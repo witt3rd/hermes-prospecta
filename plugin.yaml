@@ -1,0 +1,11 @@
+name: prospecta
+version: 0.1.0
+description: "Bilateral prospective synthesis memory — questions-on-questions retrieval with three-channel RRF fusion."
+pip_dependencies:
+  - "prospecta>=0.1.0"
+hooks:
+  - initialize
+  - prefetch
+  - sync_turn
+  - on_session_end
+  - shutdown

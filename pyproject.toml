@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-prospecta"
+version = "0.1.0"
+description = "Prospecta memory provider plugin for Hermes Agent"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Forge ⚒️", email = "forge@witt3rd.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "prospecta>=0.1.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "testcontainers[postgres]>=4", "psycopg[binary]>=3.1"]
+
+[tool.setuptools]
+py-modules = ["__init__", "cli"]
