@@ -1,23 +1,94 @@
 # hermes-prospecta
 
-Prospecta memory provider plugin for Hermes Agent. Bilateral prospective
-synthesis memory — questions-on-questions retrieval with three-channel RRF
-fusion. See https://github.com/witt3rd/prospecta.
+Prospecta memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Wraps [prospecta](https://github.com/witt3rd/prospecta) — bilateral
+prospective synthesis memory — as a Hermes `MemoryProvider`.
 
-Substrate: Postgres + pgvector. Two deployment modes:
+Three-channel hybrid index (semantic + content-stem + body-stem) fused via
+RRF. Write-side LLM-anticipated `index_text`. Read-side LLM-generated
+multi-query expansion. LLM half of the spine uses `ctx.llm` (host-provided
+credentials); the plugin never imports a model provider directly.
 
-- BYO Postgres — set `DATABASE_URL`.
-- Embedded — docker-compose Postgres spun up on first init (requires docker).
+## Install
 
-LLM half of the spine uses `ctx.llm` (host-provided). Embedder configured per
-plugin via `prospecta.defaults` (LiteLLM), `prospecta.embed.sentence_transformers`,
-or `prospecta.embed.openai`.
+```bash
+git clone https://github.com/witt3rd/hermes-prospecta /path/to/hermes-prospecta
+ln -s /path/to/hermes-prospecta $HERMES_HOME/plugins/memory/prospecta
 
-Tools surfaced to the agent: `prospecta_retain`, `prospecta_recall`,
-`prospecta_search`.
+# Provider deps (pick one)
+pip install 'prospecta[defaults]'                       # LiteLLM (multi-provider)
+pip install 'prospecta[embed-sentence-transformers]'    # local embeddings
+pip install 'prospecta[embed-openai]'                   # OpenAI direct
 
-Prefetch is OFF by default (two LLM calls per recall). Enable via
-`prefetch_enabled: true` in `$HERMES_HOME/prospecta.json` or env
-`PROSPECTA_PREFETCH=1`.
+# Activate
+hermes memory setup    # pick "prospecta"
+```
 
-License: MIT.
+## Substrate (γ — capable defaults)
+
+Two modes, resolved at `initialize()`:
+
+- **BYO Postgres** (recommended for production): set `DATABASE_URL`. Works
+  with Neon, Azure, RDS, self-hosted pgvector.
+- **Embedded** (default if no `DATABASE_URL`): plugin spins up a
+  docker-compose Postgres bundled at `docker-compose.yml`. Requires docker.
+  v0.1 supports one embedded substrate at a time (project name is namespaced
+  by `$HERMES_HOME` basename, but the host port is fixed to 5432 unless you
+  set `PROSPECTA_EMBEDDED_PORT`). For multi-profile production setups, use
+  BYO mode.
+
+Both paths run migrations and create the default bank idempotently.
+
+## Tools
+
+| Tool | Purpose |
+|---|---|
+| `prospecta_retain` | Store with optional `index_text` override |
+| `prospecta_recall` | Synthesized answer + source attribution |
+| `prospecta_search` | Raw chunks, no synthesis |
+
+## Prefetch
+
+**OFF by default.** Spine cost: two LLM calls per recall (formulate +
+synthesize). Enable via `prefetch_enabled: true` in
+`$HERMES_HOME/prospecta.json` or env `PROSPECTA_PREFETCH=1`.
+
+## Configuration
+
+`get_config_schema()` exposes six fields (`hermes memory setup` walks them):
+
+| Key | Default | Notes |
+|---|---|---|
+| `database_url` | empty | leave empty for embedded mode |
+| `bank_id` | `default` | multi-tenant key |
+| `embedder_kind` | `litellm` | one of `litellm`, `sentence_transformers`, `openai` |
+| `embedder_model` | empty | provider-specific default if empty |
+| `embedding_dim` | `1536` | must match the embedder |
+| `prefetch_enabled` | `false` | opt-in spine cost |
+
+Persisted to `$HERMES_HOME/prospecta.json`.
+
+## CLI
+
+```bash
+hermes prospecta status         # connection + bank info
+hermes prospecta stats          # document and event counters
+hermes prospecta sweep-once     # run sweeper synchronously
+hermes prospecta config         # show loaded config (redacted)
+```
+
+`stats` and `sweep-once` shell out to the `prospecta` CLI shipped by the
+library; ensure it's on `PATH` (or invokable via `python -m prospecta.cli`).
+
+## Constraints (P3 / P12)
+
+- No direct provider imports (no `openai`, no `anthropic`, no `litellm` at
+  plugin import time) — embedder resolution goes through `prospecta.embed.*`
+  or `prospecta.defaults`, and LLM access goes through `ctx.llm`.
+- `is_available()` is non-network.
+- `sync_turn` is non-blocking (daemon thread, bounded join on shutdown).
+- All storage paths use `hermes_home` kwarg, not hardcoded `~/.hermes`.
+
+## License
+
+MIT. See LICENSE.
