@@ -11,7 +11,7 @@ license = { text = "MIT" }
 authors = [{ name = "Forge ⚒️", email = "forge@witt3rd.com" }]
 requires-python = ">=3.10"
 dependencies = [
-    "prospecta>=0.1.0",
+    "prospecta @ git+https://github.com/witt3rd/prospecta.git@v0.1.0",
 ]
 
 [project.optional-dependencies]
