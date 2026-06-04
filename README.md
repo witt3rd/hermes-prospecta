@@ -28,14 +28,15 @@ hermes memory setup    # pick "prospecta"
 
 Two modes, resolved at `initialize()`:
 
-- **BYO Postgres** (recommended for production): set `DATABASE_URL`. Works
-  with Neon, Azure, RDS, self-hosted pgvector.
-- **Embedded** (default if no `DATABASE_URL`): plugin spins up a
-  docker-compose Postgres bundled at `docker-compose.yml`. Requires docker.
-  v0.1 supports one embedded substrate at a time (project name is namespaced
-  by `$HERMES_HOME` basename, but the host port is fixed to 5432 unless you
-  set `PROSPECTA_EMBEDDED_PORT`). For multi-profile production setups, use
-  BYO mode.
+- **BYO Postgres** (recommended for host/prod): set `PROSPECTA_DATABASE_URL`
+  (preferred) or `DATABASE_URL`. Works with a host-wide Roger Postgres,
+  Neon, Azure Database for PostgreSQL Flexible Server, RDS, or self-hosted
+  pgvector.
+- **Embedded** (dev-only fallback): set `PROSPECTA_ALLOW_EMBEDDED=1`; plugin
+  spins up a docker-compose Postgres bundled at `docker-compose.yml`. Requires
+  docker. v0.1 supports one embedded substrate at a time by default; set
+  `PROSPECTA_EMBEDDED_PORT` if 5432 is already in use. For multi-profile or
+  production setups, use BYO mode.
 
 Both paths run migrations and create the default bank idempotently.
 
@@ -59,8 +60,8 @@ synthesize). Enable via `prefetch_enabled: true` in
 
 | Key | Default | Notes |
 |---|---|---|
-| `database_url` | empty | leave empty for embedded mode |
-| `bank_id` | `default` | multi-tenant key |
+| `database_url` | empty | prefer `PROSPECTA_DATABASE_URL` env for host/prod; config value is fallback |
+| `bank_id` | `default` | multi-tenant key; `PROSPECTA_BANK_ID` env overrides |
 | `embedder_kind` | `litellm` | one of `litellm`, `sentence_transformers`, `openai` |
 | `embedder_model` | empty | provider-specific default if empty |
 | `embedding_dim` | `1536` | must match the embedder |

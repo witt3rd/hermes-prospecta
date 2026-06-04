@@ -33,11 +33,17 @@ def _load_config() -> dict:
 
 
 def _resolve_database_url() -> str:
+    cfg = _load_config()
     return (
-        os.environ.get("DATABASE_URL")
-        or _load_config().get("database_url")
+        os.environ.get("PROSPECTA_DATABASE_URL")
+        or cfg.get("database_url")
+        or os.environ.get("DATABASE_URL")
         or ""
     )
+
+
+def _resolve_bank_id() -> str:
+    return os.environ.get("PROSPECTA_BANK_ID") or _load_config().get("bank_id", "default")
 
 
 def _redact(values: dict) -> dict:
@@ -57,8 +63,8 @@ def _redact(values: dict) -> dict:
 def _cmd_status(args) -> int:
     cfg = _load_config()
     db_url = _resolve_database_url()
-    bank_id = cfg.get("bank_id", "default")
-    mode = "byo" if (os.environ.get("DATABASE_URL") or cfg.get("database_url")) else "embedded"
+    bank_id = _resolve_bank_id()
+    mode = "byo" if db_url else ("embedded" if os.environ.get("PROSPECTA_ALLOW_EMBEDDED") == "1" else "unconfigured")
     print(f"prospecta status")
     print(f"  hermes_home : {_hermes_home()}")
     print(f"  mode        : {mode}")
@@ -82,6 +88,8 @@ def _run_prospecta_cli(extra_args: list[str]) -> int:
     env = os.environ.copy()
     if db_url and "DATABASE_URL" not in env:
         env["DATABASE_URL"] = db_url
+    if db_url and "PROSPECTA_DATABASE_URL" not in env:
+        env["PROSPECTA_DATABASE_URL"] = db_url
 
     exe = shutil.which("prospecta")
     if exe:
@@ -97,14 +105,12 @@ def _run_prospecta_cli(extra_args: list[str]) -> int:
 
 
 def _cmd_stats(args) -> int:
-    cfg = _load_config()
-    bank_id = cfg.get("bank_id", "default")
+    bank_id = _resolve_bank_id()
     return _run_prospecta_cli(["stats", "--bank", bank_id])
 
 
 def _cmd_sweep_once(args) -> int:
-    cfg = _load_config()
-    bank_id = cfg.get("bank_id", "default")
+    bank_id = _resolve_bank_id()
     return _run_prospecta_cli(["sweep", "--once", "--bank", bank_id])
 
 

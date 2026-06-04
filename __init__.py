@@ -85,13 +85,33 @@ class ProspectaProvider(MemoryProvider):
     # ---- availability ----
 
     def is_available(self) -> bool:
-        """No network calls. Check prospecta importable + DB or docker."""
+        """No network calls. Check prospecta importable + configured substrate.
+
+        Production/platform installs should provide PROSPECTA_DATABASE_URL
+        (preferred) or database_url config. Embedded docker is dev-only and
+        requires explicit opt-in via PROSPECTA_ALLOW_EMBEDDED=1.
+        """
         try:
             import prospecta  # noqa: F401
         except ImportError:
             return False
-        if os.environ.get("DATABASE_URL"):
+        if (
+            os.environ.get("PROSPECTA_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+        ):
             return True
+        try:
+            hermes_home = os.environ.get("HERMES_HOME")
+            if hermes_home:
+                cfg_path = Path(hermes_home) / "prospecta.json"
+                if cfg_path.exists():
+                    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    if cfg.get("database_url"):
+                        return True
+        except Exception:
+            pass
+        if os.environ.get("PROSPECTA_ALLOW_EMBEDDED") != "1":
+            return False
         import shutil
         return shutil.which("docker") is not None
 
@@ -113,11 +133,43 @@ class ProspectaProvider(MemoryProvider):
             logger.warning("Failed to read prospecta config %s: %s", path, e)
             return {}
 
+    def _resolve_database_url(self) -> str:
+        """Resolve the Prospecta Postgres URL.
+
+        Prefer Prospecta-specific env over generic DATABASE_URL so host-wide
+        platform config does not collide with unrelated app databases.
+        Embedded mode is dev-only and must be explicitly enabled.
+        """
+        database_url = (
+            os.environ.get("PROSPECTA_DATABASE_URL")
+            or self._config.get("database_url")
+            or os.environ.get("DATABASE_URL")
+            or ""
+        ).strip()
+        if database_url:
+            return database_url
+        if os.environ.get("PROSPECTA_ALLOW_EMBEDDED") == "1":
+            return self._start_embedded_substrate()
+        raise RuntimeError(
+            "Prospecta requires PROSPECTA_DATABASE_URL (preferred), "
+            "database_url in prospecta.json, or DATABASE_URL. Embedded "
+            "docker fallback is dev-only; set PROSPECTA_ALLOW_EMBEDDED=1 "
+            "to opt in."
+        )
+
+    def _resolve_bank_id(self) -> str:
+        """Resolve bank id with platform env taking precedence."""
+        return (
+            os.environ.get("PROSPECTA_BANK_ID")
+            or self._config.get("bank_id")
+            or "default"
+        )
+
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
             {
                 "key": "database_url",
-                "description": "Postgres connection URL. Leave empty for embedded docker-compose mode.",
+                "description": "Postgres connection URL. Prefer PROSPECTA_DATABASE_URL env for host/prod deployments; leave empty only when explicitly enabling embedded dev mode.",
                 "default": "",
                 "secret": False,
             },
@@ -185,6 +237,7 @@ class ProspectaProvider(MemoryProvider):
         # Pass POSTGRES_PASSWORD via env if compose file references it
         env = os.environ.copy()
         env.setdefault("POSTGRES_PASSWORD", "prospecta")
+        env.setdefault("PROSPECTA_EMBEDDED_PORT", os.environ.get("PROSPECTA_EMBEDDED_PORT", "5432"))
 
         result = subprocess.run(
             ["docker", "compose", "-f", str(compose_file), "-p", project, "up", "-d"],
@@ -233,7 +286,7 @@ class ProspectaProvider(MemoryProvider):
     def _build_llm_from_ctx(self):
         ctx = self._ctx
         if ctx is None or not hasattr(ctx, "llm"):
-            raise RuntimeError("ctx.llm not available; prospecta requires Hermes plugin LLM access")
+            return None
 
         def llm(messages, *, json_mode: bool = False, **_kwargs) -> str:
             if json_mode:
@@ -264,13 +317,7 @@ class ProspectaProvider(MemoryProvider):
 
         self._config = self._load_config()
 
-        database_url = (
-            os.environ.get("DATABASE_URL")
-            or self._config.get("database_url")
-            or ""
-        ).strip()
-        if not database_url:
-            database_url = self._start_embedded_substrate()
+        database_url = self._resolve_database_url()
         self._database_url = database_url
 
         from prospecta.db.migrate import run_migrations
@@ -278,7 +325,7 @@ class ProspectaProvider(MemoryProvider):
 
         run_migrations(database_url=database_url)
 
-        bank_id = self._config.get("bank_id") or "default"
+        bank_id = self._resolve_bank_id()
         try:
             embedding_dim = int(self._config.get("embedding_dim", 1536))
         except (TypeError, ValueError):
@@ -305,7 +352,7 @@ class ProspectaProvider(MemoryProvider):
         logger.info(
             "Prospecta initialized: bank=%s dim=%s mode=%s",
             bank_id, embedding_dim,
-            "byo" if (os.environ.get("DATABASE_URL") or self._config.get("database_url")) else "embedded",
+            "byo" if database_url else "embedded",
         )
 
     def shutdown(self) -> None:
@@ -440,6 +487,8 @@ class ProspectaProvider(MemoryProvider):
                 query = args.get("query", "")
                 if not query:
                     return json.dumps({"error": "query is required"})
+                if getattr(self._memory, "_llm", None) is None:
+                    return json.dumps({"error": "ctx.llm not available; prospecta_recall requires Hermes plugin LLM access"})
                 limit = int(args.get("limit", 10))
                 result = self._memory.recall_synth(query, limit=limit)
                 sources = []
