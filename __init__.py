@@ -539,7 +539,10 @@ class ProspectaProvider(MemoryProvider):
             try:
                 content = f"<user>: {user_content}\n\n<assistant>: {assistant_content}"
                 source = f"turn:{sid}:{int(time.time() * 1000)}"
-                self._memory.retain(content=content, source=source, tags=["conversation"])
+                kwargs = {"source": source, "tags": ["conversation"]}
+                if getattr(self._memory, "_llm", None) is None:
+                    kwargs["index_text"] = [user_content, assistant_content]
+                self._memory.retain(content=content, **kwargs)
             except Exception as e:
                 logger.warning("prospecta sync_turn failed: %s", e)
 
