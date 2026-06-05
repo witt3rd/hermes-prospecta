@@ -74,40 +74,21 @@ def stub_embed(texts):
     return out
 
 
-class _StubResult:
-    def __init__(self, text: str):
-        self.text = text
-
-
-class _StubLLM:
-    def __init__(self):
-        self.complete_calls = []
-        self.complete_structured_calls = []
-
-    def complete(self, *, messages, purpose=None, **_kw):
-        self.complete_calls.append({"messages": messages, "purpose": purpose})
-        # Deterministic-enough synthesis text
-        return _StubResult("Synthesized answer based on memory.")
-
-    def complete_structured(self, *, instructions, input, json_mode=False,
-                            purpose=None, **_kw):
-        self.complete_structured_calls.append({
-            "instructions": instructions, "input": input,
-            "json_mode": json_mode, "purpose": purpose,
-        })
-        # Return JSON object shaped like prospecta's formulate parser expects:
-        # a list of query strings under "queries". Prospecta is tolerant on
-        # parse failure (falls back to single-query).
-        return _StubResult('{"queries": ["what is this about?"]}')
 
 
 class _StubCtx:
     def __init__(self):
-        self.llm = _StubLLM()
         self.registered = []
 
     def register_memory_provider(self, provider):
         self.registered.append(provider)
+
+
+def stub_llm(messages, *, json_mode: bool = False) -> str:
+    """Deterministic stub LLMCallable — no real provider needed."""
+    if json_mode:
+        return '{"queries": ["what is this about?"]}'
+    return "Synthesized answer based on memory."
 
 
 @pytest.fixture
@@ -166,13 +147,14 @@ def hermes_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def provider_with_stubs(plugin_module, mock_ctx, pg_url, hermes_home, monkeypatch):
-    """An initialized ProspectaProvider wired with stub embedder + ctx.llm."""
+    """An initialized ProspectaProvider with stub embedder + stub LLM callable."""
     monkeypatch.setenv("DATABASE_URL", pg_url)
 
     provider = plugin_module.ProspectaProvider()
-    provider._ctx = mock_ctx
     # Patch _build_embedder to use the stub (avoid LiteLLM deps).
     monkeypatch.setattr(provider, "_build_embedder", lambda: stub_embed)
+    # Patch _build_llm to use the stub callable (no provider needed).
+    monkeypatch.setattr(provider, "_build_llm", lambda: stub_llm)
 
     # Set embedding_dim=32 to match stub.
     cfg_path = hermes_home / "prospecta.json"

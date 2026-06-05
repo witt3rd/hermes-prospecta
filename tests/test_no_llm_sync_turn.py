@@ -1,4 +1,4 @@
-"""Prospecta sync_turn should not drop turns when ctx.llm is unavailable."""
+"""Prospecta sync_turn should not drop turns when no LLM is configured."""
 from __future__ import annotations
 
 import time
@@ -6,18 +6,14 @@ import time
 from tests.conftest import stub_embed
 
 
-class _NoLlmCtx:
-    pass
-
-
-def test_sync_turn_without_ctx_llm_uses_turn_text_as_index_text(
+def test_sync_turn_without_llm_uses_turn_text_as_index_text(
     plugin_module, pg_url, hermes_home, monkeypatch
 ):
     monkeypatch.setenv("PROSPECTA_DATABASE_URL", pg_url)
     monkeypatch.setenv("PROSPECTA_BANK_ID", "sync_no_llm")
     provider = plugin_module.ProspectaProvider()
-    provider._ctx = _NoLlmCtx()
     monkeypatch.setattr(provider, "_build_embedder", lambda: stub_embed)
+    monkeypatch.setattr(provider, "_build_llm", lambda: None)
     (hermes_home / "prospecta.json").write_text(
         '{"embedding_dim": "32"}', encoding="utf-8"
     )

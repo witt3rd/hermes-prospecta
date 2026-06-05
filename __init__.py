@@ -8,7 +8,9 @@ Substrate: Postgres + pgvector. Two deployment modes:
   - BYO Postgres: set DATABASE_URL env.
   - Embedded: plugin spins up docker-compose Postgres on first init.
 
-LLM: uses ctx.llm (host-provided, host-owned credentials).
+LLM: reads PROSPECTA_LLM_MODEL env (or config llm_model) and calls
+     prospecta.defaults.make_default_llm — same pattern as Hindsight.
+     No Hermes ctx.llm dependency.
 Embedder: uses prospecta.defaults make_default_embedder (LiteLLM-backed),
           OR a configured-per-plugin embedder via prospecta.embed.*.
 
@@ -36,38 +38,10 @@ from agent.memory_provider import MemoryProvider
 logger = logging.getLogger(__name__)
 
 
-def _flatten_messages_to_text(messages: List[Dict[str, Any]]) -> tuple[str, str]:
-    """Split messages into (system_instructions, user_input_text).
-
-    Concatenates system roles into instructions; everything else folded
-    into a single text block with role tags. The shim is best-effort —
-    prospecta only calls with system+user shapes, so this preserves enough
-    structure for the LLM to do its job.
-    """
-    sys_parts: list[str] = []
-    other_parts: list[str] = []
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if isinstance(content, list):
-            # OpenAI-style content blocks — flatten to text
-            text_bits = []
-            for c in content:
-                if isinstance(c, dict) and c.get("type") == "text":
-                    text_bits.append(c.get("text", ""))
-            content = "\n".join(text_bits)
-        if role == "system":
-            sys_parts.append(str(content))
-        else:
-            other_parts.append(f"[{role}] {content}")
-    return ("\n\n".join(sys_parts), "\n\n".join(other_parts))
-
-
 class ProspectaProvider(MemoryProvider):
     """Hermes MemoryProvider wrapping prospecta.Memory."""
 
     def __init__(self) -> None:
-        self._ctx = None
         self._config: Dict[str, Any] = {}
         self._memory = None  # prospecta.Memory
         self._database_url: str = ""
@@ -190,6 +164,11 @@ class ProspectaProvider(MemoryProvider):
                 "default": "",
             },
             {
+                "key": "llm_model",
+                "description": "LiteLLM model id for recall synthesis and query formulation (e.g. 'anthropic/claude-haiku-4-5'). Falls back to PROSPECTA_LLM_MODEL env, then prospecta.defaults default.",
+                "default": "",
+            },
+            {
                 "key": "embedding_dim",
                 "description": "Vector dimensionality. Must match embedder (1536 for text-embedding-3-small; 384 for all-MiniLM-L6-v2).",
                 "default": "1536",
@@ -283,28 +262,33 @@ class ProspectaProvider(MemoryProvider):
             return openai_embed(model=model or "text-embedding-3-small")
         raise RuntimeError(f"Unknown embedder_kind: {kind!r}")
 
-    def _build_llm_from_ctx(self):
-        ctx = self._ctx
-        if ctx is None or not hasattr(ctx, "llm"):
-            return None
+    def _resolve_llm_model(self) -> Optional[str]:
+        """Resolve LLM model id from config or env.
 
-        def llm(messages, *, json_mode: bool = False, **_kwargs) -> str:
-            if json_mode:
-                system_text, input_text = _flatten_messages_to_text(messages)
-                result = ctx.llm.complete_structured(
-                    instructions=system_text,
-                    input=[{"type": "text", "text": input_text}],
-                    json_mode=True,
-                    purpose="prospecta.formulate_queries",
-                )
-                return result.text
-            result = ctx.llm.complete(
-                messages=messages,
-                purpose="prospecta.retain_or_synth",
+        Priority: config llm_model > PROSPECTA_LLM_MODEL env > None (defaults module picks).
+        """
+        return (
+            (self._config.get("llm_model") or "").strip()
+            or os.environ.get("PROSPECTA_LLM_MODEL", "").strip()
+            or None
+        )
+
+    def _build_llm(self):
+        """Build LLMCallable via prospecta.defaults.make_default_llm.
+
+        Mirrors Hindsight's pattern: reads model from config/env,
+        delegates to the library's own LiteLLM-backed factory.
+        Returns None if prospecta[defaults] is not installed (no LiteLLM).
+        """
+        try:
+            from prospecta.defaults import make_default_llm
+        except ImportError:
+            logger.warning(
+                "prospecta.defaults not available (missing LiteLLM extra). "
+                "recall_synth disabled; retain/search still work."
             )
-            return result.text
-
-        return llm
+            return None
+        return make_default_llm(model=self._resolve_llm_model())
 
     # ---- lifecycle ----
 
@@ -332,7 +316,7 @@ class ProspectaProvider(MemoryProvider):
             embedding_dim = 1536
 
         embed = self._build_embedder()
-        llm = self._build_llm_from_ctx()
+        llm = self._build_llm()
 
         self._memory = Memory(
             database_url=database_url,
@@ -488,7 +472,7 @@ class ProspectaProvider(MemoryProvider):
                 if not query:
                     return json.dumps({"error": "query is required"})
                 if getattr(self._memory, "_llm", None) is None:
-                    return json.dumps({"error": "ctx.llm not available; prospecta_recall requires Hermes plugin LLM access"})
+                    return json.dumps({"error": "prospecta_recall requires an LLM. Set PROSPECTA_LLM_MODEL env or llm_model in prospecta.json and ensure 'prospecta[defaults]' is installed."})
                 limit = int(args.get("limit", 10))
                 result = self._memory.recall_synth(query, limit=limit)
                 sources = []
@@ -589,5 +573,4 @@ class ProspectaProvider(MemoryProvider):
 def register(ctx) -> None:
     """Called by Hermes memory plugin discovery."""
     provider = ProspectaProvider()
-    provider._ctx = ctx
     ctx.register_memory_provider(provider)
