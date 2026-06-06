@@ -6,8 +6,9 @@ prospective synthesis memory — as a Hermes `MemoryProvider`.
 
 Three-channel hybrid index (semantic + content-stem + body-stem) fused via
 RRF. Write-side LLM-anticipated `index_text`. Read-side LLM-generated
-multi-query expansion. LLM half of the spine uses `ctx.llm` (host-provided
-credentials); the plugin never imports a model provider directly.
+multi-query expansion. LLM half of the spine reads `PROSPECTA_LLM_MODEL`
+(env) or `llm_model` (config) and calls `prospecta.defaults.make_default_llm`
+— same pattern as Hindsight. No `ctx.llm` dependency.
 
 ## Install
 
@@ -85,7 +86,8 @@ library; ensure it's on `PATH` (or invokable via `python -m prospecta.cli`).
 
 - No direct provider imports (no `openai`, no `anthropic`, no `litellm` at
   plugin import time) — embedder resolution goes through `prospecta.embed.*`
-  or `prospecta.defaults`, and LLM access goes through `ctx.llm`.
+  or `prospecta.defaults`, and LLM config goes through `PROSPECTA_LLM_MODEL`
+  env var or `llm_model` in `prospecta.json` (not `ctx.llm`).
 - `is_available()` is non-network.
 - `sync_turn` is non-blocking (daemon thread, bounded join on shutdown).
 - All storage paths use `hermes_home` kwarg, not hardcoded `~/.hermes`.
