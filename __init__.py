@@ -37,6 +37,14 @@ from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
+# Silence LiteLLM's verbose debug output before it gets imported anywhere
+# in this process. LiteLLM emits DEBUG messages during module initialization
+# and on every completion call; those flood the Hermes CLI terminal.
+# Set by logger name first (catches import-time messages), then re-applied
+# after import via litellm.suppress_debug_info in _build_llm().
+for _litellm_logger in ("LiteLLM", "LiteLLM Proxy", "LiteLLM Router"):
+    logging.getLogger(_litellm_logger).setLevel(logging.WARNING)
+
 
 class ProspectaProvider(MemoryProvider):
     """Hermes MemoryProvider wrapping prospecta.Memory."""
@@ -283,9 +291,11 @@ class ProspectaProvider(MemoryProvider):
         """
         try:
             import logging
+            # Silence LiteLLM loggers by name BEFORE importing the module —
+            # it emits DEBUG output during import-time initialization.
+            for _name in ("LiteLLM", "LiteLLM Proxy", "LiteLLM Router"):
+                logging.getLogger(_name).setLevel(logging.WARNING)
             import litellm
-            # Silence LiteLLM's verbose debug output — it logs at DEBUG
-            # level for every completion call, flooding the terminal.
             litellm.suppress_debug_info = True
             litellm.verbose_logger.setLevel(logging.WARNING)
             from prospecta.defaults import make_default_llm
