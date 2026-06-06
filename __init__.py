@@ -49,6 +49,7 @@ class ProspectaProvider(MemoryProvider):
         self._hermes_home: Optional[Path] = None
         self._sync_thread: Optional[threading.Thread] = None
         self._compose_project: Optional[str] = None
+        self._llm = None  # built LLM callable; None means no-LLM mode
 
     # ---- identity ----
 
@@ -317,6 +318,7 @@ class ProspectaProvider(MemoryProvider):
 
         embed = self._build_embedder()
         llm = self._build_llm()
+        self._llm = llm  # store on provider so callers use self._llm, not Memory internals
 
         self._memory = Memory(
             database_url=database_url,
@@ -336,7 +338,7 @@ class ProspectaProvider(MemoryProvider):
         logger.info(
             "Prospecta initialized: bank=%s dim=%s mode=%s",
             bank_id, embedding_dim,
-            "byo" if database_url else "embedded",
+            "embedded" if self._compose_project else "byo",
         )
 
     def shutdown(self) -> None:
@@ -471,7 +473,7 @@ class ProspectaProvider(MemoryProvider):
                 query = args.get("query", "")
                 if not query:
                     return json.dumps({"error": "query is required"})
-                if getattr(self._memory, "_llm", None) is None:
+                if self._llm is None:
                     return json.dumps({"error": "prospecta_recall requires an LLM. Set PROSPECTA_LLM_MODEL env or llm_model in prospecta.json and ensure 'prospecta[defaults]' is installed."})
                 limit = int(args.get("limit", 10))
                 result = self._memory.recall_synth(query, limit=limit)
@@ -524,7 +526,7 @@ class ProspectaProvider(MemoryProvider):
                 content = f"<user>: {user_content}\n\n<assistant>: {assistant_content}"
                 source = f"turn:{sid}:{int(time.time() * 1000)}"
                 kwargs = {"source": source, "tags": ["conversation"]}
-                if getattr(self._memory, "_llm", None) is None:
+                if self._llm is None:
                     kwargs["index_text"] = [user_content, assistant_content]
                 self._memory.retain(content=content, **kwargs)
             except Exception as e:

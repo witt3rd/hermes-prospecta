@@ -57,7 +57,7 @@ synthesize). Enable via `prefetch_enabled: true` in
 
 ## Configuration
 
-`get_config_schema()` exposes six fields (`hermes memory setup` walks them):
+`get_config_schema()` exposes seven fields (`hermes memory setup` walks them):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -65,6 +65,7 @@ synthesize). Enable via `prefetch_enabled: true` in
 | `bank_id` | `default` | multi-tenant key; `PROSPECTA_BANK_ID` env overrides |
 | `embedder_kind` | `litellm` | one of `litellm`, `sentence_transformers`, `openai` |
 | `embedder_model` | empty | provider-specific default if empty |
+| `llm_model` | empty | LiteLLM model id for recall/formulation (e.g. `anthropic/claude-haiku-4-5`); `PROSPECTA_LLM_MODEL` env overrides |
 | `embedding_dim` | `1536` | must match the embedder |
 | `prefetch_enabled` | `false` | opt-in spine cost |
 
