@@ -4,15 +4,13 @@ from __future__ import annotations
 import json
 
 
-def test_get_config_schema_has_six_fields(plugin_module):
+def test_get_config_schema_has_expected_fields(plugin_module):
     p = plugin_module.ProspectaProvider()
     schema = p.get_config_schema()
-    # P12: <= 6 fields.
-    assert len(schema) <= 6
     keys = {f["key"] for f in schema}
     expected = {
         "database_url", "bank_id", "embedder_kind", "embedder_model",
-        "embedding_dim", "prefetch_enabled",
+        "llm_model", "embedding_dim", "prefetch_enabled",
     }
     assert keys == expected
 

@@ -6,8 +6,9 @@ prospective synthesis memory — as a Hermes `MemoryProvider`.
 
 Three-channel hybrid index (semantic + content-stem + body-stem) fused via
 RRF. Write-side LLM-anticipated `index_text`. Read-side LLM-generated
-multi-query expansion. LLM half of the spine uses `ctx.llm` (host-provided
-credentials); the plugin never imports a model provider directly.
+multi-query expansion. LLM half of the spine reads `PROSPECTA_LLM_MODEL`
+(env) or `llm_model` (config) and calls `prospecta.defaults.make_default_llm`
+— same pattern as Hindsight. No `ctx.llm` dependency.
 
 ## Install
 
@@ -28,14 +29,15 @@ hermes memory setup    # pick "prospecta"
 
 Two modes, resolved at `initialize()`:
 
-- **BYO Postgres** (recommended for production): set `DATABASE_URL`. Works
-  with Neon, Azure, RDS, self-hosted pgvector.
-- **Embedded** (default if no `DATABASE_URL`): plugin spins up a
-  docker-compose Postgres bundled at `docker-compose.yml`. Requires docker.
-  v0.1 supports one embedded substrate at a time (project name is namespaced
-  by `$HERMES_HOME` basename, but the host port is fixed to 5432 unless you
-  set `PROSPECTA_EMBEDDED_PORT`). For multi-profile production setups, use
-  BYO mode.
+- **BYO Postgres** (recommended for host/prod): set `PROSPECTA_DATABASE_URL`
+  (preferred) or `DATABASE_URL`. Works with a host-wide Roger Postgres,
+  Neon, Azure Database for PostgreSQL Flexible Server, RDS, or self-hosted
+  pgvector.
+- **Embedded** (dev-only fallback): set `PROSPECTA_ALLOW_EMBEDDED=1`; plugin
+  spins up a docker-compose Postgres bundled at `docker-compose.yml`. Requires
+  docker. v0.1 supports one embedded substrate at a time by default; set
+  `PROSPECTA_EMBEDDED_PORT` if 5432 is already in use. For multi-profile or
+  production setups, use BYO mode.
 
 Both paths run migrations and create the default bank idempotently.
 
@@ -55,14 +57,15 @@ synthesize). Enable via `prefetch_enabled: true` in
 
 ## Configuration
 
-`get_config_schema()` exposes six fields (`hermes memory setup` walks them):
+`get_config_schema()` exposes seven fields (`hermes memory setup` walks them):
 
 | Key | Default | Notes |
 |---|---|---|
-| `database_url` | empty | leave empty for embedded mode |
-| `bank_id` | `default` | multi-tenant key |
+| `database_url` | empty | prefer `PROSPECTA_DATABASE_URL` env for host/prod; config value is fallback |
+| `bank_id` | `default` | multi-tenant key; `PROSPECTA_BANK_ID` env overrides |
 | `embedder_kind` | `litellm` | one of `litellm`, `sentence_transformers`, `openai` |
 | `embedder_model` | empty | provider-specific default if empty |
+| `llm_model` | empty | LiteLLM model id for recall/formulation (e.g. `anthropic/claude-haiku-4-5`); `PROSPECTA_LLM_MODEL` env overrides |
 | `embedding_dim` | `1536` | must match the embedder |
 | `prefetch_enabled` | `false` | opt-in spine cost |
 
@@ -84,7 +87,8 @@ library; ensure it's on `PATH` (or invokable via `python -m prospecta.cli`).
 
 - No direct provider imports (no `openai`, no `anthropic`, no `litellm` at
   plugin import time) — embedder resolution goes through `prospecta.embed.*`
-  or `prospecta.defaults`, and LLM access goes through `ctx.llm`.
+  or `prospecta.defaults`, and LLM config goes through `PROSPECTA_LLM_MODEL`
+  env var or `llm_model` in `prospecta.json` (not `ctx.llm`).
 - `is_available()` is non-network.
 - `sync_turn` is non-blocking (daemon thread, bounded join on shutdown).
 - All storage paths use `hermes_home` kwarg, not hardcoded `~/.hermes`.
