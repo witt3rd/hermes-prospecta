@@ -282,6 +282,12 @@ class ProspectaProvider(MemoryProvider):
         Returns None if prospecta[defaults] is not installed (no LiteLLM).
         """
         try:
+            import logging
+            import litellm
+            # Silence LiteLLM's verbose debug output — it logs at DEBUG
+            # level for every completion call, flooding the terminal.
+            litellm.suppress_debug_info = True
+            litellm.verbose_logger.setLevel(logging.WARNING)
             from prospecta.defaults import make_default_llm
         except ImportError:
             logger.warning(
