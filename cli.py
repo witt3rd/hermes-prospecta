@@ -1,4 +1,4 @@
-"""hermes prospecta {status,stats,sweep-once,config} CLI subcommands.
+"""hermes prospecta {status,stats,sweep-once,config,import} CLI subcommands.
 
 Implementation strategy: shell out to the `prospecta` CLI (which already
 exists in prospecta>=0.1.0) for stats/sweep, read the JSON config directly
@@ -114,6 +114,61 @@ def _cmd_sweep_once(args) -> int:
     return _run_prospecta_cli(["sweep", "--once", "--bank", bank_id])
 
 
+def _build_embedder(cfg: dict):
+    kind = (cfg.get("embedder_kind") or "litellm").strip().lower()
+    model = (cfg.get("embedder_model") or "").strip() or None
+    if kind == "litellm":
+        from prospecta.defaults import make_default_embedder
+        return make_default_embedder(model)
+    if kind == "sentence_transformers":
+        from prospecta.embed import sentence_transformers
+        return sentence_transformers(model or "all-MiniLM-L6-v2")
+    if kind == "openai":
+        from prospecta.embed import openai as openai_embed
+        return openai_embed(model=model or "text-embedding-3-small")
+    raise RuntimeError(f"Unknown embedder_kind: {kind!r}")
+
+
+def _build_memory():
+    """Memory handle for offline writes (no LLM: imports pass index_text)."""
+    from prospecta.db.migrate import run_migrations
+    from prospecta.memory import Memory
+
+    cfg = _load_config()
+    url = _resolve_database_url()
+    if not url:
+        raise RuntimeError("no database url (set PROSPECTA_DATABASE_URL)")
+    run_migrations(database_url=url)
+    bank = _resolve_bank_id()
+    mem = Memory(database_url=url, bank_id=bank, embed=_build_embedder(cfg))
+    try:
+        mem.create_bank(bank, embedding_dim=int(cfg.get("embedding_dim", 1536)))
+    except Exception as e:
+        if "already exists" not in str(e).lower():
+            raise
+    return mem
+
+
+def _cmd_import(args) -> int:
+    try:
+        from .importer import format_report, import_dump, load_dump
+    except ImportError:  # loaded as a top-level module / installed py-module
+        from importer import format_report, import_dump, load_dump
+
+    try:
+        dump = load_dump(args.file)
+        mem = _build_memory()
+        try:
+            report = import_dump(mem, dump, dry_run=args.dry_run)
+        finally:
+            mem.close()
+    except Exception as e:
+        print(f"IMPORT FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2) if args.json else format_report(report))
+    return 0 if report["ok"] else 1
+
+
 def _dispatch(args) -> int:
     sub = getattr(args, "prospecta_command", None)
     if sub == "status":
@@ -124,7 +179,9 @@ def _dispatch(args) -> int:
         return _cmd_sweep_once(args)
     if sub == "config":
         return _cmd_config(args)
-    print("usage: hermes prospecta {status,stats,sweep-once,config}", file=sys.stderr)
+    if sub == "import":
+        return _cmd_import(args)
+    print("usage: hermes prospecta {status,stats,sweep-once,config,import}", file=sys.stderr)
     return 2
 
 
@@ -135,6 +192,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     subs.add_parser("stats", help="Show document and event counters")
     subs.add_parser("sweep-once", help="Run one sweeper pass synchronously")
     subs.add_parser("config", help="Show loaded config (redacted)")
+    imp = subs.add_parser("import", help="Import a Hindsight bank dump (JSON) into the bank")
+    imp.add_argument("file", help="path to the dump JSON")
+    imp.add_argument("--dry-run", action="store_true", help="plan only, write nothing")
+    imp.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.set_defaults(func=_dispatch)
 
 

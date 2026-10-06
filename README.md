@@ -80,6 +80,34 @@ hermes prospecta sweep-once     # run sweeper synchronously
 hermes prospecta config         # show loaded config (redacted)
 ```
 
+## Importing a Hindsight bank dump
+
+```bash
+hermes prospecta import dump.json --dry-run   # plan only
+hermes prospecta import dump.json             # import into the configured bank
+hermes prospecta import dump.json --json      # machine-readable report
+```
+
+Dump = one JSON object with `memory_units` (facts, observations; `text`
+required, plus `fact_type`, `context`, `event_date`, `created_at`,
+`document_id`, `entities`, `tags`, ...), `entities` (`canonical_name`,
+`aliases`, ...) and `links` (`from_id`, `to_id`, `link_type`, `weight`, ...).
+See the docstring of `importer.py` for the exact mapping. Prospecta has no
+entity/link tables, so entities become documents and links, provenance, event
+timestamps, and unrecognised fields ride in `documents.document_metadata.hindsight`
+(links on both endpoints). `created_at` of each document/item is the original
+timestamp. No LLM is needed: the fact text is its own `index_text`; only the
+embedder is called.
+
+- **Idempotent**: re-running leaves unchanged documents alone (no re-embed);
+  changed ones are replaced under the same source (`hindsight://<bank>/<kind>/<id>`).
+  Identical text under another id is merged as `import_aliases`, not dropped.
+- **No-loss report**: after writing, every input unit/entity/link is read back
+  from the database. Anything missing or unimportable (empty text, link with
+  no endpoint in the dump, embed failure) is listed under `LOST/UNIMPORTED`
+  and the command exits `1` (`2` for fatal errors such as an unreadable dump
+  or no database). `--dry-run` cannot see duplicates inside the dump.
+
 `stats` and `sweep-once` shell out to the `prospecta` CLI shipped by the
 library; ensure it's on `PATH` (or invokable via `python -m prospecta.cli`).
 
