@@ -17,13 +17,37 @@ from urllib.parse import urlparse, urlunparse
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PROSPECTA_ROOT = Path("/home/dt/src/witt3rd/prospecta")
-HERMES_ROOT = Path("/home/dt/src/ext/hermes-agent")
 
-# Make prospecta + agent.memory_provider importable.
-for p in (str(PROSPECTA_ROOT), str(HERMES_ROOT)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+# Optional checkouts (CI and fresh clones have neither: prospecta comes from
+# the pinned dependency, hermes' MemoryProvider from the stub below).
+for _env in ("PROSPECTA_ROOT", "HERMES_ROOT"):
+    _p = os.environ.get(_env)
+    if _p and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+
+def _ensure_memory_provider():
+    """Provide ``agent.memory_provider.MemoryProvider`` when hermes is absent."""
+    try:
+        import agent.memory_provider  # noqa: F401
+        return
+    except ImportError:
+        pass
+    import abc
+    import types
+
+    class MemoryProvider(abc.ABC):
+        """Minimal stand-in for hermes' MemoryProvider ABC."""
+
+    agent = types.ModuleType("agent")
+    mod = types.ModuleType("agent.memory_provider")
+    mod.MemoryProvider = MemoryProvider
+    agent.memory_provider = mod
+    sys.modules["agent"] = agent
+    sys.modules["agent.memory_provider"] = mod
+
+
+_ensure_memory_provider()
 
 
 def _load_plugin_module():
