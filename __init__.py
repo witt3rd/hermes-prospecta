@@ -98,6 +98,29 @@ class ProspectaProvider(MemoryProvider):
         import shutil
         return shutil.which("docker") is not None
 
+    def unavailable_reason(self) -> str:
+        """Why ``is_available()`` is False, and the fix (shown at ERROR by the host).
+
+        Mirrors ``is_available()`` step by step; empty string when available.
+        """
+        try:
+            import prospecta  # noqa: F401
+        except ImportError:
+            return (
+                "The 'prospecta' Python package is not importable in this venv "
+                "(a venv rebuild/sync drops it; it is not on PyPI). Fix: run "
+                "ops/prospecta/ensure-venv.sh from the hermes-agent checkout "
+                "(installs the pinned 'hermes-agent[prospecta]' extra), then restart "
+                "the gateway."
+            )
+        if self.is_available():
+            return ""
+        return (
+            "No Prospecta database is configured: set PROSPECTA_DATABASE_URL in this "
+            "profile's .env (or database_url in $HERMES_HOME/prospecta.json); embedded "
+            "docker is dev-only (PROSPECTA_ALLOW_EMBEDDED=1)."
+        )
+
     # ---- config ----
 
     def _config_path(self) -> Path:
@@ -289,6 +312,16 @@ class ProspectaProvider(MemoryProvider):
         delegates to the library's own LiteLLM-backed factory.
         Returns None if prospecta[defaults] is not installed (no LiteLLM).
         """
+        # No hidden defaults: prospecta.defaults would silently fall back to
+        # openai/gpt-4o-mini. An unset model is a loud initialize() failure (the
+        # host logs it at ERROR and notifies the being).
+        if not self._resolve_llm_model():
+            raise RuntimeError(
+                "Prospecta LLM model is not set: set PROSPECTA_LLM_MODEL in the "
+                "profile .env (or llm_model in prospecta.json), e.g. "
+                "'openrouter/anthropic/claude-sonnet-5.5'. Refusing the library's "
+                "built-in default model."
+            )
         try:
             import logging
             # Silence LiteLLM loggers by name BEFORE importing the module —
