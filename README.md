@@ -25,6 +25,25 @@ pip install 'prospecta[embed-openai]'                   # OpenAI direct
 hermes memory setup    # pick "prospecta"
 ```
 
+### Installable / durable
+
+`pip install .` (or `uv sync`) pulls everything the provider needs, declared in
+`pyproject.toml`: `prospecta[defaults,embed-sentence-transformers]` and
+`psycopg`. The sentence-transformers embedder is a hard dependency, so rebuilding
+a venv cannot silently drop it. `uv.lock` is committed.
+
+### Health check
+
+```bash
+hermes-prospecta-health
+```
+
+Exits 0 only if the database answers and the configured embedder loads and
+returns `embedding_dim` vectors. Otherwise it exits 1 and prints
+`!!! PROSPECTA DOWN !!! unavailable: DATABASE, EMBEDDER` (plus per-component
+reasons) on stderr. Wire it into cron/systemd/monitoring. It reads the same
+config/env as the plugin (`PROSPECTA_DATABASE_URL`, `$HERMES_HOME/prospecta.json`).
+
 ## Substrate (γ — capable defaults)
 
 Two modes, resolved at `initialize()`:

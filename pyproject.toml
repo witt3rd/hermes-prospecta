@@ -11,11 +11,17 @@ license = { text = "MIT" }
 authors = [{ name = "Forge ⚒️", email = "forge@witt3rd.com" }]
 requires-python = ">=3.11"
 dependencies = [
-    "prospecta @ git+https://github.com/witt3rd/prospecta.git@v0.1.0",
+    # [defaults] = LiteLLM (LLM + default embedder); [embed-sentence-transformers]
+    # is declared here, not optional, so a venv rebuild cannot drop the local embedder.
+    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@v0.1.0",
+    "psycopg[binary]>=3.1",
 ]
+
+[project.scripts]
+hermes-prospecta-health = "health:main"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "testcontainers[postgres]>=4", "psycopg[binary]>=3.1"]
 
 [tool.setuptools]
-py-modules = ["__init__", "cli"]
+py-modules = ["__init__", "cli", "health"]
