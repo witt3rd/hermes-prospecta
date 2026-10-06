@@ -44,6 +44,21 @@ returns `embedding_dim` vectors. Otherwise it exits 1 and prints
 reasons) on stderr. Wire it into cron/systemd/monitoring. It reads the same
 config/env as the plugin (`PROSPECTA_DATABASE_URL`, `$HERMES_HOME/prospecta.json`).
 
+### Backup / restore
+
+```bash
+hermes-prospecta-backup /path/to/prospecta.dump          # pg_dump, custom format
+hermes-prospecta-restore /path/to/prospecta.dump         # into an empty database
+hermes-prospecta-restore --clean /path/to/prospecta.dump # overwrite existing data
+```
+
+Both use the same database URL resolution as the plugin and need `pg_dump` /
+`pg_restore` on PATH (client version >= server). Backup writes to a temp file
+and renames, so a failed dump never replaces a good one. Restore is a single
+transaction: on any error nothing changes. Failures print
+`!!! PROSPECTA BACKUP FAILED !!!` / `RESTORE FAILED` on stderr and exit 1.
+Restore into a database that has the `vector` extension available (pgvector).
+
 ## Substrate (γ — capable defaults)
 
 Two modes, resolved at `initialize()`:
