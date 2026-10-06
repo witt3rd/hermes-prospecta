@@ -23,7 +23,10 @@ from pathlib import Path
 from typing import List, Optional
 from urllib.parse import unquote, urlparse
 
-from health import _load_config, resolve_database_url
+try:
+    from .health import _load_config, resolve_database_url
+except ImportError:  # loaded as a top-level module / installed py-module
+    from health import _load_config, resolve_database_url
 
 
 def _pg_env(url: str) -> dict:
