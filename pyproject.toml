@@ -19,12 +19,14 @@ dependencies = [
 
 [project.scripts]
 hermes-prospecta-health = "health:main"
+hermes-prospecta-backup = "backup:backup_main"
+hermes-prospecta-restore = "backup:restore_main"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "testcontainers[postgres]>=4", "psycopg[binary]>=3.1"]
 
 [tool.setuptools]
-py-modules = ["__init__", "cli", "health", "importer"]
+py-modules = ["__init__", "cli", "health", "importer", "backup"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
