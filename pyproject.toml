@@ -25,3 +25,6 @@ test = ["pytest>=7", "testcontainers[postgres]>=4", "psycopg[binary]>=3.1"]
 
 [tool.setuptools]
 py-modules = ["__init__", "cli", "health"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
