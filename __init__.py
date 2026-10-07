@@ -18,6 +18,8 @@ Tool surface (visible to the agent):
   - prospecta_retain(content, source=..., index_text=None, tags=None)
   - prospecta_recall(query, limit=10) -> synthesis + sources
   - prospecta_search(query, mode="hybrid", limit=10) -> raw chunks
+  - prospecta_recall_set(query, entity, aliases=None) -> complete cited list (map-reduce)
+  (recall/search take an optional depth: standard | deep)
 
 Lifecycle hooks: sync_turn (non-blocking daemon thread), on_session_end,
                   shutdown. Prefetch OPT-IN via config (default OFF —
@@ -44,6 +46,16 @@ logger = logging.getLogger(__name__)
 # after import via litellm.suppress_debug_info in _build_llm().
 for _litellm_logger in ("LiteLLM", "LiteLLM Proxy", "LiteLLM Router"):
     logging.getLogger(_litellm_logger).setLevel(logging.WARNING)
+
+
+def _depth_kw(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Pass-through of the agent's optional ``depth`` ("standard" | "deep").
+
+    Omitted means the library's own default (the bank's recall_config.depth,
+    else standard); the value is validated by Prospecta, not here.
+    """
+    depth = args.get("depth")
+    return {"depth": depth} if depth else {}
 
 
 class ProspectaProvider(MemoryProvider):
@@ -474,8 +486,32 @@ class ProspectaProvider(MemoryProvider):
                             "description": "Max results per formulated query.",
                             "default": 10,
                         },
+                        "depth": {
+                            "type": "string",
+                            "enum": ["standard", "deep"],
+                            "description": "Retrieval depth. 'standard' (default) is right for ordinary questions. Use 'deep' for discovery and completeness questions ('everything about X', 'all the ...', 'every time ...'): it reads a wider pool for about 3x the cost.",
+                        },
                     },
                     "required": ["query"],
+                },
+            },
+            {
+                "name": "prospecta_recall_set",
+                "description": (
+                    "Complete answer to a SET or discovery question about one person or "
+                    "entity ('what are X's nicknames', 'every project Y mentioned'): reads "
+                    "every note tied to the entity and returns a deduplicated cited list. "
+                    "Slower and costlier than prospecta_recall; use it when completeness "
+                    "matters more than speed."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The set question."},
+                        "entity": {"type": "string", "description": "The person or entity the set is about."},
+                        "aliases": {"type": "array", "items": {"type": "string"}, "description": "Other names for the entity."},
+                    },
+                    "required": ["query", "entity"],
                 },
             },
             {
@@ -494,6 +530,11 @@ class ProspectaProvider(MemoryProvider):
                             "default": "hybrid",
                         },
                         "limit": {"type": "integer", "default": 10},
+                        "depth": {
+                            "type": "string",
+                            "enum": ["standard", "deep"],
+                            "description": "Retrieval depth. 'standard' (default) is right for ordinary questions. Use 'deep' for discovery and completeness questions ('everything about X', 'all the ...', 'every time ...'): it reads a wider pool for about 3x the cost.",
+                        },
                     },
                     "required": ["query"],
                 },
@@ -525,7 +566,7 @@ class ProspectaProvider(MemoryProvider):
                 if self._llm is None:
                     return json.dumps({"error": "prospecta_recall requires an LLM. Set PROSPECTA_LLM_MODEL env or llm_model in prospecta.json and ensure 'prospecta[defaults]' is installed."})
                 limit = int(args.get("limit", 10))
-                result = self._memory.recall_synth(query, limit=limit)
+                result = self._memory.recall_synth(query, limit=limit, **_depth_kw(args))
                 sources = []
                 for i, s in enumerate(result.sources or []):
                     sources.append({
@@ -538,13 +579,30 @@ class ProspectaProvider(MemoryProvider):
                     "sources": sources,
                 })
 
+            if tool_name == "prospecta_recall_set":
+                query = args.get("query", "")
+                entity = args.get("entity", "")
+                if not query or not entity:
+                    return json.dumps({"error": "query and entity are required"})
+                if self._llm is None:
+                    return json.dumps({"error": "prospecta_recall_set requires an LLM. Set PROSPECTA_LLM_MODEL env or llm_model in prospecta.json and ensure 'prospecta[defaults]' is installed."})
+                kw = {"entity": entity}
+                if args.get("aliases"):
+                    kw["aliases"] = list(args["aliases"])
+                result = self._memory.recall_mapreduce(query, **kw)
+                return json.dumps({
+                    "synthesis": result.synthesis or "",
+                    "citations": [c if isinstance(c, (str, int, float, dict, list)) else str(c)
+                                  for c in (getattr(result, "citations", None) or [])],
+                })
+
             if tool_name == "prospecta_search":
                 query = args.get("query", "")
                 if not query:
                     return json.dumps({"error": "query is required"})
                 mode = args.get("mode", "hybrid")
                 limit = int(args.get("limit", 10))
-                items = self._memory.search(query, mode=mode, limit=limit)
+                items = self._memory.search(query, mode=mode, limit=limit, **_depth_kw(args))
                 results = []
                 for it in items:
                     content = it.original_chunk or it.content
