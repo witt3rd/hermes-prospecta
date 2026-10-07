@@ -15,7 +15,7 @@ dependencies = [
     # v0.1.0 tag predates both (the live bank DB is already at schema version 3).
     # [defaults] = LiteLLM (LLM + default embedder); [embed-sentence-transformers]
     # is declared here, not optional, so a venv rebuild cannot drop the local embedder.
-    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@edefe3eb6fa5b01afee932035e82a4f6cf4aeeaf",
+    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@e863ac1c7a8f291205564d24b1aa039d6c70df80",
     "psycopg[binary]>=3.1",
 ]
 
