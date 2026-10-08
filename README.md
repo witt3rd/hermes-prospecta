@@ -89,9 +89,33 @@ Both paths run migrations and create the default bank idempotently.
 synthesize). Enable via `prefetch_enabled: true` in
 `$HERMES_HOME/prospecta.json` or env `PROSPECTA_PREFETCH=1`.
 
+## Shadow reads
+
+**OFF by default.** For an embedding migration: with `shadow_bank_id` set
+(config or `PROSPECTA_SHADOW_BANK`), each `prospecta_search`, `prospecta_recall`
+and prefetch is also run against that bank, and the old/new pair is stored in
+`recall_events` (two rows sharing `trace.shadow.id`, `role` old/new,
+`jaccard` over original document ids, `old_ms`/`new_ms`, and the `tool`),
+the same shape as the library's own shadow of `Memory.recall()`.
+
+- The agent only ever gets the old bank's answer. The shadow runs after the old
+  result is ready, on one background daemon thread behind a bounded queue
+  (16 pending; beyond that a pair is dropped with an ERROR log), so the old
+  path pays nothing. Shadow failures never reach the caller; they are logged
+  with the full exception and recorded in the new row's `trace.shadow.error`.
+- The shadow `Memory` is built once at `initialize` and closed in `shutdown`
+  (pending pairs are drained first, up to 30 s).
+- `shadow_mode: search` (default) only searches the shadow bank (embedding cost,
+  no LLM) with the same queries the old side used. `full` re-runs `recall_synth`
+  on the shadow bank for `prospecta_recall` and prefetch (roughly 0.2-0.4 USD
+  each); `prospecta_search` is always retrieval-only.
+- `recall_synth` already stores its own old-bank event, so for `prospecta_recall`
+  and prefetch the pair's old row is a second row; filter on `trace -> 'shadow'`.
+- The shadow bank must already exist, with `shadow_embedding_dim` matching it.
+
 ## Configuration
 
-`get_config_schema()` exposes seven fields (`hermes memory setup` walks them):
+`get_config_schema()` exposes eleven fields (`hermes memory setup` walks them):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -102,6 +126,10 @@ synthesize). Enable via `prefetch_enabled: true` in
 | `llm_model` | empty | LiteLLM model id for recall/formulation (e.g. `anthropic/claude-haiku-4-5`); `PROSPECTA_LLM_MODEL` env overrides |
 | `embedding_dim` | `1536` | must match the embedder |
 | `prefetch_enabled` | `false` | opt-in spine cost |
+| `shadow_bank_id` | empty (OFF) | shadow-read bank, see [Shadow reads](#shadow-reads); `PROSPECTA_SHADOW_BANK` env overrides (set it empty to force OFF) |
+| `shadow_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the shadow bank |
+| `shadow_embedding_dim` | `1536` | dimensionality of the shadow bank |
+| `shadow_mode` | `search` | `search` = retrieval only; `full` = also shadow `recall_synth` (LLM cost) |
 
 Persisted to `$HERMES_HOME/prospecta.json`.
 

@@ -11,6 +11,7 @@ def test_get_config_schema_has_expected_fields(plugin_module):
     expected = {
         "database_url", "bank_id", "embedder_kind", "embedder_model",
         "llm_model", "embedding_dim", "prefetch_enabled",
+        "shadow_bank_id", "shadow_embed_model", "shadow_embedding_dim", "shadow_mode",
     }
     assert keys == expected
 
