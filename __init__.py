@@ -21,6 +21,11 @@ Tool surface (visible to the agent):
   - prospecta_recall_set(query, entity, aliases=None) -> complete cited list (map-reduce)
   (recall/search take an optional depth: standard | deep)
 
+Shadow reads (OFF by default; see README): with ``shadow_bank_id`` set, every
+search / recall / prefetch is also run against that bank on a background
+thread and the old/new pair is stored in recall_events. The agent only ever
+sees the old bank's answer.
+
 Lifecycle hooks: sync_turn (non-blocking daemon thread), on_session_end,
                   shutdown. Prefetch OPT-IN via config (default OFF —
                   spine cost should not be a surprise tax).
@@ -30,8 +35,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -58,6 +65,145 @@ def _depth_kw(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"depth": depth} if depth else {}
 
 
+# ---- shadow reads (embedding migration) ----
+
+_SHADOW_QUEUE_MAX = 16          # pending shadow jobs; beyond this a job is dropped, loudly
+_SHADOW_DRAIN_TIMEOUT_S = 30.0  # how long shutdown waits for pending shadow jobs
+_SHADOW_STOP = object()
+_SHADOW_DEFAULT_EMBED_MODEL = "openrouter/openai/text-embedding-3-large"
+
+
+class _ShadowReader:
+    """Replays the old bank's recalls against a second (new) bank, off-path.
+
+    The library's ``Memory(shadow_bank_id=...)`` only shadows ``Memory.recall``
+    (this provider calls ``search`` / ``recall_synth``) and opens a fresh
+    connection pool per call, so this reuses its pair format (two
+    ``recall_events`` rows sharing ``trace.shadow.id``, with ``jaccard`` over
+    original document ids) but keeps ONE shadow ``Memory`` for the provider's
+    life and runs it on ONE daemon worker thread behind a bounded queue.
+    Nothing here raises into, or waits on, the caller.
+    """
+
+    def __init__(self, memory, shadow_memory, *, bank_id: str, shadow_bank_id: str,
+                 mode: str = "search") -> None:
+        self._memory = memory            # old-bank Memory: writes both events, resolves ids
+        self._shadow = shadow_memory     # new-bank Memory, created once, reused
+        self._bank_id = bank_id
+        self._shadow_bank_id = shadow_bank_id
+        self._mode = mode                # "search" | "full"
+        self._queue: "queue.Queue" = queue.Queue(maxsize=_SHADOW_QUEUE_MAX)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="prospecta-shadow")
+        self._thread.start()
+
+    def submit(self, job: Dict[str, Any]) -> None:
+        """Queue a job; never blocks and never raises."""
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            logger.error(
+                "prospecta shadow queue full (%d pending); dropped shadow pair for %s %r",
+                _SHADOW_QUEUE_MAX, job.get("tool"), job.get("message"),
+            )
+        except Exception:
+            logger.exception("prospecta shadow submit failed")
+
+    def stop(self) -> None:
+        try:
+            self._queue.put(_SHADOW_STOP, timeout=_SHADOW_DRAIN_TIMEOUT_S)
+        except queue.Full:
+            logger.error("prospecta shadow queue stayed full for %ss at shutdown",
+                         _SHADOW_DRAIN_TIMEOUT_S)
+        self._thread.join(timeout=_SHADOW_DRAIN_TIMEOUT_S)
+        if self._thread.is_alive():
+            logger.error("prospecta shadow worker still busy after %ss; leaving its "
+                         "connection open (daemon thread dies with the process)",
+                         _SHADOW_DRAIN_TIMEOUT_S)
+            return
+        try:
+            self._shadow.close()
+        except Exception:
+            logger.exception("prospecta shadow memory close failed")
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is _SHADOW_STOP:
+                return
+            try:
+                self._record(job)
+            except Exception:
+                logger.exception("prospecta shadow job failed: %s %r",
+                                 job.get("tool"), job.get("message"))
+
+    def _record(self, job: Dict[str, Any]) -> None:
+        from prospecta._shadow import _origin_ids
+        from prospecta.memory import _serialize_recall_results
+
+        depth_kw = {"depth": job["depth"]} if job.get("depth") else {}
+        queries = list(job["queries"])
+        synthesis = None
+        flat: list = []
+        error = None
+        t0 = time.monotonic()
+        try:
+            if self._mode == "full" and job["tool"] != "prospecta_search":
+                res = self._shadow.recall_synth(
+                    job["message"], limit=job["limit"], mode=job["mode"], **depth_kw)
+                flat = list(res.sources or [])
+                synthesis = res.synthesis
+                queries = [q.text for q in (res.queries or [])] or queries
+            else:
+                for q in queries:
+                    flat.extend(self._shadow.search(
+                        q, mode=job["mode"], limit=job["limit"], **depth_kw))
+        except Exception as e:
+            logger.exception("prospecta shadow %s against %s failed for %r",
+                             job["tool"], self._shadow_bank_id, job["message"])
+            error = f"{type(e).__name__}: {e}"
+        new_ms = int((time.monotonic() - t0) * 1000)
+
+        old_results = job["results"]
+        try:
+            old_origin = _origin_ids(self._memory, self._bank_id, old_results)
+            new_origin = _origin_ids(self._memory, self._shadow_bank_id, flat) if error is None else []
+        except Exception:
+            logger.exception("prospecta shadow could not resolve document ids")
+            return
+        old_set, new_set = set(old_origin), set(new_origin)
+        union = old_set | new_set
+        overlap = {
+            "old_origin_document_ids": old_origin,
+            "new_origin_document_ids": new_origin,
+            "jaccard": (len(old_set & new_set) / len(union)) if union else 1.0,
+        }
+        shadow_id = str(uuid.uuid4())
+        for role, bank, peer, qs, results, syn, ms, err in (
+            ("old", self._bank_id, self._shadow_bank_id, job["queries"], old_results,
+             job.get("synthesis"), job["old_ms"], None),
+            ("new", self._shadow_bank_id, self._bank_id, queries, flat, synthesis, new_ms, error),
+        ):
+            try:
+                self._memory._tracer("recall", {
+                    "bank_id": bank,
+                    "queries": list(qs),
+                    "mode": job["mode"],
+                    "n_results": len(results),
+                    "duration_ms": ms,
+                    "trace": {"shadow": {
+                        "id": shadow_id, "role": role, "peer_bank": peer, "error": err,
+                        "tool": job["tool"], "shadow_mode": self._mode,
+                        "old_ms": job["old_ms"], "new_ms": new_ms,
+                        **overlap,
+                    }},
+                    "results": _serialize_recall_results(results),
+                    "synthesis": syn,
+                    "depth": job.get("depth"),
+                })
+            except Exception:
+                logger.exception("prospecta shadow could not store the %s event", role)
+
+
 class ProspectaProvider(MemoryProvider):
     """Hermes MemoryProvider wrapping prospecta.Memory."""
 
@@ -70,6 +216,7 @@ class ProspectaProvider(MemoryProvider):
         self._sync_thread: Optional[threading.Thread] = None
         self._compose_project: Optional[str] = None
         self._llm = None  # built LLM callable; None means no-LLM mode
+        self._shadow: Optional[_ShadowReader] = None  # None = shadow reads OFF
 
     # ---- identity ----
 
@@ -183,6 +330,14 @@ class ProspectaProvider(MemoryProvider):
             or "default"
         )
 
+    def _resolve_shadow_bank_id(self) -> str:
+        """Shadow bank id; empty means OFF. PROSPECTA_SHADOW_BANK (even set to
+        empty, which forces OFF) wins over config."""
+        env = os.environ.get("PROSPECTA_SHADOW_BANK")
+        if env is not None:
+            return env.strip()
+        return str(self._config.get("shadow_bank_id") or "").strip()
+
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
             {
@@ -221,6 +376,27 @@ class ProspectaProvider(MemoryProvider):
                 "key": "prefetch_enabled",
                 "description": "Run recall_synth before each turn (costs 2 LLM calls). Default off.",
                 "default": "false",
+            },
+            {
+                "key": "shadow_bank_id",
+                "description": "Shadow-read bank: every search/recall is also run against it and the old/new pair is logged to recall_events. Empty = OFF (default). PROSPECTA_SHADOW_BANK env overrides (empty forces off).",
+                "default": "",
+            },
+            {
+                "key": "shadow_embed_model",
+                "description": "Embedding model for the shadow bank.",
+                "default": _SHADOW_DEFAULT_EMBED_MODEL,
+            },
+            {
+                "key": "shadow_embedding_dim",
+                "description": "Embedding dimensionality of the shadow bank.",
+                "default": "1536",
+            },
+            {
+                "key": "shadow_mode",
+                "description": "'search' (default): shadow retrieval only, embedding cost. 'full': also shadow recall_synth (LLM, ~0.2-0.4 USD per recall).",
+                "default": "search",
+                "choices": ["search", "full"],
             },
         ]
 
@@ -305,6 +481,73 @@ class ProspectaProvider(MemoryProvider):
             from prospecta.embed import openai as openai_embed
             return openai_embed(model=model or "text-embedding-3-small")
         raise RuntimeError(f"Unknown embedder_kind: {kind!r}")
+
+    def _build_shadow_embedder(self, model: str, dimensions: int):
+        from prospecta.defaults import make_default_embedder
+        return make_default_embedder(model, dimensions=dimensions)
+
+    def _start_shadow(self, bank_id: str) -> None:
+        """Create the shadow reader once; any problem leaves shadow OFF, loudly."""
+        shadow_bank = self._resolve_shadow_bank_id()
+        if not shadow_bank:
+            return
+        try:
+            if shadow_bank == bank_id:
+                raise ValueError(f"shadow_bank_id {shadow_bank!r} must differ from bank_id")
+            mode = str(self._config.get("shadow_mode") or "search").strip().lower()
+            if mode not in ("search", "full"):
+                raise ValueError(f"shadow_mode must be 'search' or 'full', got {mode!r}")
+            if mode == "full" and self._llm is None:
+                logger.error("prospecta shadow_mode=full needs an LLM; using 'search'")
+                mode = "search"
+            model = (str(self._config.get("shadow_embed_model") or "").strip()
+                     or _SHADOW_DEFAULT_EMBED_MODEL)
+            try:
+                dim = int(self._config.get("shadow_embedding_dim") or 1536)
+            except (TypeError, ValueError):
+                logger.warning("invalid shadow_embedding_dim %r; using 1536",
+                               self._config.get("shadow_embedding_dim"))
+                dim = 1536
+            from prospecta._tracer import NoOpTracer
+            from prospecta.memory import Memory
+            shadow_memory = Memory(
+                database_url=self._database_url,
+                embed=self._build_shadow_embedder(model, dim),
+                llm=self._llm if mode == "full" else None,
+                bank_id=shadow_bank,
+                tracer=NoOpTracer(),
+            )
+            self._shadow = _ShadowReader(
+                self._memory, shadow_memory,
+                bank_id=bank_id, shadow_bank_id=shadow_bank, mode=mode,
+            )
+            logger.info("Prospecta shadow reads ON: %s -> %s (%s, dim=%s, mode=%s)",
+                        bank_id, shadow_bank, model, dim, mode)
+        except Exception:
+            self._shadow = None
+            logger.exception("Prospecta shadow reads could not start; shadow is OFF")
+
+    def _shadow_submit(self, tool: str, message: str, *, old_ms: int, mode: str, limit: int,
+                       depth: Optional[str], items: Any = None, result: Any = None) -> None:
+        """Hand the finished OLD answer (search ``items`` or recall_synth ``result``)
+        to the shadow worker. Never raises, never waits."""
+        shadow = self._shadow
+        if shadow is None:
+            return
+        try:
+            synthesis = None
+            queries = [message]
+            if result is not None:
+                items = result.sources
+                synthesis = result.synthesis
+                queries = [q.text for q in (getattr(result, "queries", None) or [])] or queries
+            shadow.submit({
+                "tool": tool, "message": message, "queries": queries,
+                "results": list(items or []), "synthesis": synthesis,
+                "old_ms": old_ms, "mode": mode, "limit": limit, "depth": depth,
+            })
+        except Exception:
+            logger.exception("prospecta shadow submit failed")
 
     def _resolve_llm_model(self) -> Optional[str]:
         """Resolve LLM model id from config or env.
@@ -396,6 +639,8 @@ class ProspectaProvider(MemoryProvider):
                 # prospecta raises BankConfigConflict for dim mismatch; let that propagate
                 raise
 
+        self._start_shadow(bank_id)
+
         logger.info(
             "Prospecta initialized: bank=%s dim=%s mode=%s",
             bank_id, embedding_dim,
@@ -407,6 +652,9 @@ class ProspectaProvider(MemoryProvider):
         t = self._sync_thread
         if t is not None and t.is_alive():
             t.join(timeout=5.0)
+        shadow, self._shadow = self._shadow, None
+        if shadow is not None:  # before the old Memory: it writes the pair events
+            shadow.stop()
         if self._memory is not None:
             try:
                 self._memory.shutdown()
@@ -566,7 +814,11 @@ class ProspectaProvider(MemoryProvider):
                 if self._llm is None:
                     return json.dumps({"error": "prospecta_recall requires an LLM. Set PROSPECTA_LLM_MODEL env or llm_model in prospecta.json and ensure 'prospecta[defaults]' is installed."})
                 limit = int(args.get("limit", 10))
+                t0 = time.monotonic()
                 result = self._memory.recall_synth(query, limit=limit, **_depth_kw(args))
+                self._shadow_submit(
+                    "prospecta_recall", query, result=result, mode="hybrid", limit=limit,
+                    depth=args.get("depth"), old_ms=int((time.monotonic() - t0) * 1000))
                 sources = []
                 for i, s in enumerate(result.sources or []):
                     sources.append({
@@ -602,7 +854,11 @@ class ProspectaProvider(MemoryProvider):
                     return json.dumps({"error": "query is required"})
                 mode = args.get("mode", "hybrid")
                 limit = int(args.get("limit", 10))
+                t0 = time.monotonic()
                 items = self._memory.search(query, mode=mode, limit=limit, **_depth_kw(args))
+                self._shadow_submit(
+                    "prospecta_search", query, items=items, mode=mode, limit=limit,
+                    depth=args.get("depth"), old_ms=int((time.monotonic() - t0) * 1000))
                 results = []
                 for it in items:
                     content = it.original_chunk or it.content
@@ -655,7 +911,11 @@ class ProspectaProvider(MemoryProvider):
         if not enabled or self._memory is None:
             return ""
         try:
+            t0 = time.monotonic()
             result = self._memory.recall_synth(query)
+            self._shadow_submit(
+                "prefetch", query, result=result, mode="hybrid", limit=10, depth=None,
+                old_ms=int((time.monotonic() - t0) * 1000))
             if not result.synthesis:
                 return ""
             srcs = [getattr(s, "source", "") for s in (result.sources or [])[:3]]
