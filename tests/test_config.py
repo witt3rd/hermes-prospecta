@@ -12,6 +12,8 @@ def test_get_config_schema_has_expected_fields(plugin_module):
         "database_url", "bank_id", "embedder_kind", "embedder_model",
         "llm_model", "embedding_dim", "prefetch_enabled",
         "shadow_bank_id", "shadow_embed_model", "shadow_embedding_dim", "shadow_mode",
+        "linked_writes", "dual_write_bank_id", "dual_write_embed_model",
+        "dual_write_embedding_dim", "dual_write_retry_path",
     }
     assert keys == expected
 

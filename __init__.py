@@ -26,12 +26,17 @@ search / recall / prefetch is also run against that bank on a background
 thread and the old/new pair is stored in recall_events. The agent only ever
 sees the old bank's answer.
 
+Linked / dual writes (OFF by default; see README): ``linked_writes`` builds the
+library's linker for the main Memory; ``dual_write_bank_id`` also retains every
+note into a second bank on a background thread, with a JSONL retry file.
+
 Lifecycle hooks: sync_turn (non-blocking daemon thread), on_session_end,
                   shutdown. Prefetch OPT-IN via config (default OFF —
                   spine cost should not be a surprise tax).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -73,7 +78,81 @@ _SHADOW_STOP = object()
 _SHADOW_DEFAULT_EMBED_MODEL = "openrouter/openai/text-embedding-3-large"
 
 
-class _ShadowReader:
+class _BackgroundWorker:
+    """One daemon thread behind a bounded queue that owns one ``Memory``.
+
+    Shared by the shadow reader and the dual writer. ``submit`` never blocks and
+    never raises; ``stop`` drains the queue, joins, then closes the owned Memory.
+    Subclasses set their own attributes first, then call ``__init__`` (it starts
+    the thread), and implement ``_handle``.
+    """
+
+    _label = "worker"
+
+    def __init__(self, owned_memory) -> None:
+        self._owned = owned_memory
+        self._queue: "queue.Queue" = queue.Queue(maxsize=_SHADOW_QUEUE_MAX)
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"prospecta-{self._label}")
+        self._thread.start()
+
+    def submit(self, job: Dict[str, Any]) -> None:
+        """Queue a job; never blocks and never raises."""
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            try:
+                self._on_full(job)
+            except Exception:
+                logger.exception("prospecta %s queue-full handler failed", self._label)
+        except Exception:
+            logger.exception("prospecta %s submit failed", self._label)
+
+    def stop(self) -> None:
+        try:
+            self._queue.put(_SHADOW_STOP, timeout=_SHADOW_DRAIN_TIMEOUT_S)
+        except queue.Full:
+            logger.error("prospecta %s queue stayed full for %ss at shutdown",
+                         self._label, _SHADOW_DRAIN_TIMEOUT_S)
+        self._thread.join(timeout=_SHADOW_DRAIN_TIMEOUT_S)
+        if self._thread.is_alive():
+            logger.error("prospecta %s worker still busy after %ss; leaving its "
+                         "connection open (daemon thread dies with the process)",
+                         self._label, _SHADOW_DRAIN_TIMEOUT_S)
+            try:
+                self._abandon()
+            except Exception:
+                logger.exception("prospecta %s could not save its pending jobs", self._label)
+            return
+        try:
+            self._owned.close()
+        except Exception:
+            logger.exception("prospecta %s memory close failed", self._label)
+
+    def _describe(self, job: Dict[str, Any]) -> str:
+        return repr(job)
+
+    def _on_full(self, job: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def _abandon(self) -> None:
+        """Called when the worker did not finish in time (queue still holds jobs)."""
+
+    def _handle(self, job: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is _SHADOW_STOP:
+                return
+            try:
+                self._handle(job)
+            except Exception:
+                logger.exception("prospecta %s job failed: %s", self._label, self._describe(job))
+
+
+class _ShadowReader(_BackgroundWorker):
     """Replays the old bank's recalls against a second (new) bank, off-path.
 
     The library's ``Memory(shadow_bank_id=...)`` only shadows ``Memory.recall``
@@ -85,6 +164,8 @@ class _ShadowReader:
     Nothing here raises into, or waits on, the caller.
     """
 
+    _label = "shadow"
+
     def __init__(self, memory, shadow_memory, *, bank_id: str, shadow_bank_id: str,
                  mode: str = "search") -> None:
         self._memory = memory            # old-bank Memory: writes both events, resolves ids
@@ -92,49 +173,19 @@ class _ShadowReader:
         self._bank_id = bank_id
         self._shadow_bank_id = shadow_bank_id
         self._mode = mode                # "search" | "full"
-        self._queue: "queue.Queue" = queue.Queue(maxsize=_SHADOW_QUEUE_MAX)
-        self._thread = threading.Thread(target=self._run, daemon=True, name="prospecta-shadow")
-        self._thread.start()
+        super().__init__(shadow_memory)
 
-    def submit(self, job: Dict[str, Any]) -> None:
-        """Queue a job; never blocks and never raises."""
-        try:
-            self._queue.put_nowait(job)
-        except queue.Full:
-            logger.error(
-                "prospecta shadow queue full (%d pending); dropped shadow pair for %s %r",
-                _SHADOW_QUEUE_MAX, job.get("tool"), job.get("message"),
-            )
-        except Exception:
-            logger.exception("prospecta shadow submit failed")
+    def _on_full(self, job: Dict[str, Any]) -> None:
+        logger.error(
+            "prospecta shadow queue full (%d pending); dropped shadow pair for %s %r",
+            _SHADOW_QUEUE_MAX, job.get("tool"), job.get("message"),
+        )
 
-    def stop(self) -> None:
-        try:
-            self._queue.put(_SHADOW_STOP, timeout=_SHADOW_DRAIN_TIMEOUT_S)
-        except queue.Full:
-            logger.error("prospecta shadow queue stayed full for %ss at shutdown",
-                         _SHADOW_DRAIN_TIMEOUT_S)
-        self._thread.join(timeout=_SHADOW_DRAIN_TIMEOUT_S)
-        if self._thread.is_alive():
-            logger.error("prospecta shadow worker still busy after %ss; leaving its "
-                         "connection open (daemon thread dies with the process)",
-                         _SHADOW_DRAIN_TIMEOUT_S)
-            return
-        try:
-            self._shadow.close()
-        except Exception:
-            logger.exception("prospecta shadow memory close failed")
+    def _describe(self, job: Dict[str, Any]) -> str:
+        return f"{job.get('tool')} {job.get('message')!r}"
 
-    def _run(self) -> None:
-        while True:
-            job = self._queue.get()
-            if job is _SHADOW_STOP:
-                return
-            try:
-                self._record(job)
-            except Exception:
-                logger.exception("prospecta shadow job failed: %s %r",
-                                 job.get("tool"), job.get("message"))
+    def _handle(self, job: Dict[str, Any]) -> None:
+        self._record(job)
 
     def _record(self, job: Dict[str, Any]) -> None:
         from prospecta._shadow import _origin_ids
@@ -204,6 +255,102 @@ class _ShadowReader:
                 logger.exception("prospecta shadow could not store the %s event", role)
 
 
+class _DualWriter(_BackgroundWorker):
+    """Writes each note the main bank accepted into a second bank, off-path.
+
+    One ``Memory`` for the second bank (its own embedder, linker on, chunk
+    children on), one daemon thread, the same bounded queue as the shadow
+    reader. A note whose content hash is already in the second bank is skipped,
+    so the catch-up copy and the dual write cannot duplicate. A failed (or
+    queue-overflowing) write is appended to a JSONL retry file; the file is
+    replayed by the worker right after start.
+    """
+
+    _label = "dual-write"
+
+    def __init__(self, memory, *, bank_id: str, retry_path: Path) -> None:
+        self._bank_id = bank_id
+        self._retry_path = Path(retry_path)
+        self._retry_lock = threading.Lock()
+        super().__init__(memory)
+        self.submit({"replay": True})
+
+    def _describe(self, job: Dict[str, Any]) -> str:
+        return f"{job.get('source')!r}"
+
+    def _handle(self, job: Dict[str, Any]) -> None:
+        if job.get("replay"):
+            self._replay()
+        else:
+            self._write(job)
+
+    def _write(self, job: Dict[str, Any]) -> None:
+        try:
+            content = job["content"]
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            with self._owned._pool.connection() as conn:
+                found = conn.execute(
+                    "SELECT 1 FROM documents WHERE bank_id = %s AND content_hash = %s",
+                    (self._bank_id, digest)).fetchone()
+            if found:
+                logger.debug("prospecta dual-write: %s already in %s", job.get("source"), self._bank_id)
+                return
+            kw = {k: job[k] for k in ("source", "tags", "index_text") if job.get(k) is not None}
+            self._owned.retain(content=content, child_chunks=True, **kw)
+        except Exception as e:
+            logger.exception("prospecta dual-write to %s failed for source %r; queued for retry in %s",
+                             self._bank_id, job.get("source"), self._retry_path)
+            self._to_retry(job, f"{type(e).__name__}: {e}")
+
+    def _to_retry(self, job: Dict[str, Any], error: str) -> None:
+        try:
+            line = json.dumps({**job, "error": error, "failed_at": time.time()}, ensure_ascii=False)
+            with self._retry_lock:
+                self._retry_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._retry_path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception:
+            logger.exception("prospecta dual-write could not save a note to the retry file %s; "
+                             "the note was: %r", self._retry_path, job)
+
+    def _on_full(self, job: Dict[str, Any]) -> None:
+        logger.error("prospecta dual-write queue full (%d pending); note %r goes to the retry file",
+                     _SHADOW_QUEUE_MAX, job.get("source"))
+        self._to_retry(job, "queue full")
+
+    def _abandon(self) -> None:
+        while True:
+            try:
+                job = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if job is not _SHADOW_STOP and not job.get("replay"):
+                self._to_retry(job, "shutdown before the write")
+
+    def _replay(self) -> None:
+        """Retry every saved note once; those that fail again land in a fresh retry file."""
+        work = self._retry_path.with_name(self._retry_path.name + ".replaying")
+        with self._retry_lock:  # a crash mid-replay leaves .replaying; it is merged, not lost
+            if self._retry_path.exists():
+                with work.open("a", encoding="utf-8") as w:
+                    w.write(self._retry_path.read_text(encoding="utf-8"))
+                self._retry_path.unlink()
+        if not work.exists():
+            return
+        lines = [ln for ln in work.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        logger.info("prospecta dual-write replaying %d saved note(s) into %s", len(lines), self._bank_id)
+        for ln in lines:
+            try:
+                job = json.loads(ln)
+                if not isinstance(job.get("content"), str):
+                    raise ValueError("no content")
+            except Exception:
+                logger.exception("prospecta dual-write retry line is unreadable, skipped: %r", ln)
+                continue
+            self._write(job)
+        work.unlink()
+
+
 class ProspectaProvider(MemoryProvider):
     """Hermes MemoryProvider wrapping prospecta.Memory."""
 
@@ -217,6 +364,8 @@ class ProspectaProvider(MemoryProvider):
         self._compose_project: Optional[str] = None
         self._llm = None  # built LLM callable; None means no-LLM mode
         self._shadow: Optional[_ShadowReader] = None  # None = shadow reads OFF
+        self._dual: Optional[_DualWriter] = None  # None = dual write OFF
+        self._linked_writes = False
 
     # ---- identity ----
 
@@ -333,10 +482,23 @@ class ProspectaProvider(MemoryProvider):
     def _resolve_shadow_bank_id(self) -> str:
         """Shadow bank id; empty means OFF. PROSPECTA_SHADOW_BANK (even set to
         empty, which forces OFF) wins over config."""
-        env = os.environ.get("PROSPECTA_SHADOW_BANK")
+        return self._resolve_setting("PROSPECTA_SHADOW_BANK", "shadow_bank_id")
+
+    def _resolve_setting(self, env_name: str, key: str) -> str:
+        """Env (even set to empty) wins over config."""
+        env = os.environ.get(env_name)
         if env is not None:
             return env.strip()
-        return str(self._config.get("shadow_bank_id") or "").strip()
+        return str(self._config.get(key) or "").strip()
+
+    def _resolve_linked_writes(self) -> bool:
+        return self._resolve_setting("PROSPECTA_LINKED_WRITES", "linked_writes").lower() in (
+            "1", "true", "yes", "on")
+
+    def _resolve_dual_write_bank_id(self) -> str:
+        """Dual-write bank id; empty means OFF. PROSPECTA_DUAL_WRITE_BANK (even set
+        to empty, which forces OFF) wins over config."""
+        return self._resolve_setting("PROSPECTA_DUAL_WRITE_BANK", "dual_write_bank_id")
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -391,6 +553,31 @@ class ProspectaProvider(MemoryProvider):
                 "key": "shadow_embedding_dim",
                 "description": "Embedding dimensionality of the shadow bank.",
                 "default": "1536",
+            },
+            {
+                "key": "linked_writes",
+                "description": "New notes get entities and links like the migrated bank (the library's linker, plus chunk children). Needs OPENROUTER_API_KEY. Default off. PROSPECTA_LINKED_WRITES env overrides.",
+                "default": "false",
+            },
+            {
+                "key": "dual_write_bank_id",
+                "description": "Second bank that every note is also written to (own embedder, linker on), in the background. Must already exist. Empty = OFF (default). PROSPECTA_DUAL_WRITE_BANK env overrides (empty forces off).",
+                "default": "",
+            },
+            {
+                "key": "dual_write_embed_model",
+                "description": "Embedding model for the dual-write bank.",
+                "default": _SHADOW_DEFAULT_EMBED_MODEL,
+            },
+            {
+                "key": "dual_write_embedding_dim",
+                "description": "Embedding dimensionality of the dual-write bank.",
+                "default": "1536",
+            },
+            {
+                "key": "dual_write_retry_path",
+                "description": "JSONL file for notes whose second write failed; replayed at the next initialize. Default: prospecta-dual-write-retry.jsonl beside prospecta.json.",
+                "default": "",
             },
             {
                 "key": "shadow_mode",
@@ -527,6 +714,70 @@ class ProspectaProvider(MemoryProvider):
             self._shadow = None
             logger.exception("Prospecta shadow reads could not start; shadow is OFF")
 
+    def _stage_kwargs(self) -> Dict[str, Any]:
+        """The library CLI's linker/jev/rerank/synth stages (built when
+        OPENROUTER_API_KEY is set). Any problem yields none, loudly."""
+        try:
+            from prospecta.cli._common import _stage_kwargs
+            kw = _stage_kwargs()
+        except Exception:
+            logger.exception("prospecta could not build the linker stages; none will be used")
+            return {}
+        if "linker" not in kw:
+            logger.warning("prospecta: no linker built (OPENROUTER_API_KEY unset or PROSPECTA_LINKER=off)")
+        return kw
+
+    def _start_dual_write(self, bank_id: str) -> None:
+        """Create the dual writer once; any problem leaves dual write OFF, loudly."""
+        target = self._resolve_dual_write_bank_id()
+        if not target:
+            return
+        try:
+            if target == bank_id:
+                raise ValueError(f"dual_write_bank_id {target!r} must differ from bank_id")
+            model = (str(self._config.get("dual_write_embed_model") or "").strip()
+                     or _SHADOW_DEFAULT_EMBED_MODEL)
+            try:
+                dim = int(self._config.get("dual_write_embedding_dim") or 1536)
+            except (TypeError, ValueError):
+                logger.warning("invalid dual_write_embedding_dim %r; using 1536",
+                               self._config.get("dual_write_embedding_dim"))
+                dim = 1536
+            retry = (str(self._config.get("dual_write_retry_path") or "").strip()
+                     or str(self._hermes_home / "prospecta-dual-write-retry.jsonl"))
+            from prospecta.memory import Memory
+            memory = Memory(
+                database_url=self._database_url,
+                embed=self._build_shadow_embedder(model, dim),
+                llm=self._llm,
+                bank_id=target,
+                **self._stage_kwargs(),
+            )
+            try:
+                memory.bank_stats(target)  # the bank must already exist
+            except Exception:
+                memory.close()
+                raise
+            self._dual = _DualWriter(memory, bank_id=target, retry_path=Path(retry))
+            logger.info("Prospecta dual write ON: %s -> %s (%s, dim=%s, retry file %s)",
+                        bank_id, target, model, dim, retry)
+        except Exception:
+            self._dual = None
+            logger.exception("Prospecta dual write could not start; dual write is OFF")
+
+    def _retain(self, content: str, **kw: Any) -> str:
+        """Write to the main bank (linked when on), then queue the same note for
+        the dual-write bank. The queueing never raises and never waits."""
+        main_kw = dict(kw, child_chunks=True) if self._linked_writes else kw
+        document_id = self._memory.retain(content=content, **main_kw)
+        dual = self._dual
+        if dual is not None:
+            try:
+                dual.submit({"content": content, **kw})
+            except Exception:
+                logger.exception("prospecta dual-write submit failed for %r", kw.get("source"))
+        return document_id
+
     def _shadow_submit(self, tool: str, message: str, *, old_ms: int, mode: str, limit: int,
                        depth: Optional[str], items: Any = None, result: Any = None) -> None:
         """Hand the finished OLD answer (search ``items`` or recall_synth ``result``)
@@ -624,11 +875,13 @@ class ProspectaProvider(MemoryProvider):
         llm = self._build_llm()
         self._llm = llm  # store on provider so callers use self._llm, not Memory internals
 
+        self._linked_writes = self._resolve_linked_writes()
         self._memory = Memory(
             database_url=database_url,
             bank_id=bank_id,
             llm=llm,
             embed=embed,
+            **(self._stage_kwargs() if self._linked_writes else {}),
         )
         try:
             self._memory.create_bank(bank_id, embedding_dim=embedding_dim)
@@ -640,6 +893,7 @@ class ProspectaProvider(MemoryProvider):
                 raise
 
         self._start_shadow(bank_id)
+        self._start_dual_write(bank_id)
 
         logger.info(
             "Prospecta initialized: bank=%s dim=%s mode=%s",
@@ -652,6 +906,9 @@ class ProspectaProvider(MemoryProvider):
         t = self._sync_thread
         if t is not None and t.is_alive():
             t.join(timeout=5.0)
+        dual, self._dual = self._dual, None
+        if dual is not None:  # drains the queued second writes
+            dual.stop()
         shadow, self._shadow = self._shadow, None
         if shadow is not None:  # before the old Memory: it writes the pair events
             shadow.stop()
@@ -804,7 +1061,7 @@ class ProspectaProvider(MemoryProvider):
                     kw["index_text"] = args["index_text"]
                 if "tags" in args and args["tags"]:
                     kw["tags"] = list(args["tags"])
-                document_id = self._memory.retain(content=content, **kw)
+                document_id = self._retain(content, **kw)
                 return json.dumps({"document_id": str(document_id), "source": source})
 
             if tool_name == "prospecta_recall":
@@ -891,9 +1148,9 @@ class ProspectaProvider(MemoryProvider):
                 kwargs = {"source": source, "tags": ["conversation"]}
                 if self._llm is None:
                     kwargs["index_text"] = [user_content, assistant_content]
-                self._memory.retain(content=content, **kwargs)
-            except Exception as e:
-                logger.warning("prospecta sync_turn failed: %s", e)
+                self._retain(content, **kwargs)
+            except Exception:
+                logger.exception("prospecta sync_turn failed")
 
         # Bound any pre-existing in-flight sync
         if self._sync_thread is not None and self._sync_thread.is_alive():
