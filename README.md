@@ -236,12 +236,12 @@ something else since is left alone.
 | `note_date` | empty (on, except with `linked_writes`) | save each new note's date; `PROSPECTA_NOTE_DATE` env overrides |
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
 
+Persisted to `$HERMES_HOME/prospecta.json`.
+
 Connections: each Memory the plugin builds holds at most `max_connections`
 shared connections, however many threads use it, and closes them on shutdown.
 With shadow reads and dual write both on, the plugin uses up to three times
 that. A connection lost to a database restart is replaced on next use.
-
-Persisted to `$HERMES_HOME/prospecta.json`.
 
 ## CLI
 
