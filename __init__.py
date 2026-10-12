@@ -30,6 +30,10 @@ Linked / dual writes (OFF by default; see README): ``linked_writes`` builds the
 library's linker for the main Memory; ``dual_write_bank_id`` also retains every
 note into a second bank on a background thread, with a JSONL retry file.
 
+Note dates (see README): every new note is saved with its local date
+(``metadata={"created_on": ...}``, ``timezone`` config, default
+America/Los_Angeles) so the library's date filter can find it.
+
 Lifecycle hooks: sync_turn (non-blocking daemon thread), on_session_end,
                   shutdown. Prefetch OPT-IN via config (default OFF —
                   spine cost should not be a surprise tax).
@@ -44,6 +48,7 @@ import queue
 import threading
 import time
 import uuid
+from datetime import datetime, timezone as _utc_tz
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -76,6 +81,31 @@ _SHADOW_QUEUE_MAX = 16          # pending shadow jobs; beyond this a job is drop
 _SHADOW_DRAIN_TIMEOUT_S = 30.0  # how long shutdown waits for pending shadow jobs
 _SHADOW_STOP = object()
 _SHADOW_DEFAULT_EMBED_MODEL = "openrouter/openai/text-embedding-3-large"
+
+
+_DEFAULT_TIMEZONE = "America/Los_Angeles"
+
+
+def local_date_iso(tz_name: Optional[str] = None, now: Optional[datetime] = None) -> str:
+    """Today's date (YYYY-MM-DD) in the named timezone; never raises.
+
+    ``now`` (an aware datetime, default the current time) is converted to the
+    zone, so the date is the local calendar day, not the UTC one. An empty or
+    unknown zone name falls back to America/Los_Angeles (logged), and if no
+    zone data is available at all, to UTC.
+    """
+    now = now or datetime.now(_utc_tz.utc)
+    try:
+        from zoneinfo import ZoneInfo
+    except Exception:  # pragma: no cover - zoneinfo is stdlib on 3.9+
+        return now.astimezone(_utc_tz.utc).date().isoformat()
+    wanted = (tz_name or "").strip() or _DEFAULT_TIMEZONE
+    for name in (wanted, _DEFAULT_TIMEZONE):
+        try:
+            return now.astimezone(ZoneInfo(name)).date().isoformat()
+        except Exception:
+            logger.warning("prospecta: unknown timezone %r for note dates; trying the default", name)
+    return now.astimezone(_utc_tz.utc).date().isoformat()
 
 
 class _BackgroundWorker:
@@ -295,7 +325,7 @@ class _DualWriter(_BackgroundWorker):
             if found:
                 logger.debug("prospecta dual-write: %s already in %s", job.get("source"), self._bank_id)
                 return
-            kw = {k: job[k] for k in ("source", "tags", "index_text") if job.get(k) is not None}
+            kw = {k: job[k] for k in ("source", "tags", "index_text", "metadata") if job.get(k) is not None}
             self._owned.retain(content=content, child_chunks=True, **kw)
         except Exception as e:
             logger.exception("prospecta dual-write to %s failed for source %r; queued for retry in %s",
@@ -580,6 +610,16 @@ class ProspectaProvider(MemoryProvider):
                 "default": "",
             },
             {
+                "key": "timezone",
+                "description": "IANA timezone (e.g. America/Los_Angeles) whose calendar day is saved as each new note's date (documents.created_on). Default America/Los_Angeles.",
+                "default": _DEFAULT_TIMEZONE,
+            },
+            {
+                "key": "note_date",
+                "description": "Save each new note's date so date filters work: 'true' / 'false'. Empty (default) = on, except off while linked_writes is on. PROSPECTA_NOTE_DATE env overrides.",
+                "default": "",
+            },
+            {
                 "key": "shadow_mode",
                 "description": "'search' (default): shadow retrieval only, embedding cost. 'full': also shadow recall_synth (LLM, ~0.2-0.4 USD per recall).",
                 "default": "search",
@@ -765,9 +805,50 @@ class ProspectaProvider(MemoryProvider):
             self._dual = None
             logger.exception("Prospecta dual write could not start; dual write is OFF")
 
+    def _note_dates_enabled(self) -> bool:
+        """Save the note's date with new notes? PROSPECTA_NOTE_DATE env (even
+        empty = unset) wins over config ``note_date``. Unset means on, except
+        while linked writes are on (the linker orders notes by this date, so
+        turning it on there is an explicit choice)."""
+        raw = os.environ.get("PROSPECTA_NOTE_DATE")
+        if raw is None or not raw.strip():
+            raw = self._config.get("note_date")
+        text = "" if raw is None else str(raw).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        return not self._linked_writes
+
+    def _note_date_metadata(self) -> Dict[str, Any]:
+        """Document metadata that makes the library store documents.created_on
+        (key ``created_on``): the date now, in the configured ``timezone``
+        (default America/Los_Angeles). Empty when off; never raises."""
+        try:
+            if not self._note_dates_enabled():
+                return {}
+            return {"created_on": local_date_iso(str(self._config.get("timezone") or ""))}
+        except Exception:
+            logger.exception("prospecta: could not work out the note date; saving the note without it")
+            return {}
+
+    def _with_note_date(self, kw: Dict[str, Any]) -> Dict[str, Any]:
+        """kw plus the note date in ``metadata``; other metadata is never
+        touched, and a date already there (created_on / created / date) wins."""
+        existing = kw.get("metadata")
+        if existing is not None and not isinstance(existing, dict):
+            return kw
+        if existing and any(k in existing for k in ("created_on", "created", "date")):
+            return kw
+        stamp = self._note_date_metadata()
+        if not stamp:
+            return kw
+        return {**kw, "metadata": {**(existing or {}), **stamp}}
+
     def _retain(self, content: str, **kw: Any) -> str:
         """Write to the main bank (linked when on), then queue the same note for
         the dual-write bank. The queueing never raises and never waits."""
+        kw = self._with_note_date(kw)
         main_kw = dict(kw, child_chunks=True) if self._linked_writes else kw
         document_id = self._memory.retain(content=content, **main_kw)
         dual = self._dual
@@ -1140,6 +1221,7 @@ class ProspectaProvider(MemoryProvider):
             return
 
         sid = session_id or self._session_id
+        turn_date = self._note_date_metadata()  # the turn's own day, fixed when the turn ends
 
         def _sync() -> None:
             try:
@@ -1148,6 +1230,8 @@ class ProspectaProvider(MemoryProvider):
                 kwargs = {"source": source, "tags": ["conversation"]}
                 if self._llm is None:
                     kwargs["index_text"] = [user_content, assistant_content]
+                if turn_date:
+                    kwargs["metadata"] = dict(turn_date)
                 self._retain(content, **kwargs)
             except Exception:
                 logger.exception("prospecta sync_turn failed")
