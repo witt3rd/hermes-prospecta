@@ -48,6 +48,7 @@ import queue
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone as _utc_tz
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -106,6 +107,190 @@ def local_date_iso(tz_name: Optional[str] = None, now: Optional[datetime] = None
         except Exception:
             logger.warning("prospecta: unknown timezone %r for note dates; trying the default", name)
     return now.astimezone(_utc_tz.utc).date().isoformat()
+
+
+_DEFAULT_MAX_CONNECTIONS = 4
+_POOL_WAIT_S = 30.0
+
+
+class _BoundedPool:
+    """Stands in for a Memory's ``_pool``: at most ``max_connections`` shared
+    connections, however many threads use it.
+
+    The library's own pool keeps one connection per thread and never closes it
+    when the thread ends, which piles up on a gateway that runs each turn on a
+    new thread. Here a thread borrows one connection for the length of a
+    ``connection()``/``cursor()`` block (nested blocks on the same thread reuse
+    it) and gives it back. A connection that has been lost is dropped and the
+    next borrower gets a fresh one. Same methods as the library pool:
+    connection(), cursor(), dedicated(), close(), ``_conn``, ``database_url``.
+    """
+
+    def __init__(self, database_url: str, max_connections: int = _DEFAULT_MAX_CONNECTIONS) -> None:
+        self._database_url = database_url
+        self._max = max(1, int(max_connections))
+        self._cond = threading.Condition()
+        self._idle: List[Any] = []
+        self._open: List[Any] = []   # every connection this pool opened and still holds
+        self._creating = 0
+        self._closed = False
+        self._local = threading.local()  # the connection this thread has borrowed right now
+
+    @property
+    def database_url(self) -> str:
+        return self._database_url
+
+    @property
+    def _conn(self):
+        return getattr(self._local, "conn", None)
+
+    @staticmethod
+    def _lost(conn) -> bool:
+        return bool(conn.closed or getattr(conn, "broken", False))
+
+    def _drop(self, conn) -> None:
+        with self._cond:
+            if conn in self._open:
+                self._open.remove(conn)
+            self._cond.notify()
+        try:
+            if not conn.closed:
+                conn.close()
+        except Exception:
+            logger.debug("prospecta: closing a lost connection failed", exc_info=True)
+
+    def _acquire(self):
+        import psycopg
+        deadline = time.monotonic() + _POOL_WAIT_S
+        with self._cond:
+            while True:
+                if self._closed:
+                    raise RuntimeError("prospecta connection pool is closed")
+                while self._idle:
+                    conn = self._idle.pop()
+                    if not self._lost(conn):
+                        return conn
+                    self._open.remove(conn)
+                    try:
+                        if not conn.closed:
+                            conn.close()  # broken: only frees the socket, no round trip
+                    except Exception:
+                        pass
+                if len(self._open) + self._creating < self._max:
+                    self._creating += 1
+                    break
+                if not self._cond.wait(timeout=max(0.0, deadline - time.monotonic())) \
+                        and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"no free database connection after {_POOL_WAIT_S:.0f}s "
+                        f"(max_connections={self._max})")
+        try:
+            conn = psycopg.connect(self._database_url, autocommit=False)
+        except BaseException:
+            with self._cond:
+                self._creating -= 1
+                self._cond.notify()
+            raise
+        with self._cond:
+            self._creating -= 1
+            if self._closed:
+                conn.close()
+                raise RuntimeError("prospecta connection pool is closed")
+            self._open.append(conn)
+        return conn
+
+    def _release(self, conn) -> None:
+        if not self._lost(conn):
+            try:
+                if conn.info.transaction_status != 0:  # not IDLE: never hand on a half-done transaction
+                    conn.rollback()
+            except Exception:
+                pass
+        if self._lost(conn) or self._closed:
+            self._drop(conn)
+            return
+        with self._cond:
+            self._idle.append(conn)
+            self._cond.notify()
+
+    @contextmanager
+    def _borrowed(self):
+        conn = self._conn
+        if conn is not None:  # nested on this thread: same connection, same transaction
+            yield conn
+            return
+        conn = self._acquire()
+        self._local.conn = conn
+        try:
+            yield conn
+        finally:
+            self._local.conn = None
+            self._release(conn)
+
+    @contextmanager
+    def connection(self):
+        """Yield a connection. Caller manages commit/rollback."""
+        with self._borrowed() as conn:
+            try:
+                yield conn
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    @contextmanager
+    def cursor(self):
+        """Yield a cursor with commit on success, rollback on error."""
+        with self._borrowed() as conn:
+            try:
+                with conn.cursor() as cur:
+                    yield cur
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    @contextmanager
+    def dedicated(self):
+        """A private connection for work on another thread; closed afterwards."""
+        import psycopg
+        conn = psycopg.connect(self._database_url, autocommit=False)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            conns, self._open, self._idle = self._open, [], []
+            self._cond.notify_all()
+        for c in conns:
+            try:
+                if not c.closed:
+                    c.close()
+            except Exception:
+                logger.debug("prospecta: closing a connection failed", exc_info=True)
+
+
+def _build_memory(max_connections: int = _DEFAULT_MAX_CONNECTIONS, **kw: Any):
+    """``prospecta.Memory(**kw)`` whose connections are a ``_BoundedPool``
+    (also used by its default tracer sink), so ``close()`` ends them all."""
+    from prospecta.memory import Memory
+    memory = Memory(**kw)
+    old = getattr(memory, "_pool", None)
+    if old is not None:
+        pool = _BoundedPool(old.database_url, max_connections)
+        memory._pool = pool
+        tracer = getattr(memory, "_tracer", None)
+        if getattr(tracer, "_pool", None) is old:
+            tracer._pool = pool
+    return memory
 
 
 class _BackgroundWorker:
@@ -521,6 +706,14 @@ class ProspectaProvider(MemoryProvider):
             return env.strip()
         return str(self._config.get(key) or "").strip()
 
+    def _resolve_max_connections(self) -> int:
+        """Connections each Memory may hold open (default 4)."""
+        try:
+            n = int(self._config.get("max_connections") or _DEFAULT_MAX_CONNECTIONS)
+        except (TypeError, ValueError):
+            n = _DEFAULT_MAX_CONNECTIONS
+        return n if n >= 1 else _DEFAULT_MAX_CONNECTIONS
+
     def _resolve_linked_writes(self) -> bool:
         return self._resolve_setting("PROSPECTA_LINKED_WRITES", "linked_writes").lower() in (
             "1", "true", "yes", "on")
@@ -542,6 +735,11 @@ class ProspectaProvider(MemoryProvider):
                 "key": "bank_id",
                 "description": "Bank identifier (multi-tenant key). Default 'default'.",
                 "default": "default",
+            },
+            {
+                "key": "max_connections",
+                "description": "Most database connections each Memory (main, shadow, dual write) keeps open. Default 4.",
+                "default": "4",
             },
             {
                 "key": "embedder_kind",
@@ -736,8 +934,8 @@ class ProspectaProvider(MemoryProvider):
                                self._config.get("shadow_embedding_dim"))
                 dim = 1536
             from prospecta._tracer import NoOpTracer
-            from prospecta.memory import Memory
-            shadow_memory = Memory(
+            shadow_memory = _build_memory(
+                self._resolve_max_connections(),
                 database_url=self._database_url,
                 embed=self._build_shadow_embedder(model, dim),
                 llm=self._llm if mode == "full" else None,
@@ -785,8 +983,8 @@ class ProspectaProvider(MemoryProvider):
                 dim = 1536
             retry = (str(self._config.get("dual_write_retry_path") or "").strip()
                      or str(self._hermes_home / "prospecta-dual-write-retry.jsonl"))
-            from prospecta.memory import Memory
-            memory = Memory(
+            memory = _build_memory(
+                self._resolve_max_connections(),
                 database_url=self._database_url,
                 embed=self._build_shadow_embedder(model, dim),
                 llm=self._llm,
@@ -942,7 +1140,6 @@ class ProspectaProvider(MemoryProvider):
         self._database_url = database_url
 
         from prospecta.db.migrate import run_migrations
-        from prospecta.memory import Memory
 
         run_migrations(database_url=database_url)
 
@@ -957,7 +1154,8 @@ class ProspectaProvider(MemoryProvider):
         self._llm = llm  # store on provider so callers use self._llm, not Memory internals
 
         self._linked_writes = self._resolve_linked_writes()
-        self._memory = Memory(
+        self._memory = _build_memory(
+            self._resolve_max_connections(),
             database_url=database_url,
             bank_id=bank_id,
             llm=llm,

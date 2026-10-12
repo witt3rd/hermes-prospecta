@@ -222,6 +222,7 @@ something else since is left alone.
 | `embedder_model` | empty | provider-specific default if empty |
 | `llm_model` | empty | LiteLLM model id for recall/formulation (e.g. `anthropic/claude-haiku-4-5`); `PROSPECTA_LLM_MODEL` env overrides |
 | `embedding_dim` | `1536` | must match the embedder |
+| `max_connections` | `4` | most database connections each Memory (main, shadow, dual write) keeps open; threads take turns on them. Raise it only if tool calls wait for a free connection |
 | `prefetch_enabled` | `false` | opt-in spine cost |
 | `shadow_bank_id` | empty (OFF) | shadow-read bank, see [Shadow reads](#shadow-reads); `PROSPECTA_SHADOW_BANK` env overrides (set it empty to force OFF) |
 | `shadow_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the shadow bank |
@@ -236,6 +237,11 @@ something else since is left alone.
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
 
 Persisted to `$HERMES_HOME/prospecta.json`.
+
+Connections: each Memory the plugin builds holds at most `max_connections`
+shared connections, however many threads use it, and closes them on shutdown.
+With shadow reads and dual write both on, the plugin uses up to three times
+that. A connection lost to a database restart is replaced on next use.
 
 ## CLI
 
