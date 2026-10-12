@@ -113,9 +113,44 @@ the same shape as the library's own shadow of `Memory.recall()`.
   and prefetch the pair's old row is a second row; filter on `trace -> 'shadow'`.
 - The shadow bank must already exist, with `shadow_embedding_dim` matching it.
 
+## Linked and dual writes
+
+**Both OFF by default**; with both off nothing changes (no extra `Memory`, no
+extra thread). They prepare a switch to a newer bank.
+
+- `linked_writes` builds the main `Memory` with the stages the library CLI
+  builds (`prospecta.cli._common._stage_kwargs()`: linker, Jev, rerank and
+  synth LLMs, built when `OPENROUTER_API_KEY` is set; `PROSPECTA_LINKER=off` /
+  `PROSPECTA_JEV=off` opt out), and retains notes with `child_chunks=True`. New
+  notes get entities and links like the migrated bank. Note that the same
+  stages also apply to recall on that `Memory`. The library links on its own
+  worker thread; a linking (or stage build) failure is logged with the full
+  exception and never fails the turn.
+- `dual_write_bank_id` queues every note the main bank accepted (`sync_turn`
+  and `prospecta_retain`) for one background daemon thread (bounded queue, 16
+  pending, same worker as the shadow reads) that retains it into that bank with
+  its own embedder, the linker on and chunk children. The agent's turn never
+  waits for it and it can never fail it.
+- The second write is idempotent: a note whose content hash is already in the
+  second bank is skipped, so a catch-up copy and the dual write cannot
+  duplicate.
+- A failed second write (or a note that does not fit the queue, or is still
+  pending after the 30 s shutdown drain) is logged in full and appended to the
+  retry file (JSONL: content, source, tags, index_text, error, failed_at). The
+  worker replays that file right after each `initialize`; notes that fail
+  again stay in a fresh file.
+- The second `Memory` is built once at `initialize` and closed in `shutdown`
+  after the queue drains. The bank must already exist; otherwise dual write
+  stays OFF with an ERROR log (the catch-up copy covers the gap).
+- Timestamps: the library's `retain` takes no creation time, so the second
+  bank stamps `documents.created_at` when the second write runs (seconds after
+  the main one, or at replay time for a retried note). `created_on` is derived
+  from the note's own content/metadata in both banks, identically. If the second
+  bank asks the LLM for `index_text` it gets its own questions.
+
 ## Configuration
 
-`get_config_schema()` exposes eleven fields (`hermes memory setup` walks them):
+`get_config_schema()` exposes sixteen fields (`hermes memory setup` walks them):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -130,6 +165,11 @@ the same shape as the library's own shadow of `Memory.recall()`.
 | `shadow_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the shadow bank |
 | `shadow_embedding_dim` | `1536` | dimensionality of the shadow bank |
 | `shadow_mode` | `search` | `search` = retrieval only; `full` = also shadow `recall_synth` (LLM cost) |
+| `linked_writes` | `false` | linked notes, see [Linked and dual writes](#linked-and-dual-writes); `PROSPECTA_LINKED_WRITES` env overrides |
+| `dual_write_bank_id` | empty (OFF) | second bank every note is also written to; `PROSPECTA_DUAL_WRITE_BANK` env overrides (set it empty to force OFF) |
+| `dual_write_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the dual-write bank |
+| `dual_write_embedding_dim` | `1536` | dimensionality of the dual-write bank |
+| `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
 
 Persisted to `$HERMES_HOME/prospecta.json`.
 
