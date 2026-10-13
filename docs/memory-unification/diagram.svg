@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 548" font-family="Publishing Sans, sans-serif" role="img" aria-label="Agents on the left talk to one memory contract in the middle; two separate memories on the right answer it; a privacy line runs underneath.">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#5b4bd6"/></marker>
+  </defs>
+
+  <text x="30" y="36" font-size="28" font-weight="700" fill="#4a5163">Who asks</text>
+  <text x="1060" y="36" font-size="28" font-weight="700" fill="#4a5163">Who answers</text>
+
+  <!-- left column: agents -->
+  <rect x="30" y="52" width="370" height="104" rx="16" fill="#ffffff" stroke="#dcd9d0" stroke-width="2"/>
+  <text x="215" y="96" font-size="31" font-weight="700" text-anchor="middle" fill="#1d2433">Hermes Januses</text>
+  <text x="215" y="134" font-size="25" text-anchor="middle" fill="#4a5163">Augur, Forge, Lee</text>
+
+  <rect x="30" y="172" width="370" height="104" rx="16" fill="#ffffff" stroke="#dcd9d0" stroke-width="2"/>
+  <text x="215" y="216" font-size="31" font-weight="700" text-anchor="middle" fill="#1d2433">Spire's own agents</text>
+  <text x="215" y="254" font-size="25" text-anchor="middle" fill="#4a5163">Spire, Janus, specialists</text>
+
+  <rect x="30" y="292" width="370" height="104" rx="16" fill="#ffffff" stroke="#dcd9d0" stroke-width="2"/>
+  <text x="215" y="336" font-size="31" font-weight="700" text-anchor="middle" fill="#1d2433">rung agents</text>
+  <text x="215" y="374" font-size="25" text-anchor="middle" fill="#4a5163">run inside the host</text>
+
+  <!-- arrows in -->
+  <path d="M402 104 H500" stroke="#5b4bd6" stroke-width="5" marker-end="url(#a)"/>
+  <path d="M402 224 H500" stroke="#5b4bd6" stroke-width="5" marker-end="url(#a)"/>
+  <path d="M402 344 H500" stroke="#5b4bd6" stroke-width="5" marker-end="url(#a)"/>
+
+  <!-- centre: the contract -->
+  <rect x="510" y="52" width="440" height="360" rx="18" fill="#ece9fb" stroke="#5b4bd6" stroke-width="3"/>
+  <text x="730" y="98" font-size="32" font-weight="700" text-anchor="middle" fill="#5b4bd6">One memory contract</text>
+  <text x="540" y="150" font-size="25" fill="#1d2433">1  Recall before the turn</text>
+  <text x="540" y="192" font-size="25" fill="#1d2433">2  Retain after the turn</text>
+  <text x="540" y="234" font-size="25" fill="#1d2433">3  Tools: recall, remember,</text>
+  <text x="540" y="264" font-size="25" fill="#1d2433">    forget</text>
+  <text x="540" y="306" font-size="25" fill="#1d2433">4  Scope key and audience</text>
+  <text x="540" y="348" font-size="25" fill="#1d2433">5  Provenance (cited)</text>
+  <text x="540" y="384" font-size="25" fill="#1d2433">6  Cost reported</text>
+
+  <!-- arrows out -->
+  <path d="M952 134 H1050" stroke="#5b4bd6" stroke-width="5" marker-end="url(#a)"/>
+  <path d="M952 314 H1050" stroke="#5b4bd6" stroke-width="5" marker-end="url(#a)"/>
+
+  <!-- right column: the two memories -->
+  <rect x="1060" y="52" width="410" height="168" rx="16" fill="#ffffff" stroke="#dcd9d0" stroke-width="2"/>
+  <text x="1265" y="96" font-size="31" font-weight="700" text-anchor="middle" fill="#1d2433">Prospecta</text>
+  <text x="1265" y="138" font-size="24" text-anchor="middle" fill="#4a5163">Whole turns kept, matched by</text>
+  <text x="1265" y="170" font-size="24" text-anchor="middle" fill="#4a5163">question, links, rerank</text>
+  <text x="1265" y="204" font-size="24" text-anchor="middle" fill="#4a5163">One bank per Janus</text>
+
+  <rect x="1060" y="236" width="410" height="160" rx="16" fill="#ffffff" stroke="#dcd9d0" stroke-width="2"/>
+  <text x="1265" y="280" font-size="31" font-weight="700" text-anchor="middle" fill="#1d2433">Spire memory</text>
+  <text x="1265" y="322" font-size="24" text-anchor="middle" fill="#4a5163">Judged notes, Library pages,</text>
+  <text x="1265" y="354" font-size="24" text-anchor="middle" fill="#4a5163">chat lines, one access rule</text>
+  <text x="1265" y="384" font-size="24" text-anchor="middle" fill="#4a5163">Every fact is cited</text>
+
+  <!-- privacy line -->
+  <rect x="30" y="428" width="1440" height="104" rx="16" fill="#ffffff" stroke="#5b4bd6" stroke-width="3" stroke-dasharray="14 10"/>
+  <text x="750" y="472" font-size="30" font-weight="700" text-anchor="middle" fill="#5b4bd6">The privacy line</text>
+  <text x="750" y="510" font-size="25" text-anchor="middle" fill="#1d2433">Only private chat lines are private, and they stay in their room. Secrets are stripped before anything is kept.</text>
+</svg>
