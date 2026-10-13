@@ -127,6 +127,7 @@ def local_date_iso(tz_name: Optional[str] = None, now: Optional[datetime] = None
 
 
 _DEFAULT_MAX_CONNECTIONS = 4
+_DEFAULT_POOL_IDLE_SECONDS = 300
 _POOL_WAIT_S = 30.0
 
 
@@ -139,13 +140,21 @@ class _BoundedPool:
     new thread. Here a thread borrows one connection for the length of a
     ``connection()``/``cursor()`` block (nested blocks on the same thread reuse
     it) and gives it back. A connection that has been lost is dropped and the
-    next borrower gets a fresh one. Same methods as the library pool:
+    next borrower gets a fresh one. A connection that sits unused for longer
+    than ``idle_seconds`` is closed (by a timer, and never handed out stale);
+    the next use opens a new one. Same methods as the library pool:
     connection(), cursor(), dedicated(), close(), ``_conn``, ``database_url``.
     """
 
-    def __init__(self, database_url: str, max_connections: int = _DEFAULT_MAX_CONNECTIONS) -> None:
+    def __init__(self, database_url: str, max_connections: int = _DEFAULT_MAX_CONNECTIONS,
+                 idle_seconds: float = _DEFAULT_POOL_IDLE_SECONDS,
+                 clock: Any = time.monotonic) -> None:
         self._database_url = database_url
         self._max = max(1, int(max_connections))
+        self._idle_seconds = idle_seconds
+        self._clock = clock
+        self._idle_since: Dict[int, float] = {}  # id(conn) -> when it went idle
+        self._timer: Optional[threading.Timer] = None
         self._cond = threading.Condition()
         self._idle: List[Any] = []
         self._open: List[Any] = []   # every connection this pool opened and still holds
@@ -176,15 +185,67 @@ class _BoundedPool:
         except Exception:
             logger.debug("prospecta: closing a lost connection failed", exc_info=True)
 
+    def _expire_idle(self) -> List[Any]:
+        """Take the connections idle longer than ``idle_seconds`` out of the
+        pool (caller holds the lock and closes them)."""
+        now = self._clock()
+        stale = [c for c in self._idle if now - self._idle_since.get(id(c), now) > self._idle_seconds]
+        for c in stale:
+            self._idle.remove(c)
+            self._idle_since.pop(id(c), None)
+            if c in self._open:
+                self._open.remove(c)
+        if stale:
+            self._cond.notify_all()
+        return stale
+
+    def _close_all(self, conns: List[Any]) -> None:
+        for c in conns:
+            try:
+                if not c.closed:
+                    c.close()
+            except Exception:
+                logger.debug("prospecta: closing an idle connection failed", exc_info=True)
+
+    def reap(self) -> None:
+        """Close the connections that have been idle too long."""
+        with self._cond:
+            stale = self._expire_idle()
+        self._close_all(stale)
+
+    def _reap_later(self) -> None:
+        """Run ``reap`` once the oldest idle connection is due (lock held)."""
+        if self._timer is not None or self._closed or not self._idle:
+            return
+        now = self._clock()
+        oldest = min(self._idle_since.get(id(c), now) for c in self._idle)
+        delay = max(0.0, oldest + self._idle_seconds - now) + 0.01
+        self._timer = threading.Timer(delay, self._on_timer)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _on_timer(self) -> None:
+        with self._cond:
+            self._timer = None
+        try:
+            self.reap()
+        finally:
+            with self._cond:
+                self._reap_later()
+
     def _acquire(self):
         import psycopg
         deadline = time.monotonic() + _POOL_WAIT_S
+        with self._cond:
+            stale = self._expire_idle()
+        self._close_all(stale)
         with self._cond:
             while True:
                 if self._closed:
                     raise RuntimeError("prospecta connection pool is closed")
                 while self._idle:
                     conn = self._idle.pop()
+                    self._idle_since.pop(id(conn), None)
                     if not self._lost(conn):
                         return conn
                     self._open.remove(conn)
@@ -228,7 +289,9 @@ class _BoundedPool:
             return
         with self._cond:
             self._idle.append(conn)
+            self._idle_since[id(conn)] = self._clock()
             self._cond.notify()
+            self._reap_later()
 
     @contextmanager
     def _borrowed(self):
@@ -286,7 +349,11 @@ class _BoundedPool:
         with self._cond:
             self._closed = True
             conns, self._open, self._idle = self._open, [], []
+            self._idle_since.clear()
+            timer, self._timer = self._timer, None
             self._cond.notify_all()
+        if timer is not None:
+            timer.cancel()
         for c in conns:
             try:
                 if not c.closed:
@@ -295,19 +362,126 @@ class _BoundedPool:
                 logger.debug("prospecta: closing a connection failed", exc_info=True)
 
 
-def _build_memory(max_connections: int = _DEFAULT_MAX_CONNECTIONS, **kw: Any):
+def _build_memory(max_connections: int = _DEFAULT_MAX_CONNECTIONS,
+                  pool_idle_seconds: float = _DEFAULT_POOL_IDLE_SECONDS, **kw: Any):
     """``prospecta.Memory(**kw)`` whose connections are a ``_BoundedPool``
     (also used by its default tracer sink), so ``close()`` ends them all."""
     from prospecta.memory import Memory
     memory = Memory(**kw)
     old = getattr(memory, "_pool", None)
     if old is not None:
-        pool = _BoundedPool(old.database_url, max_connections)
+        pool = _BoundedPool(old.database_url, max_connections, pool_idle_seconds)
         memory._pool = pool
         tracer = getattr(memory, "_tracer", None)
         if getattr(tracer, "_pool", None) is old:
             tracer._pool = pool
     return memory
+
+
+_DEFAULT_CONNECTION_WATCH_PERCENT = 70
+_CONNECTION_WATCH_INTERVAL_S = 120.0
+_HEALTH_FILENAME = "memory-provider-health.json"  # hermes-agent's agent/memory_health.py
+_WATCH_KIND = "connection_limit"
+
+
+class _ConnectionWatch:
+    """Warns loudly, in time, when the database nears its connection limit.
+
+    A daemon thread checks at start and then every ``interval`` seconds, with
+    one cheap query on its own short-lived connection (never the pool's). At
+    ``percent`` of ``max_connections`` or more, or when the query itself fails
+    (a full server refuses it), it logs at ERROR with the numbers and writes
+    ``$HERMES_HOME/memory-provider-health.json`` in hermes-agent's format, so
+    the being's next turn shows a notice. It clears that notice, and only its
+    own, once the numbers are back under the line.
+    """
+
+    def __init__(self, database_url: str, hermes_home: Path, percent: int = _DEFAULT_CONNECTION_WATCH_PERCENT,
+                 interval: float = _CONNECTION_WATCH_INTERVAL_S, provider: str = "prospecta") -> None:
+        self._url = database_url
+        self._path = Path(hermes_home) / _HEALTH_FILENAME
+        self._percent = percent
+        self._interval = interval
+        self._provider = provider
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True, name="prospecta-connection-watch")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=10.0)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.check()
+            self._stop.wait(self._interval)
+
+    def _count(self) -> "tuple[int, int]":
+        import psycopg
+        with psycopg.connect(self._url, autocommit=True, connect_timeout=5) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()")
+            used = int(cur.fetchone()[0])
+            cur.execute("SHOW max_connections")
+            limit = int(cur.fetchone()[0])
+        return used, limit
+
+    def check(self) -> None:
+        """One check; never raises."""
+        try:
+            try:
+                used, limit = self._count()
+            except Exception as e:
+                self._alarm(f"the connection check failed, the database may be full: {type(e).__name__}: {e}")
+                return
+            pct = 100.0 * used / limit if limit > 0 else 100.0
+            if pct >= self._percent:
+                self._alarm(f"the database is close to its connection limit: {used} of {limit} "
+                            f"connections in use ({pct:.0f}%, warning line {self._percent}%); "
+                            "memory will fail when it is full")
+            else:
+                self._clear()
+        except Exception:
+            logger.exception("prospecta connection watch failed")
+
+    def _read(self) -> Dict[str, Any]:
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _alarm(self, reason: str) -> None:
+        logger.error("memory_provider_unavailable provider=%s source=connection_watch: %s",
+                     self._provider, reason)
+        prev = self._read()
+        same = prev.get("provider") == self._provider and prev.get("kind") == _WATCH_KIND
+        if prev.get("status") == "unavailable" and not same:
+            return  # another cause already owns the notice; do not overwrite it
+        now = datetime.now(_utc_tz.utc).isoformat(timespec="seconds")
+        state = {"status": "unavailable", "provider": self._provider, "kind": _WATCH_KIND,
+                 "reason": reason, "source": "connection_watch",
+                 "since": (prev.get("since") if same else None) or now, "last_checked": now}
+        try:
+            tmp = self._path.with_name(self._path.name + f".tmp.{os.getpid()}")
+            tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, self._path)
+        except Exception:
+            logger.exception("prospecta: could not write %s", self._path)
+
+    def _clear(self) -> None:
+        prev = self._read()
+        if prev.get("provider") == self._provider and prev.get("kind") == _WATCH_KIND:
+            try:
+                self._path.unlink(missing_ok=True)
+                logger.info("memory_provider_recovered provider=%s source=connection_watch", self._provider)
+            except Exception:
+                logger.exception("prospecta: could not remove %s", self._path)
 
 
 class _BackgroundWorker:
@@ -598,6 +772,7 @@ class ProspectaProvider(MemoryProvider):
         self._shadow: Optional[_ShadowReader] = None  # None = shadow reads OFF
         self._dual: Optional[_DualWriter] = None  # None = dual write OFF
         self._linked_writes = False
+        self._conn_watch: Optional[_ConnectionWatch] = None
 
     # ---- identity ----
 
@@ -731,6 +906,44 @@ class ProspectaProvider(MemoryProvider):
             n = _DEFAULT_MAX_CONNECTIONS
         return n if n >= 1 else _DEFAULT_MAX_CONNECTIONS
 
+    def _resolve_pool_idle_seconds(self) -> int:
+        """Seconds a pooled connection may sit unused before it is closed
+        (default 300). PROSPECTA_POOL_IDLE_SECONDS env wins over config."""
+        raw = os.environ.get("PROSPECTA_POOL_IDLE_SECONDS")
+        if raw is None or not raw.strip():
+            raw = self._config.get("pool_idle_seconds")
+        try:
+            n = int(raw or _DEFAULT_POOL_IDLE_SECONDS)
+        except (TypeError, ValueError):
+            n = _DEFAULT_POOL_IDLE_SECONDS
+        return n if n >= 1 else _DEFAULT_POOL_IDLE_SECONDS
+
+    def _connection_watch_enabled(self) -> bool:
+        """Watch the database's connection count? Default on."""
+        raw = os.environ.get("PROSPECTA_CONNECTION_WATCH")
+        if raw is None or not raw.strip():
+            raw = self._config.get("connection_watch")
+        return ("" if raw is None else str(raw).strip().lower()) not in ("0", "false", "no", "off")
+
+    def _resolve_connection_watch_percent(self) -> int:
+        """Share of max_connections (1-100) at which the watch warns (default 70)."""
+        try:
+            n = int(self._config.get("connection_watch_percent") or _DEFAULT_CONNECTION_WATCH_PERCENT)
+        except (TypeError, ValueError):
+            n = _DEFAULT_CONNECTION_WATCH_PERCENT
+        return n if 1 <= n <= 100 else _DEFAULT_CONNECTION_WATCH_PERCENT
+
+    def _start_connection_watch(self) -> None:
+        if not self._connection_watch_enabled():
+            return
+        try:
+            self._conn_watch = _ConnectionWatch(
+                self._database_url, self._hermes_home, self._resolve_connection_watch_percent())
+            self._conn_watch.start()
+        except Exception:
+            self._conn_watch = None
+            logger.exception("Prospecta connection watch could not start")
+
     def _resolve_linked_writes(self) -> bool:
         return self._resolve_setting("PROSPECTA_LINKED_WRITES", "linked_writes").lower() in (
             "1", "true", "yes", "on")
@@ -757,6 +970,21 @@ class ProspectaProvider(MemoryProvider):
                 "key": "max_connections",
                 "description": "Most database connections each Memory (main, shadow, dual write) keeps open. Default 4.",
                 "default": "4",
+            },
+            {
+                "key": "pool_idle_seconds",
+                "description": "Seconds a pooled database connection may sit unused before it is closed (a new one opens on next use). Default 300. PROSPECTA_POOL_IDLE_SECONDS env overrides.",
+                "default": "300",
+            },
+            {
+                "key": "connection_watch",
+                "description": "Warn loudly (ERROR log and a notice on the next turn) when the database nears its connection limit: 'true' / 'false'. Default on. PROSPECTA_CONNECTION_WATCH env overrides.",
+                "default": "true",
+            },
+            {
+                "key": "connection_watch_percent",
+                "description": "Share of the database's max_connections (1-100) in use at which connection_watch warns. Default 70.",
+                "default": "70",
             },
             {
                 "key": "embedder_kind",
@@ -963,6 +1191,7 @@ class ProspectaProvider(MemoryProvider):
             from prospecta._tracer import NoOpTracer
             shadow_memory = _build_memory(
                 self._resolve_max_connections(),
+                self._resolve_pool_idle_seconds(),
                 database_url=self._database_url,
                 embed=self._build_shadow_embedder(model, dim),
                 llm=self._llm if mode == "full" else None,
@@ -1012,6 +1241,7 @@ class ProspectaProvider(MemoryProvider):
                      or str(self._hermes_home / "prospecta-dual-write-retry.jsonl"))
             memory = _build_memory(
                 self._resolve_max_connections(),
+                self._resolve_pool_idle_seconds(),
                 database_url=self._database_url,
                 embed=self._build_shadow_embedder(model, dim),
                 llm=self._llm,
@@ -1226,6 +1456,7 @@ class ProspectaProvider(MemoryProvider):
         self._linked_writes = self._resolve_linked_writes()
         self._memory = _build_memory(
             self._resolve_max_connections(),
+            self._resolve_pool_idle_seconds(),
             database_url=database_url,
             bank_id=bank_id,
             llm=llm,
@@ -1243,6 +1474,7 @@ class ProspectaProvider(MemoryProvider):
 
         self._start_shadow(bank_id)
         self._start_dual_write(bank_id)
+        self._start_connection_watch()
 
         logger.info(
             "Prospecta initialized: bank=%s dim=%s mode=%s",
@@ -1255,6 +1487,9 @@ class ProspectaProvider(MemoryProvider):
         t = self._sync_thread
         if t is not None and t.is_alive():
             t.join(timeout=5.0)
+        watch, self._conn_watch = self._conn_watch, None
+        if watch is not None:
+            watch.stop()
         dual, self._dual = self._dual, None
         if dual is not None:  # drains the queued second writes
             dual.stop()

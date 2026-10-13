@@ -14,7 +14,8 @@ def test_get_config_schema_has_expected_fields(plugin_module):
         "shadow_bank_id", "shadow_embed_model", "shadow_embedding_dim", "shadow_mode",
         "linked_writes", "dual_write_bank_id", "dual_write_embed_model",
         "dual_write_embedding_dim", "dual_write_retry_path", "timezone", "note_date", "hash_precheck",
-        "max_connections", "tool_guide",
+        "max_connections", "tool_guide", "pool_idle_seconds", "connection_watch",
+        "connection_watch_percent",
     }
     assert keys == expected
 
