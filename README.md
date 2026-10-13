@@ -234,6 +234,7 @@ something else since is left alone.
 | `dual_write_embedding_dim` | `1536` | dimensionality of the dual-write bank |
 | `timezone` | `America/Los_Angeles` | IANA zone whose calendar day is saved as each new note's date, see [Note dates](#note-dates) |
 | `note_date` | empty (on, except with `linked_writes`) | save each new note's date; `PROSPECTA_NOTE_DATE` env overrides |
+| `hash_precheck` | empty (on) | before saving, look for the same text already in the bank and skip the write (no LLM call); `PROSPECTA_HASH_PRECHECK` env overrides. Same text under another source is logged and skipped |
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
 
 Persisted to `$HERMES_HOME/prospecta.json`.

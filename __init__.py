@@ -818,6 +818,11 @@ class ProspectaProvider(MemoryProvider):
                 "default": "",
             },
             {
+                "key": "hash_precheck",
+                "description": "Before saving a note, look up whether the bank already holds the same text, and skip the write (and its LLM call) if so: 'true' / 'false'. Empty (default) = on. PROSPECTA_HASH_PRECHECK env overrides.",
+                "default": "",
+            },
+            {
                 "key": "shadow_mode",
                 "description": "'search' (default): shadow retrieval only, embedding cost. 'full': also shadow recall_synth (LLM, ~0.2-0.4 USD per recall).",
                 "default": "search",
@@ -1043,9 +1048,52 @@ class ProspectaProvider(MemoryProvider):
             return kw
         return {**kw, "metadata": {**(existing or {}), **stamp}}
 
+    def _hash_precheck_enabled(self) -> bool:
+        """Look for an existing note before paying for a save? PROSPECTA_HASH_PRECHECK
+        env (even empty = unset) wins over config ``hash_precheck``. Default on."""
+        raw = os.environ.get("PROSPECTA_HASH_PRECHECK")
+        if raw is None or not raw.strip():
+            raw = self._config.get("hash_precheck")
+        return ("" if raw is None else str(raw).strip().lower()) not in ("0", "false", "no", "off")
+
+    def _existing_note(self, content: str, kw: Dict[str, Any]) -> Optional[str]:
+        """The id of the note already saved for this text and source, so the caller can
+        skip the write. Returns None to write as usual: no such note, the check is off,
+        or the lookup failed. A note with the same text under another source is
+        logged and skipped too (the library would refuse it): returns "" then."""
+        try:
+            if not self._hash_precheck_enabled():
+                return None
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            source = kw.get("source")
+            if source is None and kw.get("path") is not None:
+                source = str(Path(kw["path"]))
+            if source is None:
+                source = f"retain://{digest[:12]}"
+            with self._memory._pool.connection() as conn:
+                row = conn.execute(
+                    "SELECT id, source FROM documents WHERE bank_id = %s AND content_hash = %s",
+                    (self._memory._default_bank_id, digest)).fetchone()
+            if not row:
+                return None
+            doc_id, existing_source = row
+            if existing_source == source:
+                logger.debug("prospecta: note %r already saved; skipping the write", source)
+                return str(doc_id)
+            logger.info("prospecta: same text already saved under source %r; not saving it again as %r",
+                        existing_source, source)
+            return ""
+        except Exception:
+            logger.debug("prospecta: hash pre-check failed; saving the note normally", exc_info=True)
+            return None
+
     def _retain(self, content: str, **kw: Any) -> str:
         """Write to the main bank (linked when on), then queue the same note for
-        the dual-write bank. The queueing never raises and never waits."""
+        the dual-write bank. The queueing never raises and never waits.
+        A note the bank already holds is skipped before the LLM call."""
+        existing = self._existing_note(content, kw)
+        if existing is not None:
+            return existing
         kw = self._with_note_date(kw)
         main_kw = dict(kw, child_chunks=True) if self._linked_writes else kw
         document_id = self._memory.retain(content=content, **main_kw)
