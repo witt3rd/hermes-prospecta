@@ -66,6 +66,23 @@ for _litellm_logger in ("LiteLLM", "LiteLLM Proxy", "LiteLLM Router"):
     logging.getLogger(_litellm_logger).setLevel(logging.WARNING)
 
 
+_TOOL_GUIDE = (
+    "Memory tool guide:\n"
+    "- prospecta_search: fast, no LLM calls. Use it for exact names, for lists of notes, and "
+    "whenever you want to see the matching notes yourself.\n"
+    "- prospecta_recall: reads the matches and writes one synthesized answer. It costs LLM "
+    "calls, so use it when you need an answer, not a list.\n"
+    "- depth (search and recall): 'standard' suits ordinary questions. 'deep' reads a wider pool "
+    "for about 3x the cost; use it for 'everything about X' or 'every time ...' questions.\n"
+    "- A date in a question (\"in July\", a year) narrows results only for notes that carry a "
+    "date; notes without one are not filtered by it.\n"
+    "- A hit may be a generated question that points to a note, not the note itself. Read the "
+    "note it points to before relying on it.\n"
+    "- Retaining is automatic after every turn. Call prospecta_retain only for a fact the "
+    "person asks you to remember, with a clear `source`."
+)
+
+
 def _depth_kw(args: Dict[str, Any]) -> Dict[str, Any]:
     """Pass-through of the agent's optional ``depth`` ("standard" | "deep").
 
@@ -823,6 +840,11 @@ class ProspectaProvider(MemoryProvider):
                 "default": "",
             },
             {
+                "key": "tool_guide",
+                "description": "Add a short guide to the memory tools to the system prompt: 'true' / 'false'. Empty (default) = on. PROSPECTA_TOOL_GUIDE env overrides.",
+                "default": "",
+            },
+            {
                 "key": "shadow_mode",
                 "description": "'search' (default): shadow retrieval only, embedding cost. 'full': also shadow recall_synth (LLM, ~0.2-0.4 USD per recall).",
                 "default": "search",
@@ -1248,7 +1270,22 @@ class ProspectaProvider(MemoryProvider):
 
     # ---- tools ----
 
+    def _tool_guide_enabled(self) -> bool:
+        """Add the tool guide to the prompt block? PROSPECTA_TOOL_GUIDE env (even
+        empty = unset) wins over config ``tool_guide``. Unset means on."""
+        raw = os.environ.get("PROSPECTA_TOOL_GUIDE")
+        if raw is None or not raw.strip():
+            raw = self._config.get("tool_guide")
+        text = "" if raw is None else str(raw).strip().lower()
+        return text not in ("0", "false", "no", "off")
+
     def system_prompt_block(self) -> str:
+        block = self._base_prompt_block()
+        if self._tool_guide_enabled():
+            block += "\n\n" + _TOOL_GUIDE
+        return block
+
+    def _base_prompt_block(self) -> str:
         return (
             "You have access to prospecta memory — bilateral question-space retrieval. "
             "Use `prospecta_retain` to store memorable facts or decisions; supply a clear `source` "
