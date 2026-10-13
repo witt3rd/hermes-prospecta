@@ -3,6 +3,7 @@ closes every one it opens (no database needed: psycopg.connect is faked)."""
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -186,3 +187,116 @@ def test_max_connections_setting(plugin_module):
     for raw, want in (("7", 7), (3, 3), ("0", 4), ("junk", 4), (-2, 4)):
         p._config = {"max_connections": raw}
         assert p._resolve_max_connections() == want
+
+
+# ---- idle timeout --------------------------------------------------------
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def _idle_pool(plugin_module, max_connections=2, idle=300):
+    clock = Clock()
+    return plugin_module._BoundedPool(URL, max_connections, idle_seconds=idle, clock=clock), clock
+
+
+def test_idle_connection_is_closed_and_count_returns_to_zero(plugin_module, world):
+    pool, clock = _idle_pool(plugin_module)
+    with pool.cursor():
+        pass
+    clock.now += 299
+    pool.reap()
+    assert len(world.open) == 1  # not idle long enough yet
+    clock.now += 2
+    pool.reap()
+    assert not world.open and world.all[0].closed
+
+
+def test_busy_connection_is_not_closed_by_the_idle_timeout(plugin_module, world):
+    pool, clock = _idle_pool(plugin_module)
+    with pool.connection() as conn:
+        clock.now += 10_000  # held the whole time: busy, not idle
+        pool.reap()
+        assert not conn.closed
+    pool.reap()  # just returned: idle for zero seconds
+    assert len(world.open) == 1
+
+
+def test_next_use_after_idle_close_reconnects(plugin_module, world):
+    pool, clock = _idle_pool(plugin_module, max_connections=1)
+    with pool.cursor():
+        pass
+    clock.now += 301
+    pool.reap()
+    with pool.cursor():  # never fails because of the idle close
+        pass
+    assert len(world.all) == 2 and world.all[0].closed and len(world.open) == 1
+
+
+def test_stale_connection_is_not_reused_even_if_never_reaped(plugin_module, world):
+    pool, clock = _idle_pool(plugin_module, max_connections=1)
+    with pool.cursor():
+        pass
+    clock.now += 301
+    with pool.cursor():
+        pass
+    assert len(world.all) == 2 and world.all[0].closed and len(world.open) == 1
+
+
+def test_only_the_stale_connections_are_closed(plugin_module, world):
+    pool, clock = _idle_pool(plugin_module, max_connections=2)
+    a, b = threading.Event(), threading.Event()
+
+    def hold(ev_in, ev_out):
+        with pool.connection():
+            ev_in.set()
+            ev_out.wait(5)
+
+    done = threading.Event()
+    t1 = threading.Thread(target=hold, args=(a, done))
+    t2 = threading.Thread(target=hold, args=(b, done))
+    t1.start(); a.wait(5); t2.start(); b.wait(5)
+    done.set(); t1.join(); t2.join()
+    assert len(world.open) == 2
+    clock.now += 200
+    with pool.connection() as fresh:  # takes the most recently returned one
+        pass
+    clock.now += 200  # one idle 400s, one idle 200s
+    pool.reap()
+    assert len(world.open) == 1 and world.open[0] is fresh
+
+
+def test_idle_connection_is_closed_by_the_pool_itself(plugin_module, world):
+    pool = plugin_module._BoundedPool(URL, 2, idle_seconds=0.05)
+    with pool.cursor():
+        pass
+    deadline = time.monotonic() + 5
+    while world.open and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not world.open
+    with pool.cursor():
+        pass
+    assert len(world.all) == 2
+    pool.close()
+    assert not world.open
+
+
+def test_pool_idle_seconds_setting(plugin_module, monkeypatch):
+    monkeypatch.delenv("PROSPECTA_POOL_IDLE_SECONDS", raising=False)
+    p = plugin_module.ProspectaProvider()
+    assert p._resolve_pool_idle_seconds() == 300
+    for raw, want in (("45", 45), (60, 60), ("0", 300), ("junk", 300), (-2, 300)):
+        p._config = {"pool_idle_seconds": raw}
+        assert p._resolve_pool_idle_seconds() == want
+    monkeypatch.setenv("PROSPECTA_POOL_IDLE_SECONDS", "9")
+    assert p._resolve_pool_idle_seconds() == 9
+
+
+def test_build_memory_passes_the_idle_timeout_to_the_pool(plugin_module, world):
+    m = plugin_module._build_memory(
+        2, pool_idle_seconds=17, database_url=URL, embed=stub_embed, bank_id="x")
+    assert m._pool._idle_seconds == 17

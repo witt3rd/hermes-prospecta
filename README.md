@@ -223,6 +223,9 @@ something else since is left alone.
 | `llm_model` | empty | LiteLLM model id for recall/formulation (e.g. `anthropic/claude-haiku-4-5`); `PROSPECTA_LLM_MODEL` env overrides |
 | `embedding_dim` | `1536` | must match the embedder |
 | `max_connections` | `4` | most database connections each Memory (main, shadow, dual write) keeps open; threads take turns on them. Raise it only if tool calls wait for a free connection |
+| `pool_idle_seconds` | `300` | a pooled database connection unused for this long is closed; the next use opens a new one. `PROSPECTA_POOL_IDLE_SECONDS` env overrides |
+| `connection_watch` | `true` | warn loudly when the database nears its connection limit, see [Connections](#configuration); `PROSPECTA_CONNECTION_WATCH` env overrides |
+| `connection_watch_percent` | `70` | share of the database's `max_connections` in use (1-100) at which the watch warns |
 | `prefetch_enabled` | `false` | opt-in spine cost |
 | `shadow_bank_id` | empty (OFF) | shadow-read bank, see [Shadow reads](#shadow-reads); `PROSPECTA_SHADOW_BANK` env overrides (set it empty to force OFF) |
 | `shadow_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the shadow bank |
@@ -244,6 +247,16 @@ Connections: each Memory the plugin builds holds at most `max_connections`
 shared connections, however many threads use it, and closes them on shutdown.
 With shadow reads and dual write both on, the plugin uses up to three times
 that. A connection lost to a database restart is replaced on next use.
+A pooled connection that sits unused for `pool_idle_seconds` is closed, so an
+idle provider holds no connections; the next use opens a new one.
+
+Connection watch: at start and then every 2 minutes, a background thread asks
+the database (on its own short-lived connection) how many connections are in
+use and what `max_connections` is. At `connection_watch_percent` or more, or if
+that query itself fails (a full server refuses it), it logs an ERROR with the
+numbers and writes `$HERMES_HOME/memory-provider-health.json`, so the next turn
+shows a notice. The notice is cleared once usage is back under the line. Set
+`connection_watch` to `false` to turn it off.
 
 ## CLI
 
