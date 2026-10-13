@@ -1,0 +1,15 @@
+publishing = "0.14.0"
+project = "Fleet"
+format = "pdf"
+paper = "letter"
+
+[scan]
+words = []
+allow = []
+days = true
+
+[[document]]
+source = "document.md"
+pdf = "agent-memory-unification-v1.pdf"
+format = "document"
+paper = "letter"
