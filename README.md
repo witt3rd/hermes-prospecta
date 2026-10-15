@@ -340,6 +340,7 @@ something else since is left alone.
 | `recall.fusion` | `keyword_first_union` | how `prospecta_search` joins the keyword leg with the store's recall; `store` = the old behaviour; `PROSPECTA_RECALL_FUSION` env overrides. See [Recall](#recall-keyword-leg-union-and-block) |
 | `recall.block_tokens` | `1500` | `prospecta_search` returns one block of at most this many estimated tokens (whole entries only); `0` = the old list of notes; `PROSPECTA_RECALL_BLOCK_TOKENS` env overrides |
 | `recall.keyword` | `true` | build the in-memory keyword leg (BM25, stemming off) over the bank's notes; `PROSPECTA_RECALL_KEYWORD` env overrides |
+| `recall.date_cue_gate` | `true` | call the filter-extraction model only when the question has a date cue (month, weekday, `ago`, `last week`, a year, an ISO date, ...); otherwise search with no date filter and no model call (people matching still runs). `false` restores the library behaviour; `PROSPECTA_DATE_CUE_GATE` env overrides |
 | `recall.keyword_unit` | `documents` | what the leg indexes: `documents` (the bank's raw notes, present in every bank) or `chunks` (the old behaviour: chunk items); `PROSPECTA_RECALL_KEYWORD_UNIT` env overrides |
 | `recall.keyword_index_warn_mb` | `0` (off) | log a WARNING when the keyword index's estimated size exceeds this many MB (soft threshold, nothing is turned off); `PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB` env overrides |
 | `recall.keyword_batch_pause_ms` | `50` | pause after each database page while the index is built or extended; `PROSPECTA_RECALL_KEYWORD_PAUSE_MS` env overrides |
