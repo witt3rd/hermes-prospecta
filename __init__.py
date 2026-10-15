@@ -63,8 +63,10 @@ from agent.memory_provider import MemoryProvider
 
 try:  # as a package (how hermes loads the plugin) ...
     from . import recall_fusion as _rf
+    from . import date_cue_gate as _dcg
 except ImportError:  # ... or with the checkout on sys.path (tests, console scripts)
     import recall_fusion as _rf
+    import date_cue_gate as _dcg
 
 logger = logging.getLogger(__name__)
 
@@ -832,6 +834,7 @@ class ProspectaProvider(MemoryProvider):
         self._dual: Optional[_DualWriter] = None  # None = dual write OFF
         self._linked_writes = False
         self._conn_watch: Optional[_ConnectionWatch] = None
+        self._date_gate_held = False
         self._keyword: Optional[Any] = None  # _rf.KeywordLeg; None = no keyword leg
 
     # ---- identity ----
@@ -1040,6 +1043,12 @@ class ProspectaProvider(MemoryProvider):
         raw = self._recall_setting("PROSPECTA_RECALL_KEYWORD", "keyword")
         return ("" if raw is None else str(raw).strip().lower()) not in ("0", "false", "no", "off")
 
+    def _recall_date_cue_gate(self) -> bool:
+        """Skip the filter-extraction model call for a question with no date cue?
+        Default on; PROSPECTA_DATE_CUE_GATE env or ``recall.date_cue_gate`` turns it off."""
+        raw = self._recall_setting("PROSPECTA_DATE_CUE_GATE", "date_cue_gate")
+        return ("" if raw is None else str(raw).strip().lower()) not in ("0", "false", "no", "off")
+
     def _recall_keyword_unit(self) -> str:
         """What the keyword leg indexes: 'documents' (default: the bank's raw notes,
         present in every bank) or 'chunks' (the old behaviour: chunk items, which
@@ -1240,6 +1249,11 @@ class ProspectaProvider(MemoryProvider):
             {
                 "key": "recall.keyword",
                 "description": "Build the in-memory keyword leg over the bank's notes: 'true' / 'false'. Default on. PROSPECTA_RECALL_KEYWORD env overrides.",
+                "default": "true",
+            },
+            {
+                "key": "recall.date_cue_gate",
+                "description": "Call the filter-extraction model on a search only when the question has a date cue (a month, weekday, 'ago', 'last week', a year, an ISO date, ...); otherwise search with no date filter and no model call. 'true' / 'false'. Default on. PROSPECTA_DATE_CUE_GATE env overrides.",
                 "default": "true",
             },
             {
@@ -1664,6 +1678,9 @@ class ProspectaProvider(MemoryProvider):
                 # prospecta raises BankConfigConflict for dim mismatch; let that propagate
                 raise
 
+        if self._recall_date_cue_gate() and not self._date_gate_held:
+            self._date_gate_held = _dcg.install()
+
         self._start_keyword(bank_id)
         self._start_shadow(bank_id)
         self._start_dual_write(bank_id)
@@ -1676,6 +1693,9 @@ class ProspectaProvider(MemoryProvider):
         )
 
     def shutdown(self) -> None:
+        if self._date_gate_held:
+            self._date_gate_held = False
+            _dcg.uninstall()
         # Wait briefly for in-flight sync_turn
         t = self._sync_thread
         if t is not None and t.is_alive():
