@@ -34,8 +34,8 @@ def test_initialize_without_llm_supports_retain_with_index_text_and_search(
             "prospecta_search",
             {"query": "Augur Prospecta substrate", "limit": 5},
         ))
-        assert search["results"]
-        assert search["results"][0]["source"] == "smoke:no-llm"
+        assert search["sources"]
+        assert search["sources"][0]["source"] == "smoke:no-llm"
     finally:
         provider.shutdown()
 

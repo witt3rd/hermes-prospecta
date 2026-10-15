@@ -47,11 +47,10 @@ def test_handle_search_returns_chunks(provider_with_stubs):
         {"query": "France", "mode": "hybrid", "limit": 5},
     )
     data = json.loads(result)
-    assert "results" in data
-    for item in data["results"]:
-        assert "content" in item
-        assert "source" in item
-        assert "scores" in item
+    assert "France" in data["block"]   # one block of the note text
+    assert data["entries"] == len(data["sources"]) >= 1
+    for item in data["sources"]:
+        assert "source" in item and "date" in item
 
 
 def test_unknown_tool_returns_error(provider_with_stubs):

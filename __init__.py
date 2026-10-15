@@ -26,6 +26,12 @@ search / recall / prefetch is also run against that bank on a background
 thread and the old/new pair is stored in recall_events. The agent only ever
 sees the old bank's answer.
 
+Recall (see README, "Recall: keyword leg, union and block"): ``prospecta_search``
+also runs a plain keyword search (BM25, stemming off) over the bank's chunk
+items, puts its top hits first (``recall.fusion``), and returns the text as one
+block sized by a token budget (``recall.block_tokens``). The shadow log prints
+the false-abstain rate beside every abstention figure.
+
 Linked / dual writes (OFF by default; see README): ``linked_writes`` builds the
 library's linker for the main Memory; ``dual_write_bank_id`` also retains every
 note into a second bank on a background thread, with a JSONL retry file.
@@ -55,6 +61,11 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
+try:  # as a package (how hermes loads the plugin) ...
+    from . import recall_fusion as _rf
+except ImportError:  # ... or with the checkout on sys.path (tests, console scripts)
+    import recall_fusion as _rf
+
 logger = logging.getLogger(__name__)
 
 # Silence LiteLLM's verbose debug output before it gets imported anywhere
@@ -68,8 +79,9 @@ for _litellm_logger in ("LiteLLM", "LiteLLM Proxy", "LiteLLM Router"):
 
 _TOOL_GUIDE = (
     "Memory tool guide:\n"
-    "- prospecta_search: fast, no LLM calls. Use it for exact names, for lists of notes, and "
-    "whenever you want to see the matching notes yourself.\n"
+    "- prospecta_search: fast, no LLM calls. It returns one block of note text (exact keyword "
+    "matches first), each entry tagged with its source and date. Use it for exact names, "
+    "identifiers and file names, and whenever you want to read the notes yourself.\n"
     "- prospecta_recall: reads the matches and writes one synthesized answer. It costs LLM "
     "calls, so use it when you need an answer, not a list.\n"
     "- depth (search and recall): 'standard' suits ordinary questions. 'deep' reads a wider pool "
@@ -91,6 +103,23 @@ def _depth_kw(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     depth = args.get("depth")
     return {"depth": depth} if depth else {}
+
+
+def _library_floor_kw() -> Dict[str, Any]:
+    """The library's own floor-preserving option for ``Memory.search``, if it
+    has one (feature-detected, never required): a ``floor`` parameter on
+    ``prospecta._index.search``. The pinned library has none there (its
+    ``rerank.blend.floor`` is a per-bank stage setting and does not touch
+    search), so this is empty today; the keyword-first union gives the same
+    guarantee whether or not it is present."""
+    try:
+        import inspect
+        from prospecta import _index
+        if "floor" in inspect.signature(_index.search).parameters:
+            return {"floor": True}
+    except Exception:
+        logger.debug("prospecta: could not inspect the library's search signature", exc_info=True)
+    return {}
 
 
 # ---- shadow reads (embedding migration) ----
@@ -573,12 +602,14 @@ class _ShadowReader(_BackgroundWorker):
     _label = "shadow"
 
     def __init__(self, memory, shadow_memory, *, bank_id: str, shadow_bank_id: str,
-                 mode: str = "search") -> None:
+                 mode: str = "search", keyword: Any = None) -> None:
         self._memory = memory            # old-bank Memory: writes both events, resolves ids
         self._shadow = shadow_memory     # new-bank Memory, created once, reused
         self._bank_id = bank_id
         self._shadow_bank_id = shadow_bank_id
         self._mode = mode                # "search" | "full"
+        self._keyword = keyword          # the keyword leg (or None): evidence for the false-abstain rate
+        self._tally = _rf.AbstentionTally()
         super().__init__(shadow_memory)
 
     def _on_full(self, job: Dict[str, Any]) -> None:
@@ -592,6 +623,22 @@ class _ShadowReader(_BackgroundWorker):
 
     def _handle(self, job: Dict[str, Any]) -> None:
         self._record(job)
+
+    def _keyword_count(self, job: Dict[str, Any]) -> Optional[int]:
+        """How many hits the keyword leg has for this question (None: unknown).
+        The search tool measured it on the old path; recall and prefetch ask the
+        leg here, off the old path."""
+        if "kw_n" in job:
+            return job["kw_n"]
+        leg = self._keyword
+        if leg is None:
+            return None
+        try:
+            status, hits = leg.search(job["message"], 10)
+        except Exception:
+            logger.exception("prospecta shadow keyword count failed")
+            return None
+        return len(hits) if status == "ok" else None
 
     def _record(self, job: Dict[str, Any]) -> None:
         from prospecta._shadow import _origin_ids
@@ -629,11 +676,23 @@ class _ShadowReader(_BackgroundWorker):
             return
         old_set, new_set = set(old_origin), set(new_origin)
         union = old_set | new_set
+        kw_n = self._keyword_count(job)
+        old_found = bool(old_results)
+        new_found = None if error else bool(flat)  # None: the new side failed, not an abstention
+        counts = self._tally.record(old_found=old_found, new_found=new_found, kw_found=bool(kw_n))
         overlap = {
             "old_origin_document_ids": old_origin,
             "new_origin_document_ids": new_origin,
             "jaccard": (len(old_set & new_set) / len(union)) if union else 1.0,
+            # counts only: abstention is "returned nothing"; the false-abstain rate
+            # (abstained where the other side or the keyword leg found something,
+            # over answerable questions) always sits beside it
+            "old_n": len(old_results), "new_n": None if error else len(flat), "kw_n": kw_n,
+            "abstain": counts,
         }
+        logger.info("prospecta shadow pair tool=%s old_n=%d new_n=%s kw_n=%s jaccard=%.2f | %s",
+                    job["tool"], len(old_results), "err" if error else len(flat),
+                    "n/a" if kw_n is None else kw_n, overlap["jaccard"], _rf.format_tally(counts))
         shadow_id = str(uuid.uuid4())
         for role, bank, peer, qs, results, syn, ms, err in (
             ("old", self._bank_id, self._shadow_bank_id, job["queries"], old_results,
@@ -773,6 +832,7 @@ class ProspectaProvider(MemoryProvider):
         self._dual: Optional[_DualWriter] = None  # None = dual write OFF
         self._linked_writes = False
         self._conn_watch: Optional[_ConnectionWatch] = None
+        self._keyword: Optional[Any] = None  # _rf.KeywordLeg; None = no keyword leg
 
     # ---- identity ----
 
@@ -933,6 +993,67 @@ class ProspectaProvider(MemoryProvider):
             n = _DEFAULT_CONNECTION_WATCH_PERCENT
         return n if 1 <= n <= 100 else _DEFAULT_CONNECTION_WATCH_PERCENT
 
+    # ---- recall options: keyword leg, fusion, token-budget block ----
+
+    def _recall_setting(self, env_name: str, key: str) -> Any:
+        """A ``recall.*`` option: env (when non-empty) wins; then the nested
+        ``{"recall": {key: ...}}``; then the flat ``"recall.key"`` that
+        ``hermes memory setup`` writes. None when unset."""
+        raw = os.environ.get(env_name)
+        if raw is not None and raw.strip():
+            return raw.strip()
+        nested = self._config.get("recall")
+        if isinstance(nested, dict) and nested.get(key) not in (None, ""):
+            return nested[key]
+        flat = self._config.get(f"recall.{key}")
+        return None if flat in (None, "") else flat
+
+    def _recall_fusion(self) -> str:
+        """'keyword_first_union' (default) or 'store' (the old behaviour)."""
+        raw = self._recall_setting("PROSPECTA_RECALL_FUSION", "fusion")
+        if raw is None:
+            return _rf.DEFAULT_FUSION
+        text = str(raw).strip().lower()
+        if text in _rf.RECALL_FUSIONS:
+            return text
+        logger.warning("prospecta: recall.fusion %r is not one of %s; using %r",
+                       raw, list(_rf.RECALL_FUSIONS), _rf.DEFAULT_FUSION)
+        return _rf.DEFAULT_FUSION
+
+    def _recall_block_tokens(self) -> int:
+        """Token budget of the recall block (default 1500); 0 = the old list of notes."""
+        raw = self._recall_setting("PROSPECTA_RECALL_BLOCK_TOKENS", "block_tokens")
+        if raw is None:
+            return _rf.DEFAULT_BLOCK_TOKENS
+        try:
+            n = int(str(raw).strip())
+            if n < 0 or isinstance(raw, bool):
+                raise ValueError(raw)
+            return n
+        except (TypeError, ValueError):
+            logger.warning("prospecta: recall.block_tokens %r is not a whole number >= 0; using %d",
+                           raw, _rf.DEFAULT_BLOCK_TOKENS)
+            return _rf.DEFAULT_BLOCK_TOKENS
+
+    def _recall_keyword_enabled(self) -> bool:
+        """Build and use the in-memory keyword leg? Default on."""
+        raw = self._recall_setting("PROSPECTA_RECALL_KEYWORD", "keyword")
+        return ("" if raw is None else str(raw).strip().lower()) not in ("0", "false", "no", "off")
+
+    def _start_keyword(self, bank_id: str) -> None:
+        """The keyword leg over the main bank, on the main Memory's own pool.
+        Only built when something uses it: the union, or the shadow log's
+        false-abstain rate. Nothing is read until the first search."""
+        if not self._recall_keyword_enabled():
+            return
+        if self._recall_fusion() != "keyword_first_union" and not self._resolve_shadow_bank_id():
+            return
+        try:
+            self._keyword = _rf.KeywordLeg(_rf.PgChunkSource(self._memory._pool, bank_id), bank_id=bank_id)
+        except Exception:
+            self._keyword = None
+            logger.exception("Prospecta keyword leg could not start; recall uses the store only")
+
     def _start_connection_watch(self) -> None:
         if not self._connection_watch_enabled():
             return
@@ -1073,6 +1194,22 @@ class ProspectaProvider(MemoryProvider):
                 "default": "",
             },
             {
+                "key": "recall.fusion",
+                "description": "How prospecta_search joins a plain keyword search (BM25, stemming off) with the store's own recall: 'keyword_first_union' (default: the top 3 of each first, then the store's order) or 'store' (the store's recall alone, the old behaviour). May also be written as {\"recall\": {\"fusion\": ...}}. PROSPECTA_RECALL_FUSION env overrides.",
+                "default": _rf.DEFAULT_FUSION,
+                "choices": list(_rf.RECALL_FUSIONS),
+            },
+            {
+                "key": "recall.block_tokens",
+                "description": "prospecta_search returns the recalled text as one block of at most this many (estimated) tokens, each entry tagged with its source and date; an entry that does not fit is skipped, never cut. Default 1500. 0 = the old list of notes. PROSPECTA_RECALL_BLOCK_TOKENS env overrides.",
+                "default": str(_rf.DEFAULT_BLOCK_TOKENS),
+            },
+            {
+                "key": "recall.keyword",
+                "description": "Build the in-memory keyword leg over the bank's chunk items: 'true' / 'false'. Default on. PROSPECTA_RECALL_KEYWORD env overrides.",
+                "default": "true",
+            },
+            {
                 "key": "shadow_mode",
                 "description": "'search' (default): shadow retrieval only, embedding cost. 'full': also shadow recall_synth (LLM, ~0.2-0.4 USD per recall).",
                 "default": "search",
@@ -1200,7 +1337,7 @@ class ProspectaProvider(MemoryProvider):
             )
             self._shadow = _ShadowReader(
                 self._memory, shadow_memory,
-                bank_id=bank_id, shadow_bank_id=shadow_bank, mode=mode,
+                bank_id=bank_id, shadow_bank_id=shadow_bank, mode=mode, keyword=self._keyword,
             )
             logger.info("Prospecta shadow reads ON: %s -> %s (%s, dim=%s, mode=%s)",
                         bank_id, shadow_bank, model, dim, mode)
@@ -1358,9 +1495,12 @@ class ProspectaProvider(MemoryProvider):
         return document_id
 
     def _shadow_submit(self, tool: str, message: str, *, old_ms: int, mode: str, limit: int,
-                       depth: Optional[str], items: Any = None, result: Any = None) -> None:
+                       depth: Optional[str], items: Any = None, result: Any = None,
+                       kw_n: Optional[int] = None) -> None:
         """Hand the finished OLD answer (search ``items`` or recall_synth ``result``)
-        to the shadow worker. Never raises, never waits."""
+        to the shadow worker. ``kw_n`` is how many hits the keyword leg had for
+        this question when the caller already asked it (else the worker asks).
+        Never raises, never waits."""
         shadow = self._shadow
         if shadow is None:
             return
@@ -1371,11 +1511,14 @@ class ProspectaProvider(MemoryProvider):
                 items = result.sources
                 synthesis = result.synthesis
                 queries = [q.text for q in (getattr(result, "queries", None) or [])] or queries
-            shadow.submit({
+            job = {
                 "tool": tool, "message": message, "queries": queries,
                 "results": list(items or []), "synthesis": synthesis,
                 "old_ms": old_ms, "mode": mode, "limit": limit, "depth": depth,
-            })
+            }
+            if kw_n is not None:
+                job["kw_n"] = kw_n
+            shadow.submit(job)
         except Exception:
             logger.exception("prospecta shadow submit failed")
 
@@ -1472,6 +1615,7 @@ class ProspectaProvider(MemoryProvider):
                 # prospecta raises BankConfigConflict for dim mismatch; let that propagate
                 raise
 
+        self._start_keyword(bank_id)
         self._start_shadow(bank_id)
         self._start_dual_write(bank_id)
         self._start_connection_watch()
@@ -1496,6 +1640,9 @@ class ProspectaProvider(MemoryProvider):
         shadow, self._shadow = self._shadow, None
         if shadow is not None:  # before the old Memory: it writes the pair events
             shadow.stop()
+        keyword, self._keyword = self._keyword, None
+        if keyword is not None:  # its reads use the old Memory's pool
+            keyword.stop()
         if self._memory is not None:
             try:
                 self._memory.shutdown()
@@ -1708,29 +1855,103 @@ class ProspectaProvider(MemoryProvider):
                 query = args.get("query", "")
                 if not query:
                     return json.dumps({"error": "query is required"})
-                mode = args.get("mode", "hybrid")
-                limit = int(args.get("limit", 10))
-                t0 = time.monotonic()
-                items = self._memory.search(query, mode=mode, limit=limit, **_depth_kw(args))
-                self._shadow_submit(
-                    "prospecta_search", query, items=items, mode=mode, limit=limit,
-                    depth=args.get("depth"), old_ms=int((time.monotonic() - t0) * 1000))
-                results = []
-                for it in items:
-                    content = it.original_chunk or it.content
-                    if content and len(content) > 2000:
-                        content = content[:2000] + "...[truncated]"
-                    results.append({
-                        "content": content,
-                        "source": it.source,
-                        "scores": dict(it.scores) if it.scores else {},
-                    })
-                return json.dumps({"results": results})
+                return self._search_tool(query, args)
 
             return json.dumps({"error": f"unknown tool: {tool_name}"})
         except Exception as e:
             logger.warning("prospecta tool %s failed: %s", tool_name, e)
             return json.dumps({"error": str(e)})
+
+    # ---- prospecta_search: keyword leg + union + block ----
+
+    def _search_tool(self, query: str, args: Dict[str, Any]) -> str:
+        """The store's recall and the keyword leg, fused by ``recall.fusion``,
+        returned as one token-budget block (``recall.block_tokens``) or, with a
+        budget of 0, as the old list of notes. The shadow always compares the
+        store's own list, so the shadow comparison is unchanged."""
+        mode = args.get("mode", "hybrid")
+        limit = int(args.get("limit", 10))
+        block_tokens = self._recall_block_tokens()
+        union = self._recall_fusion() == "keyword_first_union"
+        pool = max(limit, _rf.BLOCK_POOL) if block_tokens > 0 else limit
+        t0 = time.monotonic()
+        store_items = list(self._memory.search(
+            query, mode=mode, limit=pool, **_depth_kw(args), **_library_floor_kw()))
+        old_ms = int((time.monotonic() - t0) * 1000)
+
+        leg = self._keyword
+        kw_status, kw_hits = "off", []
+        if leg is not None and mode == "hybrid":
+            kw_status, kw_hits = leg.search(query, pool)
+            if kw_status != "ok":
+                kw_hits = []
+        extra = {"kw_n": len(kw_hits)} if kw_status == "ok" else {}  # absent: the worker asks the leg
+        self._shadow_submit(
+            "prospecta_search", query, items=store_items[:limit], mode=mode, limit=limit,
+            depth=args.get("depth"), old_ms=old_ms, kw_n=extra.get("kw_n"))
+
+        fused = _rf.keyword_first_union(kw_hits, store_items, slots=pool) if union and kw_hits \
+            else store_items[:pool]
+        if block_tokens <= 0:
+            results = []
+            for it in fused[:limit]:
+                content = it.original_chunk or it.content
+                if content and len(content) > 2000:
+                    content = content[:2000] + "...[truncated]"
+                results.append({"content": content, "source": it.source,
+                                "scores": dict(it.scores) if it.scores else {}})
+            return json.dumps({"results": results})
+
+        dates = self._note_dates(fused)
+        entries = [_rf.BlockEntry(source=it.source or "", date=dates.get(id(it), ""),
+                                  text=it.original_chunk or it.content or "",
+                                  origin=getattr(it, "origin", "store")) for it in fused]
+        block = _rf.build_block(entries, block_tokens)
+        out: Dict[str, Any] = {
+            "block": block.text,
+            "entries": len(block.included),
+            "tokens": block.tokens,
+            "budget": block_tokens,
+            "keyword": kw_status,
+            "sources": [{"source": e.source, "date": e.date or "undated", "origin": e.origin}
+                        for e in block.included],
+        }
+        if block.omitted:
+            out["omitted"] = [{"source": e.source, "date": e.date or "undated"} for e in block.omitted]
+            if not block.included:
+                out["note"] = ("no entry fit the token budget; raise recall.block_tokens "
+                               "or search for something narrower")
+        return json.dumps(out)
+
+    def _note_dates(self, items: List[Any]) -> Dict[int, str]:
+        """YYYY-MM-DD for each item (by ``id(item)``): the keyword leg's own,
+        else the item's metadata, else one lookup of the notes' dates in the
+        database. Items with no date are left out (shown as 'undated')."""
+        dates: Dict[int, str] = {}
+        missing: Dict[str, List[int]] = {}
+        for it in items:
+            d = getattr(it, "created_on", "") or ""
+            if not d:
+                meta = getattr(it, "metadata", None) or {}
+                d = str(meta.get("created_on") or meta.get("date") or "")
+            if d:
+                dates[id(it)] = d[:10]
+            else:
+                missing.setdefault(str(getattr(it, "document_id", "")), []).append(id(it))
+        if missing:
+            try:
+                with self._memory._pool.connection() as conn:
+                    rows = conn.execute(
+                        "SELECT id::text, COALESCE(created_on::text, "
+                        "NULLIF(document_metadata->>'created_on', '')) FROM documents "
+                        "WHERE id = ANY(%s::uuid[])", (list(missing),)).fetchall()
+                for doc_id, d in rows:
+                    for key in missing.get(doc_id, ()):
+                        if d:
+                            dates[key] = str(d)[:10]
+            except Exception:
+                logger.debug("prospecta: could not look up note dates; entries are shown undated", exc_info=True)
+        return dates
 
     # ---- hooks ----
 
