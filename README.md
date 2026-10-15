@@ -91,29 +91,55 @@ found the evidence far more often than the store's fused recall, that rank
 fusion can demote the best channel's top hit, and that ten short notes lose to
 a block of raw text. Three parts, each with a config option (all under
 `recall`, in `prospecta.json` as `{"recall": {...}}` or as the flat keys
-`recall.fusion`, `recall.block_tokens`, `recall.keyword`):
+`recall.fusion`, `recall.block_tokens`, `recall.keyword`, and the keyword leg's
+`recall.keyword_unit`, `recall.keyword_index_warn_mb`,
+`recall.keyword_batch_pause_ms`):
 
 1. **Keyword leg** (`recall.keyword`, default `true`). A plain raw-text keyword
-   search over the bank's chunk items (`kind='chunk'`, text in
-   `original_chunk`): Okapi BM25 (k1 1.5, b 0.75), stemming **off**, OR
-   semantics, lowercase tokens. Identifiers and file names are kept whole and
-   also split: `deploy-config_v2.yaml` is searchable as that, and as `deploy`,
-   `config`, `v2`, `yaml`. The index lives in memory only (nothing on disk). It
-   is read through the plugin's own bounded pool in short borrows of
-   5,000 rows (no connection of its own, so `max_connections` and
-   `pool_idle_seconds` apply as before), is built on first use in a background
-   thread, and rebuilt when the bank's fingerprint (chunk count and latest
-   write time) changes: checked every 30 s, rebuilt at most once a minute, the
-   old index serving meanwhile. A search never waits for it: while it is
-   building (or if it failed, which is logged with the full exception) the
-   store's own recall is used alone and the answer says `"keyword": "warming"`
-   / `"unavailable"`. A bank with more than 400,000 chunk items gets no
-   keyword leg (ERROR log). It is only built when something uses it: the
-   union, or the shadow log. Only `mode: hybrid` searches use it.
+   search over the bank's **notes**: the raw note text in the `documents` table
+   (`original_text`, with the note's id, source and date). Every bank has them,
+   whether or not it has chunk items (the banks written before chunking have
+   question items only, so an index over chunk items would be empty there).
+   Okapi BM25 (k1 1.5, b 0.75), stemming **off**, OR semantics, lowercase
+   tokens. Identifiers and file names are kept whole and also split:
+   `deploy-config_v2.yaml` is searchable as that, and as `deploy`, `config`,
+   `v2`, `yaml`. A hit is a note, so a note found by both the leg and the
+   store (or by several of its items) appears once, with the note's own text.
+   `recall.keyword_unit` selects the unit: `documents` (default) or `chunks`
+   (the old behaviour: chunk items, `kind='chunk'`, text in `original_chunk`).
+   The index lives in memory only (nothing on disk).
+
+   *How it is built.* On first use, in a background thread; a search never
+   waits for it: while it is building (or if it failed, which is logged with
+   the full exception) the store's own recall is used alone and the answer says
+   `"keyword": "warming"` / `"unavailable"`. Rows are read through the plugin's
+   own bounded pool, one connection at a time, in keyset pages of 2,000 notes
+   (no connection of its own, so `max_connections` and `pool_idle_seconds`
+   apply as before; a connection is back in the pool before the page is
+   indexed). The build runs at a lower thread priority, indexes in small
+   slices and pauses after every page (`recall.keyword_batch_pause_ms`,
+   default 50), so it cannot starve the gateway. There is **no size cap**: a
+   bank of any size is indexed. Instead it logs the note count, the estimated
+   index size, the time and the process memory
+   (`prospecta keyword leg: indexed N documents ... index about X MB ...`), and
+   with `recall.keyword_index_warn_mb` set (default `0`, off) it logs a WARNING
+   when the estimate exceeds that many MB (the leg stays on). Memory is about
+   five times the note text (measured: 73,000 notes of 378 characters on
+   average, 27.6 MB of text, took about 160 MB and 5-7 s to build).
+
+   *How it stays fresh.* Checked every 30 s with one cheap aggregate (note
+   count, latest created / updated time). When only new notes were added (the
+   notes already indexed are unchanged: same count and latest update time up to
+   the last one read) just the new ones are read and appended, so a growing
+   bank is not re-read in full on every write. If an indexed note was edited or
+   deleted, or a note appears behind the last one read, the index is rebuilt in
+   full (at most every 5 minutes), the old index serving meanwhile (memory
+   briefly holds both). It is only built when something uses it: the union, or
+   the shadow log. Only `mode: hybrid` searches use it.
 2. **Keyword-first union** (`recall.fusion`, default `keyword_first_union`;
    `store` is the old behaviour). The top 3 of the keyword leg first, then the
-   top 3 of the store, de-duplicated (the same chunk of the same note counts
-   once), then the remaining slots in the store's own order. The best keyword
+   top 3 of the store, de-duplicated (by note when the leg indexes notes; the
+   same chunk of the same note counts once when it indexes chunks), then the remaining slots in the store's own order. The best keyword
    hit is never demoted. If the library's `search` gets a floor-preserving
    option (a `floor` parameter), the plugin passes it on (feature-detected,
    never required); the pinned library has none there today (its
@@ -122,7 +148,11 @@ a block of raw text. Three parts, each with a config option (all under
 3. **Token-budget block** (`recall.block_tokens`, default `1500`; `0` = the old
    list of notes). The search result is **one block** of raw note text in the
    fused order, each entry headed `[source: ... | date: YYYY-MM-DD]` (`undated`
-   when the note has no date), until the budget is reached. An entry that does
+   when the note has no date), until the budget is reached. With the default
+   note unit the text of an entry is the note's own text, whichever leg found
+   it (a note written since the index was built, or one too long to ever fit
+   the budget when the store holds a shorter part that fits, keeps the store's
+   text). An entry that does
    not fit is skipped whole and the next one that fits is taken; stored text is
    never cut. The block is built from up to 50 candidates (the store is asked
    for 50, not `limit`, when the block is on). Tokens are estimated, since the
@@ -309,7 +339,10 @@ something else since is left alone.
 | `tool_guide` | empty (on) | add a short guide to the memory tools (search vs recall, depth, dates, retain) to the system prompt block; `false` or `PROSPECTA_TOOL_GUIDE=off` turns it off |
 | `recall.fusion` | `keyword_first_union` | how `prospecta_search` joins the keyword leg with the store's recall; `store` = the old behaviour; `PROSPECTA_RECALL_FUSION` env overrides. See [Recall](#recall-keyword-leg-union-and-block) |
 | `recall.block_tokens` | `1500` | `prospecta_search` returns one block of at most this many estimated tokens (whole entries only); `0` = the old list of notes; `PROSPECTA_RECALL_BLOCK_TOKENS` env overrides |
-| `recall.keyword` | `true` | build the in-memory keyword leg (BM25, stemming off) over the bank's chunk items; `PROSPECTA_RECALL_KEYWORD` env overrides |
+| `recall.keyword` | `true` | build the in-memory keyword leg (BM25, stemming off) over the bank's notes; `PROSPECTA_RECALL_KEYWORD` env overrides |
+| `recall.keyword_unit` | `documents` | what the leg indexes: `documents` (the bank's raw notes, present in every bank) or `chunks` (the old behaviour: chunk items); `PROSPECTA_RECALL_KEYWORD_UNIT` env overrides |
+| `recall.keyword_index_warn_mb` | `0` (off) | log a WARNING when the keyword index's estimated size exceeds this many MB (soft threshold, nothing is turned off); `PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB` env overrides |
+| `recall.keyword_batch_pause_ms` | `50` | pause after each database page while the index is built or extended; `PROSPECTA_RECALL_KEYWORD_PAUSE_MS` env overrides |
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
 
 Persisted to `$HERMES_HOME/prospecta.json`.

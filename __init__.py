@@ -27,8 +27,8 @@ thread and the old/new pair is stored in recall_events. The agent only ever
 sees the old bank's answer.
 
 Recall (see README, "Recall: keyword leg, union and block"): ``prospecta_search``
-also runs a plain keyword search (BM25, stemming off) over the bank's chunk
-items, puts its top hits first (``recall.fusion``), and returns the text as one
+also runs a plain keyword search (BM25, stemming off) over the bank's notes
+(its ``documents`` rows, present in every bank), puts its top hits first (``recall.fusion``), and returns the text as one
 block sized by a token budget (``recall.block_tokens``). The shadow log prints
 the false-abstain rate beside every abstention figure.
 

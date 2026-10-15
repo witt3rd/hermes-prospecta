@@ -41,7 +41,7 @@ BLOCK_POOL = 50                 # candidates considered for a block (the bake-of
 BM25_K1 = 1.5
 BM25_B = 0.75
 DEFAULT_RECHECK_S = 30.0        # how often the fingerprint is looked at
-DEFAULT_MIN_REBUILD_S = 60.0    # a changed bank is rebuilt at most this often
+DEFAULT_MIN_REBUILD_S = 300.0   # an edited or deleted note triggers a full rebuild at most this often (appends are not held back)
 DEFAULT_BATCH = 2000            # rows per database read
 DEFAULT_PAUSE_S = 0.05          # pause after each database batch while building
 _SLICE = 250                    # rows indexed between two yields to the gateway's threads
@@ -331,6 +331,16 @@ def _rss_mb() -> Optional[float]:
         return None
 
 
+def _release_freed_memory() -> None:
+    """After a full rebuild replaced the index, hand the old one's freed pages
+    back to the OS (glibc only; best effort, harmless elsewhere)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _lower_thread_priority() -> None:
     """Make the calling thread nicer than the gateway's own (Linux threads have
     their own nice value). Best effort."""
@@ -508,10 +518,13 @@ class KeywordLeg:
             with self._lock:
                 if self._closed:
                     return
-                self._index, self._fingerprint = work, fp
+                old, self._index, self._fingerprint = self._index, work, fp
                 self._built_at = self._clock()
                 self._checked_at = self._built_at
                 self._failed_at = None
+            if old is not None and old is not work:
+                del old
+                _release_freed_memory()
             self._report(work, mode, added, before, time.monotonic() - started)
         except Exception:
             logger.exception("prospecta keyword leg could not refresh bank %s; %s", self._bank_id,
