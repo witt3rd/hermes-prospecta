@@ -17,7 +17,9 @@ from tests.conftest import stub_embed, stub_llm
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for k in ("PROSPECTA_RECALL_FUSION", "PROSPECTA_RECALL_BLOCK_TOKENS", "PROSPECTA_RECALL_KEYWORD"):
+    for k in ("PROSPECTA_RECALL_FUSION", "PROSPECTA_RECALL_BLOCK_TOKENS", "PROSPECTA_RECALL_KEYWORD",
+              "PROSPECTA_RECALL_KEYWORD_UNIT", "PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB",
+              "PROSPECTA_RECALL_KEYWORD_PAUSE_MS"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -49,8 +51,12 @@ class FakeMemory:
 
 
 class FakeLeg:
-    def __init__(self, hits=(), status="ok"):
+    def __init__(self, hits=(), status="ok", unit="chunk", docs=None):
         self.hits, self.status, self.calls = list(hits), status, []
+        self.unit, self.docs = unit, dict(docs or {})
+
+    def documents(self, ids):
+        return {i: self.docs[i] for i in ids if i in self.docs}
 
     def search(self, q, limit):
         self.calls.append((q, limit))
@@ -105,12 +111,34 @@ def test_bad_settings_fall_back_to_defaults_loudly(plugin_module, caplog):
     assert p._recall_block_tokens() == 1500
 
 
+def test_keyword_unit_and_index_options(plugin_module, monkeypatch, caplog):
+    p = plugin_module.ProspectaProvider()
+    assert p._recall_keyword_unit() == "documents"
+    assert p._recall_float("PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB", "keyword_index_warn_mb", 0.0) == 0.0
+    p._config = {"recall": {"keyword_unit": "chunks", "keyword_index_warn_mb": 300, "keyword_batch_pause_ms": 0}}
+    assert p._recall_keyword_unit() == "chunks"
+    assert p._recall_float("PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB", "keyword_index_warn_mb", 0.0) == 300.0
+    assert p._recall_float("PROSPECTA_RECALL_KEYWORD_PAUSE_MS", "keyword_batch_pause_ms", 50.0) == 0.0
+    monkeypatch.setenv("PROSPECTA_RECALL_KEYWORD_UNIT", "documents")
+    assert p._recall_keyword_unit() == "documents"
+    p._config = {"recall": {"keyword_unit": "paragraphs", "keyword_index_warn_mb": "lots"}}
+    monkeypatch.delenv("PROSPECTA_RECALL_KEYWORD_UNIT")
+    with caplog.at_level(logging.WARNING):
+        assert p._recall_keyword_unit() == "documents"
+        assert p._recall_float("PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB", "keyword_index_warn_mb", 0.0) == 0.0
+    assert "paragraphs" in caplog.text and "lots" in caplog.text
+
+
 def test_config_schema_lists_the_three_options(plugin_module):
     schema = {f["key"]: f for f in plugin_module.ProspectaProvider().get_config_schema()}
     assert schema["recall.fusion"]["default"] == "keyword_first_union"
     assert schema["recall.fusion"]["choices"] == ["keyword_first_union", "store"]
     assert schema["recall.block_tokens"]["default"] == "1500"
     assert schema["recall.keyword"]["default"] == "true"
+    assert schema["recall.keyword_unit"]["default"] == "documents"
+    assert schema["recall.keyword_unit"]["choices"] == ["documents", "chunks"]
+    assert schema["recall.keyword_index_warn_mb"]["default"] == "0"
+    assert schema["recall.keyword_batch_pause_ms"]["default"] == "50"
 
 
 # ---- the block ----
@@ -130,6 +158,60 @@ def test_search_returns_one_block_keyword_first_tagged_with_source_and_date(plug
     assert out["keyword"] == "ok" and out["entries"] == len(out["sources"])
     assert out["budget"] == 1500 and 0 < out["tokens"] <= 1500
     assert "results" not in out
+
+
+def _doc_hit(doc, text, date="2026-04-04", source=None):
+    return rf.KeywordHit(content=text, original_chunk=text, source=source or f"src-{doc}", score=0.0, scores={},
+                         metadata={}, bank_id="b", document_id=f"doc-{doc}", created_on=date, origin="store")
+
+
+def test_document_mode_one_entry_per_note_with_the_notes_own_text(plugin_module):
+    # the store returns two question items of note a and one of note b; the leg also found note a
+    store = [_store_item("a", "part one of a"), _store_item("a", "part two of a"), _store_item("b", "part of b")]
+    docs = {"doc-a": _doc_hit("a", "the whole of note a"), "doc-b": _doc_hit("b", "the whole of note b")}
+    leg = FakeLeg([_kw_hit("a", "the whole of note a")], unit="document", docs=docs)
+    out = _search(_p(plugin_module, store, leg))
+    assert [s["source"] for s in out["sources"]] == ["src-a", "src-b"]
+    assert out["block"].count("the whole of note a") == 1 and "the whole of note b" in out["block"]
+    assert "part one" not in out["block"] and "part of b" not in out["block"]
+    assert "[source: src-b | date: 2026-04-04]" in out["block"]            # the note's own date
+
+
+def test_document_mode_note_found_only_by_the_store_reads_the_same_text(plugin_module):
+    store = [_store_item("a", "a chunk of a")]
+    leg = FakeLeg([], unit="document", docs={"doc-a": _doc_hit("a", "the whole of note a")})
+    out = _search(_p(plugin_module, store, leg))
+    assert "the whole of note a" in out["block"] and "a chunk of a" not in out["block"]
+
+
+def test_document_mode_keeps_the_stores_text_for_a_note_newer_than_the_index(plugin_module):
+    store = [_store_item("new", "text of a note written since the build")]
+    out = _search(_p(plugin_module, store, FakeLeg([], unit="document")))
+    assert "text of a note written since the build" in out["block"]
+
+
+def test_document_mode_dedupes_the_union_by_document_id_across_legs(plugin_module):
+    store = [_store_item(n) for n in "abc"]
+    docs = {f"doc-{n}": _doc_hit(n, f"note {n}") for n in "abcx"}
+    leg = FakeLeg([_kw_hit("x"), _kw_hit("b"), _kw_hit("a")], unit="document", docs=docs)
+    out = _search(_p(plugin_module, store, leg))
+    assert [s["source"] for s in out["sources"]] == ["src-x", "src-b", "src-a", "src-c"]
+    assert out["sources"][1]["origin"] == "keyword"
+
+
+def test_document_mode_old_note_list_uses_note_text_and_fusion_store_is_untouched(plugin_module):
+    store = [_store_item("a", "a chunk of a")]
+    docs = {"doc-a": _doc_hit("a", "the whole of note a")}
+    out = _search(_p(plugin_module, store, FakeLeg([], unit="document", docs=docs), {"recall": {"block_tokens": 0}}))
+    assert out["results"][0]["content"] == "the whole of note a"
+    out = _search(_p(plugin_module, store, FakeLeg([], unit="document", docs=docs), {"recall": {"fusion": "store"}}))
+    assert "a chunk of a" in out["block"]                                   # fusion=store: exactly as before
+
+
+def test_document_mode_warming_leg_answers_from_the_store_alone(plugin_module):
+    store = [_store_item("a", "a chunk of a")]
+    out = _search(_p(plugin_module, store, FakeLeg([], status="warming", unit="document")))
+    assert out["keyword"] == "warming" and "a chunk of a" in out["block"]
 
 
 def test_union_keeps_the_store_top_hits_too(plugin_module):
@@ -333,9 +415,18 @@ def test_shadow_recall_tools_count_keyword_evidence_in_the_worker(plugin_module,
 
 # ---- real Postgres: the leg reads the plugin's own pool ----
 
-def _seed(p, name, text, date="2026-03-01"):
-    p._memory.retain(content=text, source=name, index_text=[f"what about {name}?"], child_chunks=True,
+def _seed(p, name, text, date="2026-03-01", chunks=True):
+    p._memory.retain(content=text, source=name, index_text=[f"what about {name}?"], child_chunks=chunks,
                      metadata={"created_on": date})
+
+
+def _settle(leg, query="alpha"):
+    """Let a due check run (background build), then wait for it."""
+    leg.wait_idle(10)
+    leg._checked_at = None
+    leg._min_rebuild_s = 0
+    leg.search(query, 1)
+    leg.wait_idle(10)
 
 
 def test_real_bank_keyword_leg_finds_an_exact_identifier(provider_with_stubs):
@@ -356,6 +447,62 @@ def test_real_bank_keyword_leg_finds_an_exact_identifier(provider_with_stubs):
     assert out["sources"][0]["source"] == "turn:2"
 
 
+def test_real_bank_without_chunk_items_still_has_a_working_keyword_leg(provider_with_stubs):
+    """The live case: question items only, no chunk items. The leg indexes the notes."""
+    p = provider_with_stubs
+    _seed(p, "turn:1", "we shipped a release and wrote the changelog", chunks=False)
+    _seed(p, "turn:2", "the flag deploy-config_v2.yaml controls staging", chunks=False)
+    with p._memory._pool.connection() as conn:
+        assert conn.execute("SELECT count(*) FROM memory_items WHERE kind = 'chunk'").fetchone()[0] == 0
+    leg = p._keyword
+    assert leg.unit == "document"
+    _settle(leg, "deploy-config_v2.yaml")
+    status, hits = leg.search("deploy-config_v2.yaml", 3)
+    assert status == "ok" and hits[0].source == "turn:2" and hits[0].created_on == "2026-03-01"
+    assert hits[0].original_chunk == "the flag deploy-config_v2.yaml controls staging" and hits[0].item_id == ""
+    out = json.loads(p.handle_tool_call("prospecta_search", {"query": "deploy-config_v2.yaml"}))
+    assert out["block"].startswith("[source: turn:2 | date: 2026-03-01]")
+    chunk_leg = rf.KeywordLeg(rf.PgChunkSource(p._memory._pool, "test"), bank_id="test", background=False)
+    assert chunk_leg.search("deploy-config_v2.yaml", 3) == ("ok", [])      # the old unit finds nothing here
+
+
+def test_real_bank_leg_appends_new_notes_without_a_full_read(provider_with_stubs):
+    p = provider_with_stubs
+    _seed(p, "turn:1", "alpha one", chunks=False)
+    leg = p._keyword
+    _settle(leg)
+    assert leg.last_build["mode"] == "full" and leg.last_build["rows"] == 1
+    _seed(p, "turn:2", "alpha two with zebrafish", chunks=False)
+    _settle(leg, "zebrafish")
+    assert leg.last_build["mode"] == "append" and leg.last_build["added"] == 1 and leg.last_build["rows"] == 2
+    assert [h.source for h in leg.search("zebrafish", 3)[1]] == ["turn:2"]
+    assert len(leg.search("alpha", 10)[1]) == 2                       # no duplicate of the first note
+    with p._memory._pool.connection() as conn:                        # an in-place edit: full rebuild
+        conn.execute("UPDATE documents SET original_text = 'alpha edited', updated_at = now() "
+                     "WHERE source = 'turn:1'")
+        conn.commit()
+    _settle(leg, "edited")
+    assert leg.last_build["mode"] == "full" and [h.source for h in leg.search("edited", 3)[1]] == ["turn:1"]
+
+
+def test_real_bank_chunk_unit_is_still_selectable(plugin_module, pg_url, hermes_home, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", pg_url)
+    (hermes_home / "prospecta.json").write_text(json.dumps(
+        {"bank_id": "t", "embedding_dim": "32", "recall": {"keyword_unit": "chunks"}}))
+    p = plugin_module.ProspectaProvider()
+    monkeypatch.setattr(p, "_build_embedder", lambda: stub_embed)
+    monkeypatch.setattr(p, "_build_llm", lambda: stub_llm)
+    p.initialize("s", hermes_home=str(hermes_home))
+    try:
+        assert p._keyword.unit == "chunk"
+        _seed(p, "turn:1", "the flag deploy-config_v2.yaml controls staging", chunks=True)
+        _settle(p._keyword, "deploy-config_v2.yaml")
+        status, hits = p._keyword.search("deploy-config_v2.yaml", 3)
+        assert status == "ok" and hits[0].item_id and hits[0].source == "turn:1"
+    finally:
+        p.shutdown()
+
+
 def test_real_bank_leg_uses_the_bounded_pool_and_stops_with_the_provider(provider_with_stubs):
     p = provider_with_stubs
     _seed(p, "turn:1", "alpha beta gamma")
@@ -372,15 +519,29 @@ def test_real_bank_leg_uses_the_bounded_pool_and_stops_with_the_provider(provide
     assert p._keyword is None
 
 
-def test_real_bank_fingerprint_changes_with_new_chunks(provider_with_stubs):
+@pytest.mark.parametrize("cls,chunks", [("PgDocumentSource", False), ("PgChunkSource", True)])
+def test_real_bank_source_fingerprint_and_keyset_batches(provider_with_stubs, cls, chunks):
     p = provider_with_stubs
-    src = rf.PgChunkSource(p._memory._pool, "test")
-    before = src.fingerprint()
-    _seed(p, "turn:9", "something new to remember")
-    after = src.fingerprint()
-    assert before != after and after[0] == before[0] + 1
-    rows = [r for b in src.batches() for r in b]
-    assert len(rows) == after[0] and rows[0]["source"] == "turn:9"
+    pool = p._memory._pool
+    src = getattr(rf, cls)(pool, "test", batch=2)
+    assert src.fingerprint()["count"] == 0
+    for i in range(5):
+        _seed(p, f"turn:{i}", f"note number {i}", chunks=chunks)
+    fp = src.fingerprint()
+    assert fp["count"] == 5
+    pages = list(src.batches())
+    assert [len(b) for b in pages] == [2, 2, 1]                       # keyset pages, 2 at a time
+    rows = [r for b in pages for r in b]
+    assert [r["source"] for r in rows] == [f"turn:{i}" for i in range(5)]
+    cursor = pages[1][-1]["cursor"]
+    rest = [r for b in src.batches(after=cursor) for r in b]
+    assert [r["source"] for r in rest] == ["turn:4"]
+    fp2 = src.fingerprint(cursor)
+    assert fp2["prefix_count"] == 4 and fp2["prefix_max_updated"] == max(r["updated_at"] for r in rows[:4])
+    _seed(p, "turn:9", "later", chunks=chunks)
+    fp3 = src.fingerprint(cursor)
+    assert fp3["count"] == 6 and fp3["prefix_count"] == 4 and fp3["max_created"] > fp["max_created"]
+    assert len(pool._open) <= pool._max
 
 
 def test_recall_keyword_off_builds_no_leg(plugin_module, pg_url, hermes_home, monkeypatch):

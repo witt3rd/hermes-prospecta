@@ -39,9 +39,11 @@ def test_no_stemming():
 
 # ---- BM25 index ----
 
-def _row(i, text, doc=None, source=None, date="2026-01-01"):
+def _row(i, text, doc=None, source=None, date="2026-01-01", updated=None):
+    created = f"2026-01-01 00:00:{i:02d}.000000"
     return {"item_id": f"i{i}", "document_id": doc or f"d{i}", "source": source or f"s{i}",
-            "created_on": date, "text": text}
+            "created_on": date, "text": text, "cursor": (created, doc or f"d{i}"),
+            "updated_at": updated or created}
 
 
 def _index(rows):
@@ -237,25 +239,40 @@ def test_tally_empty_rates_are_na_not_an_error():
 # ---- the keyword leg: in-memory index, fingerprint rebuild, never blocks ----
 
 class FakeSource:
+    """The source protocol: fingerprint(cursor) and batches(after), rows ordered by cursor."""
+
+    unit = "document"
+
     def __init__(self, rows):
         self.rows = list(rows)
         self.fp_calls = 0
-        self.batch_calls = 0
+        self.batch_calls = []          # the ``after`` of each scan
+        self.rows_read = 0
         self.fail = None
         self.gate = None
 
-    def fingerprint(self):
+    def fingerprint(self, cursor=None):
         self.fp_calls += 1
         if self.fail:
             raise self.fail
-        return (len(self.rows), len(self.rows))
+        rows = sorted(self.rows, key=lambda r: r["cursor"])
+        fp = {"count": len(rows), "max_created": max((r["cursor"][0] for r in rows), default=""),
+              "max_updated": max((r["updated_at"] for r in rows), default="")}
+        if cursor is not None:
+            pre = [r for r in rows if r["cursor"] <= tuple(cursor)]
+            fp["prefix_count"] = len(pre)
+            fp["prefix_max_updated"] = max((r["updated_at"] for r in pre), default="")
+        return fp
 
-    def batches(self):
-        self.batch_calls += 1
+    def batches(self, after=None):
+        self.batch_calls.append(after)
         if self.gate is not None:
             self.gate.wait(5)
-        yield self.rows[:2]
-        yield self.rows[2:]
+        rows = sorted(self.rows, key=lambda r: r["cursor"])
+        rows = [r for r in rows if after is None or r["cursor"] > tuple(after)]
+        for lo in range(0, len(rows), 2):
+            self.rows_read += len(rows[lo:lo + 2])
+            yield rows[lo:lo + 2]
 
 
 class Clock:
@@ -277,21 +294,65 @@ def test_leg_builds_on_first_use_then_serves_from_memory():
     status, hits = leg.search("token3", 3)
     assert status == "ok" and hits[0].source == "s3"
     leg.search("token1", 3)
-    assert src.batch_calls == 1   # one scan, then memory only
+    assert len(src.batch_calls) == 1   # one scan, then memory only
 
 
-def test_leg_rebuilds_when_fingerprint_changes_after_the_min_interval():
+def test_leg_appends_new_rows_only_and_is_not_held_back_by_the_rebuild_interval():
+    clock = Clock()
+    src = FakeSource([_row(i, f"token{i}") for i in range(3)])
+    leg = _leg(src, clock, recheck_s=30, min_rebuild_s=600)
+    leg.search("token0", 3)
+    assert src.rows_read == 3
+    src.rows.append(_row(9, "freshword"))
+    clock.t += 31                                  # due for a check: appended at once, not a full read
+    leg.search("freshword", 3)
+    assert [h.source for h in leg.search("freshword", 3)[1]] == ["s9"]
+    assert src.rows_read == 4 and src.batch_calls[-1] == ("2026-01-01 00:00:02.000000", "d2")
+    assert leg.last_build["mode"] == "append" and leg.last_build["rows"] == 4
+    assert [h.source for h in leg.search("token1", 3)[1]] == ["s1"]   # old rows still served
+
+
+def test_leg_rebuilds_in_full_when_indexed_rows_changed_and_the_interval_has_passed():
     clock = Clock()
     src = FakeSource([_row(i, f"token{i}") for i in range(3)])
     leg = _leg(src, clock, recheck_s=30, min_rebuild_s=60)
     leg.search("token0", 3)
-    src.rows.append(_row(9, "freshword"))
+    src.rows[1] = _row(1, "rewritten", updated="2026-02-01 00:00:00.000000")    # edited in place
     clock.t += 31                                  # due for a check, but too soon to rebuild
-    assert leg.search("freshword", 3)[1] == []
+    assert leg.search("rewritten", 3)[1] == []
     clock.t += 61
-    leg.search("freshword", 3)                     # check -> rebuild (synchronous in this test)
-    assert [h.source for h in leg.search("freshword", 3)[1]] == ["s9"]
-    assert src.batch_calls == 2
+    leg.search("rewritten", 3)
+    assert [h.source for h in leg.search("rewritten", 3)[1]] == ["s1"]
+    assert leg.search("token1", 3)[1] == []
+    assert src.batch_calls[-1] is None and src.rows_read == 6 and leg.last_build["mode"] == "full"
+
+
+def test_leg_rebuilds_in_full_after_a_delete_or_a_late_row_behind_the_cursor():
+    clock = Clock()
+    src = FakeSource([_row(i, f"token{i}") for i in range(4)])
+    leg = _leg(src, clock, recheck_s=30, min_rebuild_s=0)
+    leg.search("token0", 3)
+    del src.rows[1]                                # a note was deleted
+    clock.t += 31
+    leg.search("token0", 3)
+    assert leg.search("token1", 3)[1] == [] and leg.last_build["mode"] == "full"
+    src.rows.append(_row(0, "late", doc="dz"))     # committed late, ordered before the cursor
+    src.rows[-1]["cursor"] = ("2026-01-01 00:00:00.500000", "dz")
+    clock.t += 31
+    leg.search("token0", 3)
+    assert [h.document_id for h in leg.search("late", 3)[1]] == ["dz"] and leg.last_build["mode"] == "full"
+
+
+def test_leg_appending_never_duplicates_a_row():
+    clock = Clock()
+    src = FakeSource([_row(i, f"t{i} shared") for i in range(3)])
+    leg = _leg(src, clock, recheck_s=30, min_rebuild_s=0)
+    leg.search("t0", 1)
+    for k in range(3, 6):
+        src.rows.append(_row(k, f"t{k} shared"))
+        clock.t += 31
+        leg.search("t0", 1)
+    assert len(leg.search("shared", 50)[1]) == 6
 
 
 def test_leg_unchanged_fingerprint_does_not_rebuild():
@@ -301,7 +362,7 @@ def test_leg_unchanged_fingerprint_does_not_rebuild():
     leg.search("t1", 1)
     clock.t += 100
     leg.search("t1", 1)
-    assert src.batch_calls == 1 and src.fp_calls >= 2
+    assert len(src.batch_calls) == 1 and src.fp_calls >= 2
 
 
 def test_leg_background_build_never_blocks_the_caller():
@@ -339,20 +400,106 @@ def test_leg_keeps_serving_the_old_index_when_a_recheck_fails():
     assert status == "ok" and hits[0].source == "s1"
 
 
-def test_leg_refuses_a_bank_over_the_chunk_cap(caplog):
-    class Big(FakeSource):
-        def fingerprint(self):
-            return (10_000_000, 0)
-    leg = _leg(Big([_row(1, "a")]), max_chunks=1000)
-    with caplog.at_level("ERROR"):
-        assert leg.search("a", 1) == ("unavailable", [])
-    assert "1000" in caplog.text
-    assert leg.search("a", 1)[0] == "unavailable"
-
-
 def test_leg_stop_prevents_new_work():
     src = FakeSource([_row(1, "a")])
     leg = _leg(src)
     leg.stop()
     assert leg.search("a", 1) == ("unavailable", [])
-    assert src.batch_calls == 0
+    assert src.batch_calls == []
+
+
+def test_leg_has_no_size_cap_it_builds_whatever_the_bank_holds():
+    class Huge(FakeSource):
+        def fingerprint(self, cursor=None):
+            fp = super().fingerprint(cursor)
+            fp["count"] = 50_000_000                 # a bank far past the old 400,000 limit
+            return fp
+    leg = _leg(Huge([_row(1, "alpha")]))
+    assert leg.search("alpha", 1)[0] == "ok"
+
+
+def test_leg_logs_counts_size_and_time_and_warns_over_the_soft_threshold(caplog):
+    src = FakeSource([_row(i, "alpha beta " * 50) for i in range(6)])
+    leg = _leg(src, warn_mb=0.0001)
+    with caplog.at_level("INFO"):
+        leg.search("alpha", 1)
+    info = [r for r in caplog.records if r.levelname == "INFO" and "keyword leg" in r.message]
+    assert info and "6 documents" in info[0].getMessage() and "bank b" in info[0].getMessage()
+    assert " MB" in info[0].getMessage() and "in " in info[0].getMessage()
+    warn = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warn) == 1 and "soft threshold" in warn[0].getMessage()
+    assert leg.search("alpha", 1)[0] == "ok"        # warned, never turned off
+    assert "alpha beta" not in caplog.text          # counts only
+
+
+def test_leg_no_warning_when_the_threshold_is_off(caplog):
+    leg = _leg(FakeSource([_row(i, "alpha " * 100) for i in range(5)]))
+    with caplog.at_level("WARNING"):
+        leg.search("alpha", 1)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_leg_pauses_after_every_database_batch(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(rf.time, "sleep", lambda s: sleeps.append(s))
+    leg = _leg(FakeSource([_row(i, f"t{i}") for i in range(5)]), pause_s=0.2)
+    leg.search("t1", 1)
+    assert sleeps.count(0.2) == 3                  # 5 rows in batches of 2, 2, 1
+    assert sleeps.count(0) >= 3                    # and a yield after every slice
+
+
+def test_leg_never_runs_the_build_in_the_callers_connection_scope():
+    """Rows are indexed after the source has handed the batch back: the source's
+    generator is suspended between batches, so a pooled connection is not held."""
+    order = []
+
+    class Spy(FakeSource):
+        def batches(self, after=None):
+            for b in super().batches(after):
+                order.append("fetch")
+                yield b
+                order.append("resumed")
+
+    leg = _leg(Spy([_row(i, f"t{i}") for i in range(4)]))
+    leg.search("t1", 1)
+    assert order == ["fetch", "resumed", "fetch", "resumed"]
+
+
+def test_bm25_search_while_rows_are_still_being_added():
+    idx = _index([_row(i, f"w{i} common") for i in range(5)])
+    hits = idx.search("common", 10)
+    idx.add_rows([_row(7, "w7 common")])
+    assert len(idx.search("common", 10)) == len(hits) + 1 and len(idx) == 6
+
+
+def test_bm25_documents_lookup_and_stats():
+    idx = _index([_row(1, "alpha one"), _row(2, "beta two")])
+    docs = idx.documents(["d2", "nope", "d2"])
+    assert list(docs) == ["d2"] and docs["d2"].content == "beta two" and docs["d2"].origin == "store"
+    st = idx.stats()
+    assert st["rows"] == 2 and st["terms"] == 4 and st["postings"] == 4 and st["approx_bytes"] > 0
+
+
+def test_union_by_document_counts_a_note_found_by_both_legs_once():
+    kw = [_It("dA", "whole note A"), _It("dB", "whole note B")]
+    st = [_It("dA", "part of note A"), _It("dC", "note C")]
+    assert [i.document_id for i in rf.keyword_first_union(kw, st, slots=10, by_document=True)] == ["dA", "dB", "dC"]
+    # by chunk (the old key) the two texts of note A are two entries
+    assert len(rf.keyword_first_union(kw, st, slots=10)) == 4
+
+
+def test_with_document_text_swaps_in_the_whole_note_and_keeps_unindexed_items():
+    doc = rf.KeywordHit(content="the whole note", original_chunk="the whole note", source="S", score=0.0,
+                        scores={}, metadata={}, bank_id="b", document_id="dA", created_on="2026-01-02", origin="store")
+    items = [_It("dA", "a part"), _It("dNew", "new note")]
+    out = rf.with_document_text(items, {"dA": doc})
+    assert out[0].original_chunk == "the whole note" and out[0].created_on == "2026-01-02"
+    assert out[1] is items[1]
+
+
+def test_with_document_text_never_cuts_a_note_too_long_for_the_budget():
+    long_doc = rf.KeywordHit(content="word " * 5000, original_chunk="word " * 5000, source="S", score=0.0,
+                             scores={}, metadata={}, bank_id="b", document_id="dA", origin="store")
+    item = _It("dA", "short part")
+    assert rf.with_document_text([item], {"dA": long_doc}, 1500)[0] is item
+    assert rf.with_document_text([item], {"dA": long_doc}, 0)[0].original_chunk == long_doc.content

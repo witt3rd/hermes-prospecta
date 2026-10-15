@@ -1040,6 +1040,34 @@ class ProspectaProvider(MemoryProvider):
         raw = self._recall_setting("PROSPECTA_RECALL_KEYWORD", "keyword")
         return ("" if raw is None else str(raw).strip().lower()) not in ("0", "false", "no", "off")
 
+    def _recall_keyword_unit(self) -> str:
+        """What the keyword leg indexes: 'documents' (default: the bank's raw notes,
+        present in every bank) or 'chunks' (the old behaviour: chunk items, which
+        only newer banks have)."""
+        raw = self._recall_setting("PROSPECTA_RECALL_KEYWORD_UNIT", "keyword_unit")
+        if raw is None:
+            return _rf.DEFAULT_UNIT
+        text = str(raw).strip().lower()
+        if text in _rf.KEYWORD_UNITS:
+            return text
+        logger.warning("prospecta: recall.keyword_unit %r is not one of %s; using %r",
+                       raw, list(_rf.KEYWORD_UNITS), _rf.DEFAULT_UNIT)
+        return _rf.DEFAULT_UNIT
+
+    def _recall_float(self, env_name: str, key: str, default: float) -> float:
+        """A non-negative number from a ``recall.*`` option, else ``default``."""
+        raw = self._recall_setting(env_name, key)
+        if raw is None or isinstance(raw, bool):
+            return default
+        try:
+            v = float(str(raw).strip())
+            if v < 0 or v != v:
+                raise ValueError(raw)
+            return v
+        except (TypeError, ValueError):
+            logger.warning("prospecta: recall.%s %r is not a number >= 0; using %s", key, raw, default)
+            return default
+
     def _start_keyword(self, bank_id: str) -> None:
         """The keyword leg over the main bank, on the main Memory's own pool.
         Only built when something uses it: the union, or the shadow log's
@@ -1049,7 +1077,12 @@ class ProspectaProvider(MemoryProvider):
         if self._recall_fusion() != "keyword_first_union" and not self._resolve_shadow_bank_id():
             return
         try:
-            self._keyword = _rf.KeywordLeg(_rf.PgChunkSource(self._memory._pool, bank_id), bank_id=bank_id)
+            source_cls = _rf.PgChunkSource if self._recall_keyword_unit() == "chunks" else _rf.PgDocumentSource
+            self._keyword = _rf.KeywordLeg(
+                source_cls(self._memory._pool, bank_id), bank_id=bank_id,
+                pause_s=self._recall_float("PROSPECTA_RECALL_KEYWORD_PAUSE_MS", "keyword_batch_pause_ms",
+                                           _rf.DEFAULT_PAUSE_S * 1000) / 1000.0,
+                warn_mb=self._recall_float("PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB", "keyword_index_warn_mb", 0.0))
         except Exception:
             self._keyword = None
             logger.exception("Prospecta keyword leg could not start; recall uses the store only")
@@ -1206,8 +1239,24 @@ class ProspectaProvider(MemoryProvider):
             },
             {
                 "key": "recall.keyword",
-                "description": "Build the in-memory keyword leg over the bank's chunk items: 'true' / 'false'. Default on. PROSPECTA_RECALL_KEYWORD env overrides.",
+                "description": "Build the in-memory keyword leg over the bank's notes: 'true' / 'false'. Default on. PROSPECTA_RECALL_KEYWORD env overrides.",
                 "default": "true",
+            },
+            {
+                "key": "recall.keyword_unit",
+                "description": "What the keyword leg indexes: 'documents' (default: the bank's raw notes, which every bank has) or 'chunks' (the old behaviour: chunk items, which only banks written with chunking have). PROSPECTA_RECALL_KEYWORD_UNIT env overrides.",
+                "default": _rf.DEFAULT_UNIT,
+                "choices": list(_rf.KEYWORD_UNITS),
+            },
+            {
+                "key": "recall.keyword_index_warn_mb",
+                "description": "Soft memory threshold for the keyword index, in MB: when the index's estimated size exceeds it a WARNING is logged (the index is kept, nothing is turned off). 0 (default) = no warning. PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB env overrides.",
+                "default": "0",
+            },
+            {
+                "key": "recall.keyword_batch_pause_ms",
+                "description": "Pause, in milliseconds, after each database batch while the keyword index is built or extended, so the build never starves the gateway. Default 50. 0 = no pause. PROSPECTA_RECALL_KEYWORD_PAUSE_MS env overrides.",
+                "default": str(int(_rf.DEFAULT_PAUSE_S * 1000)),
             },
             {
                 "key": "shadow_mode",
@@ -1890,8 +1939,16 @@ class ProspectaProvider(MemoryProvider):
             "prospecta_search", query, items=store_items[:limit], mode=mode, limit=limit,
             depth=args.get("depth"), old_ms=old_ms, kw_n=extra.get("kw_n"))
 
-        fused = _rf.keyword_first_union(kw_hits, store_items, slots=pool) if union and kw_hits \
-            else store_items[:pool]
+        by_doc = kw_status == "ok" and leg is not None and leg.unit == "document"
+        if union and (kw_hits or by_doc):
+            # one entry per note when the leg indexes notes (a note found by both legs, or by
+            # several of its items, appears once, with the note's own text); else per chunk
+            fused = _rf.keyword_first_union(kw_hits, store_items, slots=pool, by_document=by_doc)
+            if by_doc:
+                fused = _rf.with_document_text(
+                    fused, leg.documents(str(getattr(it, "document_id", "")) for it in fused), block_tokens)
+        else:
+            fused = store_items[:pool]
         if block_tokens <= 0:
             results = []
             for it in fused[:limit]:
