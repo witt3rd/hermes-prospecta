@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +76,73 @@ def _people(text: str, people_vocab) -> list:
             if re.search(rf"(?<!\w){re.escape(p)}(?!\w)", text, re.IGNORECASE)]
 
 
-def make_gated(original):
-    """Wrap ``extract_filters``: no cue -> people regex only, no model call."""
+DEFAULT_TIMEOUT = 6.0
+MAX_INFLIGHT = 8  # abandoned + running model calls allowed at once
+_timeout = DEFAULT_TIMEOUT
+_slots = threading.BoundedSemaphore(MAX_INFLIGHT)
+_stats = {"timeouts": 0, "errors": 0, "skipped": 0}
+
+
+def set_timeout(seconds) -> None:
+    """Wall-clock cap (s) on the model call; 0 or less disables."""
+    global _timeout
+    _timeout = float(seconds)
+
+
+def _call_with_timeout(fn, timeout):
+    """Run ``fn`` in a daemon thread; return (done, value). Never raises.
+    The thread cannot be cancelled: on timeout it is abandoned, its result and
+    any exception are dropped, and it holds one of MAX_INFLIGHT slots until it
+    ends. With no free slot the call is not started (done=False)."""
+    if not _slots.acquire(blocking=False):
+        _stats["skipped"] += 1
+        return False, "no free slot (%d stalled calls)" % MAX_INFLIGHT
+    box = {}
+    finished = threading.Event()
+
+    def run():
+        try:
+            box["v"] = fn()
+        except BaseException as e:  # noqa: BLE001 - reported to the caller or dropped
+            box["e"] = e
+        finally:
+            _slots.release()
+            finished.set()
+
+    try:
+        threading.Thread(target=run, name="prospecta-date-extract", daemon=True).start()
+    except Exception as e:
+        _slots.release()
+        return False, repr(e)
+    if not finished.wait(timeout):
+        return False, "timed out after %.1fs" % timeout
+    if "e" in box:
+        return False, "%s: %s" % (type(box["e"]).__name__, box["e"])
+    return True, box["v"]
+
+
+def make_gated(original, timeout=None):
+    """Wrap ``extract_filters``: no cue -> people regex only, no model call; with a
+    cue the library call runs under a wall-clock timeout (``timeout`` seconds, or
+    the module setting) and falls back to the library's regex baseline."""
     def extract_filters(text, *, llm, people_vocab, now, **kwargs):
-        if llm is None or has_date_cue(text):
+        if llm is None:
             return original(text, llm=llm, people_vocab=people_vocab, now=now, **kwargs)
+        if has_date_cue(text):
+            limit = _timeout if timeout is None else timeout
+            if not limit or limit <= 0:
+                return original(text, llm=llm, people_vocab=people_vocab, now=now, **kwargs)
+            t0 = time.monotonic()
+            ok, val = _call_with_timeout(
+                lambda: original(text, llm=llm, people_vocab=people_vocab, now=now, **kwargs),
+                limit)
+            if ok:
+                return val
+            _stats["timeouts" if "timed out" in str(val) else "errors"] += 1
+            logger.warning("prospecta: date extraction fell back to regex after %.2fs (%s)",
+                           time.monotonic() - t0, val)
+            from prospecta.channels.extract import regex_filters
+            return regex_filters(text, people_vocab, now)
         from prospecta.channels.base import Filters
         return Filters(people=_people(text, people_vocab), date_from=None,
                        date_to=None, hard=False)
