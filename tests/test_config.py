@@ -15,7 +15,7 @@ def test_get_config_schema_has_expected_fields(plugin_module):
         "linked_writes", "dual_write_bank_id", "dual_write_embed_model",
         "dual_write_embedding_dim", "dual_write_retry_path", "timezone", "note_date", "hash_precheck",
         "max_connections", "tool_guide", "pool_idle_seconds", "connection_watch",
-        "connection_watch_percent",
+        "connection_watch_percent", "recall.fusion", "recall.block_tokens", "recall.keyword",
     }
     assert keys == expected
 

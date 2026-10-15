@@ -17,9 +17,9 @@ def test_retain_then_search_finds_content(provider_with_stubs):
     _call(p, "prospecta_retain", content="The capital of France is Paris.",
           source="fact:france", index_text=["What is the capital of France?"])
     res = _call(p, "prospecta_search", query="When is Kelly's birthday?", limit=5)
-    assert res["results"], res
-    assert res["results"][0]["source"] == "fact:kelly"
-    assert "May 14" in res["results"][0]["content"]
+    assert res["sources"], res
+    assert res["sources"][0]["source"] == "fact:kelly"
+    assert "May 14" in res["block"]
 
 
 def test_retain_then_recall_attributes_source(provider_with_stubs):
@@ -44,7 +44,7 @@ def test_memory_survives_provider_restart(plugin_module, provider_with_stubs,
     p2.initialize(session_id="second", hermes_home=str(hermes_home))
     try:
         res = _call(p2, "prospecta_search", query="What is the vault code?")
-        assert [r["source"] for r in res["results"]][:1] == ["fact:vault"]
+        assert [r["source"] for r in res["sources"]][:1] == ["fact:vault"]
     finally:
         p2.shutdown()
 
@@ -60,6 +60,6 @@ def test_banks_are_isolated(plugin_module, provider_with_stubs, hermes_home,
     monkeypatch.setattr(p2, "_build_llm", lambda: stub_llm)
     p2.initialize(session_id="other", hermes_home=str(hermes_home))
     try:
-        assert _call(p2, "prospecta_search", query="secret")["results"] == []
+        assert _call(p2, "prospecta_search", query="secret")["sources"] == []
     finally:
         p2.shutdown()
