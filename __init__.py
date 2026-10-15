@@ -1049,6 +1049,22 @@ class ProspectaProvider(MemoryProvider):
         raw = self._recall_setting("PROSPECTA_DATE_CUE_GATE", "date_cue_gate")
         return ("" if raw is None else str(raw).strip().lower()) not in ("0", "false", "no", "off")
 
+    def _recall_date_timeout(self) -> float:
+        """Hard cap (s) on the date-extraction model call. Default 6; 0 disables.
+        PROSPECTA_DATE_TIMEOUT env or ``recall.date_timeout_seconds``."""
+        raw = self._recall_setting("PROSPECTA_DATE_TIMEOUT", "date_timeout_seconds")
+        if raw is None:
+            return _dcg.DEFAULT_TIMEOUT
+        try:
+            v = float(str(raw).strip())
+            if v < 0 or v != v:
+                raise ValueError(raw)
+            return v
+        except ValueError:
+            logger.warning("prospecta: recall.date_timeout_seconds %r is not a number >= 0; using %s",
+                           raw, _dcg.DEFAULT_TIMEOUT)
+            return _dcg.DEFAULT_TIMEOUT
+
     def _recall_keyword_unit(self) -> str:
         """What the keyword leg indexes: 'documents' (default: the bank's raw notes,
         present in every bank) or 'chunks' (the old behaviour: chunk items, which
@@ -1255,6 +1271,11 @@ class ProspectaProvider(MemoryProvider):
                 "key": "recall.date_cue_gate",
                 "description": "Call the filter-extraction model on a search only when the question has a date cue (a month, weekday, 'ago', 'last week', a year, an ISO date, ...); otherwise search with no date filter and no model call. 'true' / 'false'. Default on. PROSPECTA_DATE_CUE_GATE env overrides.",
                 "default": "true",
+            },
+            {
+                "key": "recall.date_timeout_seconds",
+                "description": "Hard wall-clock cap in seconds on the date-extraction model call; on timeout or error the search uses the regex date filter. Default 6. 0 disables. PROSPECTA_DATE_TIMEOUT env overrides.",
+                "default": "6",
             },
             {
                 "key": "recall.keyword_unit",
@@ -1680,6 +1701,7 @@ class ProspectaProvider(MemoryProvider):
 
         if self._recall_date_cue_gate() and not self._date_gate_held:
             self._date_gate_held = _dcg.install()
+            _dcg.set_timeout(self._recall_date_timeout())
 
         self._start_keyword(bank_id)
         self._start_shadow(bank_id)

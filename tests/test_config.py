@@ -16,7 +16,7 @@ def test_get_config_schema_has_expected_fields(plugin_module):
         "dual_write_embedding_dim", "dual_write_retry_path", "timezone", "note_date", "hash_precheck",
         "max_connections", "tool_guide", "pool_idle_seconds", "connection_watch",
         "connection_watch_percent", "recall.fusion", "recall.block_tokens", "recall.keyword",
-        "recall.date_cue_gate", "recall.keyword_unit", "recall.keyword_index_warn_mb", "recall.keyword_batch_pause_ms",
+        "recall.date_cue_gate", "recall.date_timeout_seconds", "recall.keyword_unit", "recall.keyword_index_warn_mb", "recall.keyword_batch_pause_ms",
     }
     assert keys == expected
 
