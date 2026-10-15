@@ -81,7 +81,62 @@ Both paths run migrations and create the default bank idempotently.
 |---|---|
 | `prospecta_retain` | Store with optional `index_text` override |
 | `prospecta_recall` | Synthesized answer + source attribution |
-| `prospecta_search` | Raw chunks, no synthesis |
+| `prospecta_search` | Raw note text, no synthesis: one token-budget block, keyword matches first (see [Recall](#recall-keyword-leg-union-and-block)) |
+
+## Recall: keyword leg, union and block
+
+`prospecta_search` (the tool that returns notes, no LLM) changed after the
+memory bake-off, which found that on real histories a plain keyword search
+found the evidence far more often than the store's fused recall, that rank
+fusion can demote the best channel's top hit, and that ten short notes lose to
+a block of raw text. Three parts, each with a config option (all under
+`recall`, in `prospecta.json` as `{"recall": {...}}` or as the flat keys
+`recall.fusion`, `recall.block_tokens`, `recall.keyword`):
+
+1. **Keyword leg** (`recall.keyword`, default `true`). A plain raw-text keyword
+   search over the bank's chunk items (`kind='chunk'`, text in
+   `original_chunk`): Okapi BM25 (k1 1.5, b 0.75), stemming **off**, OR
+   semantics, lowercase tokens. Identifiers and file names are kept whole and
+   also split: `deploy-config_v2.yaml` is searchable as that, and as `deploy`,
+   `config`, `v2`, `yaml`. The index lives in memory only (nothing on disk). It
+   is read through the plugin's own bounded pool in short borrows of
+   5,000 rows (no connection of its own, so `max_connections` and
+   `pool_idle_seconds` apply as before), is built on first use in a background
+   thread, and rebuilt when the bank's fingerprint (chunk count and latest
+   write time) changes: checked every 30 s, rebuilt at most once a minute, the
+   old index serving meanwhile. A search never waits for it: while it is
+   building (or if it failed, which is logged with the full exception) the
+   store's own recall is used alone and the answer says `"keyword": "warming"`
+   / `"unavailable"`. A bank with more than 400,000 chunk items gets no
+   keyword leg (ERROR log). It is only built when something uses it: the
+   union, or the shadow log. Only `mode: hybrid` searches use it.
+2. **Keyword-first union** (`recall.fusion`, default `keyword_first_union`;
+   `store` is the old behaviour). The top 3 of the keyword leg first, then the
+   top 3 of the store, de-duplicated (the same chunk of the same note counts
+   once), then the remaining slots in the store's own order. The best keyword
+   hit is never demoted. If the library's `search` gets a floor-preserving
+   option (a `floor` parameter), the plugin passes it on (feature-detected,
+   never required); the pinned library has none there today (its
+   `rerank.blend.floor` is a per-bank rerank setting that does not touch
+   search), and the union gives the same guarantee either way.
+3. **Token-budget block** (`recall.block_tokens`, default `1500`; `0` = the old
+   list of notes). The search result is **one block** of raw note text in the
+   fused order, each entry headed `[source: ... | date: YYYY-MM-DD]` (`undated`
+   when the note has no date), until the budget is reached. An entry that does
+   not fit is skipped whole and the next one that fits is taken; stored text is
+   never cut. The block is built from up to 50 candidates (the store is asked
+   for 50, not `limit`, when the block is on). Tokens are estimated, since the
+   plugin has no tokenizer: whitespace words x 1.3, floored by characters / 4.
+   The JSON answer has `block`, `entries`, `tokens`, `budget`, `keyword`,
+   `sources` (source, date, `store` / `keyword`) and, when something was left
+   out for size, `omitted` (source and date only).
+
+Rollback is by config, no code change: `{"recall": {"fusion": "store",
+"block_tokens": 0}}` returns the old `{"results": [...]}` list exactly (add
+`"keyword": false` to also drop the index). Env overrides:
+`PROSPECTA_RECALL_FUSION`, `PROSPECTA_RECALL_BLOCK_TOKENS`,
+`PROSPECTA_RECALL_KEYWORD`. `prospecta_recall` and prefetch (the LLM
+synthesis paths) are unchanged.
 
 ## Prefetch
 
@@ -112,6 +167,19 @@ the same shape as the library's own shadow of `Memory.recall()`.
 - `recall_synth` already stores its own old-bank event, so for `prospecta_recall`
   and prefetch the pair's old row is a second row; filter on `trace -> 'shadow'`.
 - The shadow bank must already exist, with `shadow_embedding_dim` matching it.
+- **Abstention is always read with the false-abstain rate.** A side *abstains*
+  on a question when it returns nothing; a question is *answerable* when the old
+  side, the new side or the keyword leg found something; a *false abstain* is an
+  abstention on an answerable question. Every pair's two rows carry counts only
+  in `trace.shadow` (`old_n`, `new_n`, `kw_n`, and `abstain`: running totals
+  `pairs`, `answerable`, `old_abstain`, `old_false_abstain`, `new_pairs`,
+  `new_abstain`, `new_false_abstain`), and the worker logs one INFO line per
+  pair, e.g. `prospecta shadow pair tool=prospecta_search old_n=10 new_n=10
+  kw_n=7 jaccard=0.43 | abstain old 0/40 (0.0%) false-abstain old 0/38 (0.0%);
+  abstain new 2/40 (5.0%) false-abstain new 2/38 (5.3%)`. No question or note
+  text is in it. A shadow side that errored is left out of its own counts. The
+  pair itself is unchanged: it still compares the store's lists (the old bank's
+  `recall` list against the new bank's), not the fused block.
 
 ## Linked and dual writes
 
@@ -212,7 +280,7 @@ something else since is left alone.
 
 ## Configuration
 
-`get_config_schema()` exposes twenty fields (`hermes memory setup` walks them):
+`get_config_schema()` exposes twenty-three fields (`hermes memory setup` walks them):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -239,6 +307,9 @@ something else since is left alone.
 | `note_date` | empty (on, except with `linked_writes`) | save each new note's date; `PROSPECTA_NOTE_DATE` env overrides |
 | `hash_precheck` | empty (on) | before saving, look for the same text already in the bank and skip the write (no LLM call); `PROSPECTA_HASH_PRECHECK` env overrides. Same text under another source is logged and skipped |
 | `tool_guide` | empty (on) | add a short guide to the memory tools (search vs recall, depth, dates, retain) to the system prompt block; `false` or `PROSPECTA_TOOL_GUIDE=off` turns it off |
+| `recall.fusion` | `keyword_first_union` | how `prospecta_search` joins the keyword leg with the store's recall; `store` = the old behaviour; `PROSPECTA_RECALL_FUSION` env overrides. See [Recall](#recall-keyword-leg-union-and-block) |
+| `recall.block_tokens` | `1500` | `prospecta_search` returns one block of at most this many estimated tokens (whole entries only); `0` = the old list of notes; `PROSPECTA_RECALL_BLOCK_TOKENS` env overrides |
+| `recall.keyword` | `true` | build the in-memory keyword leg (BM25, stemming off) over the bank's chunk items; `PROSPECTA_RECALL_KEYWORD` env overrides |
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
 
 Persisted to `$HERMES_HOME/prospecta.json`.
