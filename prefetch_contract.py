@@ -290,8 +290,11 @@ class Decision:
 
     def sources(self) -> List[str]:
         """The sources to ask: the need_* at or above 0.5; none at 0.5 means all."""
-        named = [NEED_SOURCES[k] for k, v in self.needs.items() if k in NEED_SOURCES and v >= NEEDS_THRESHOLD]
-        return named or list(ALL_SOURCES)
+        return self.named_sources() or list(ALL_SOURCES)
+
+    def named_sources(self) -> List[str]:
+        """Only the sources whose need_* reached 0.5; empty when none did."""
+        return [NEED_SOURCES[k] for k, v in self.needs.items() if k in NEED_SOURCES and v >= NEEDS_THRESHOLD]
 
 
 def build_state(*, line: str, agent_last: str, turns: int, thread: str = "", agent: str = "") -> dict:
@@ -673,7 +676,7 @@ class _Run:
                 raise TimeoutError("no time left")
             qs, cost = self.timed("questions", lambda: write_questions(
                 self.deps.writer_llm, self.c, line=line, agent_last=agent_last, line_kind=d.line_kind,
-                kinds=sources, thread=thread, timeout=timeout))
+                kinds=d.named_sources(), thread=thread, timeout=timeout))
             self.brief.cost_usd += cost
             return qs
         except Exception as exc:

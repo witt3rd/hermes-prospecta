@@ -2219,6 +2219,50 @@ class ProspectaProvider(MemoryProvider):
         except Exception:
             logger.debug("prospecta: could not keep the last answer", exc_info=True)
 
+    def _recover_last_answer(self, sid: str) -> None:
+        """When this session has no kept answer (after a restart or with a new session id), read
+        the session's last assistant message once from the profile's session store and keep it.
+        Never raises; on any trouble the session just has no last answer."""
+        try:
+            with self._state_lock:
+                if sid in self._exchanges:
+                    return
+            text = self._read_last_assistant(sid)
+            with self._state_lock:
+                if sid not in self._exchanges:
+                    self._exchanges[sid] = (text, 0)
+                    while len(self._exchanges) > 64:
+                        self._exchanges.popitem(last=False)
+        except Exception:
+            logger.debug("prospecta: could not recover the last answer", exc_info=True)
+
+    def _read_last_assistant(self, sid: str) -> str:
+        """The whole latest non-empty assistant message of ``sid`` from ``state.db`` in the
+        profile home, through a separate read-only connection. '' on any error or no row."""
+        if self._hermes_home is None or not sid:
+            return ""
+        db = Path(self._hermes_home) / "state.db"
+        if not db.is_file():
+            return ""
+        import sqlite3
+        conn = None
+        try:
+            conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=0.2)
+            conn.execute("PRAGMA busy_timeout = 200")
+            row = conn.execute(
+                "SELECT content FROM messages WHERE session_id = ? AND role = 'assistant' "
+                "AND content IS NOT NULL AND content != '' ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+            text = row[0] if row else ""
+            return text if isinstance(text, str) else ""
+        except Exception:
+            return ""
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def _last_exchange(self, sid: str) -> "tuple":
         with self._state_lock:
             return self._exchanges.get(sid, ("", 0))
@@ -2301,6 +2345,7 @@ class ProspectaProvider(MemoryProvider):
     def _prefetch_contract(self, query: str, sid: str, cfg: Any) -> str:
         contract = _pc.load_contract(cfg.contract_path or None)
         started = time.monotonic()
+        self._recover_last_answer(sid)
         agent_last, turns = self._last_exchange(sid)
         with self._state_lock:
             ahead = self._ahead.get(sid)

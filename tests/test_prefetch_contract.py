@@ -901,3 +901,135 @@ def test_the_stage_budget_is_capped_by_what_is_left_of_the_deadline():
     assert run.budget(4.5) == 4.0
     now[0] = 8.0
     assert run.budget(4.5) == 0.0
+
+
+# ---------------------------------------------------------------------------- what the writer is given
+
+def _writer_input(prompt):
+    return prompt[prompt.index("## Input"):]
+
+
+def test_writer_kinds_are_any_when_no_need_reached_half():
+    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
+    writer = FakeWriter(questions_reply("Who was the person with at the cafe?"))
+    b = run("do you remember who i saw it with?", make_deps(FakeStore(default=[item("a")]), jev, writer))
+    assert b.sources == list(pc.ALL_SOURCES)          # the search still uses all of them
+    text = _writer_input(writer.prompts[0])
+    assert "The kinds of knowledge needed: any" in text
+    assert not any(src in text.split("kinds of knowledge needed:")[1] for src in pc.ALL_SOURCES)
+    assert OPENER_AGENT_LAST in text                  # the last answer, and only it, is the context
+
+
+def test_writer_kinds_are_only_the_chosen_ones():
+    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1, need_decisions=0.8))
+    writer = FakeWriter(questions_reply("What was decided?"))
+    run("and that?", make_deps(FakeStore(default=[item("a")]), jev, writer))
+    kinds = _writer_input(writer.prompts[0]).split("The kinds of knowledge needed: ")[1].strip()
+    assert kinds == pc.NEED_SOURCES["need_decisions"]
+
+
+def test_writer_context_is_exactly_the_last_answer():
+    seen = {}
+    import prospecta._formulate as f
+    real = f.formulate_queries
+
+    def spy(line, **kw):
+        seen["context"] = kw["context"]
+        return real(line, **kw)
+    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
+    import unittest.mock as um
+    with um.patch.object(f, "formulate_queries", spy):
+        run("and that?", make_deps(FakeStore(default=[item("a")]), jev, FakeWriter(questions_reply("Q one?"))),
+            agent_last="LAST ANSWER ONLY")
+    assert seen["context"] == "LAST ANSWER ONLY"
+
+
+# ---------------------------------------------------------------------------- the last answer after a restart
+
+def _state_db(path, rows):
+    import sqlite3
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL)")
+    c.executemany("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)", rows)
+    c.commit()
+    c.close()
+
+
+def _restarted(plugin_module, tmp_path, rows=None, **kw):
+    if rows is not None:
+        _state_db(tmp_path / "state.db", rows)
+    p = provider(plugin_module, config=CONTRACT_ON, **kw)
+    p._hermes_home = tmp_path
+    return p
+
+
+def test_recovery_returns_latest_assistant_message_whole(plugin_module, tmp_path):
+    long = "x" * 5000
+    p = _restarted(plugin_module, tmp_path, [
+        ("s1", "assistant", "old", 1), ("s1", "assistant", long, 3), ("s1", "user", "newer user", 4),
+        ("s1", "tool", "tool out", 5), ("s1", "assistant", "", 6), ("s1", "assistant", None, 7),
+        ("s2", "assistant", "other session", 9)])
+    assert p._read_last_assistant("s1") == long
+
+
+def test_recovery_survives_missing_file_table_and_lock(plugin_module, tmp_path):
+    import sqlite3
+    p = _restarted(plugin_module, tmp_path)
+    assert p._read_last_assistant("s1") == ""                       # no file
+    sqlite3.connect(tmp_path / "state.db").close()
+    assert p._read_last_assistant("s1") == ""                       # no table
+    _state_db(tmp_path / "other.db", [])
+    (tmp_path / "state.db").write_bytes(b"not a database" * 100)
+    assert p._read_last_assistant("s1") == ""                       # garbage
+    (tmp_path / "state.db").unlink()
+    _state_db(tmp_path / "state.db", [("s1", "assistant", "hi", 1)])
+    locker = sqlite3.connect(tmp_path / "state.db", isolation_level=None)
+    locker.execute("BEGIN EXCLUSIVE")
+    try:
+        p._read_last_assistant("s1")                                # lock: no raise, no hang
+    finally:
+        locker.close()
+    p._hermes_home = None
+    assert p._read_last_assistant("s1") == ""
+
+
+def test_recovery_is_read_only(plugin_module, tmp_path):
+    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "hello", 1)])
+    db = tmp_path / "state.db"
+    before, mtime = db.read_bytes(), db.stat().st_mtime_ns
+    assert p._read_last_assistant("s1") == "hello"
+    assert db.read_bytes() == before and db.stat().st_mtime_ns == mtime
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["state.db"]
+
+
+def test_recovery_reaches_decision_and_writer_once_per_session(plugin_module, tmp_path, monkeypatch):
+    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
+    writer = FakeWriter(questions_reply("Who was the person with?"))
+    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "We met Ana at the cafe.", 1)],
+                   store=FakeStore(default=[item("a")]), jev=jev, writer=writer)
+    calls = []
+    real = p._read_last_assistant
+    monkeypatch.setattr(p, "_read_last_assistant", lambda sid: calls.append(sid) or real(sid))
+    p.prefetch("do you remember who i saw it with?")
+    p.prefetch("and then?")
+    assert calls == ["s1"]
+    assert jev.decisions()[0]["state"]["agent_last"] == "We met Ana at the cafe."
+    assert "We met Ana at the cafe." in writer.prompts[0]
+    assert "The kinds of knowledge needed: any" in writer.prompts[0]
+
+
+def test_recovery_does_not_run_when_an_answer_is_held(plugin_module, tmp_path, monkeypatch):
+    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
+    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "from the db", 1)], jev=jev,
+                   writer=FakeWriter(questions_reply("Q?")), store=FakeStore(default=[item("a")]))
+    _sync(p, "hello", "kept answer", monkeypatch)
+    monkeypatch.setattr(p, "_read_last_assistant", lambda sid: pytest.fail("must not read"))
+    p.prefetch("and that?")
+    assert jev.decisions()[0]["state"]["agent_last"] == "kept answer"
+
+
+def test_recovery_never_fails_the_turn(plugin_module, tmp_path, monkeypatch):
+    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "x", 1)])
+    monkeypatch.setattr(p, "_read_last_assistant", lambda sid: (_ for _ in ()).throw(RuntimeError("boom")))
+    p._recover_last_answer("s1")
+    assert p._last_exchange("s1") == ("", 0)
