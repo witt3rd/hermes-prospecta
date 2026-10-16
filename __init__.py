@@ -136,6 +136,9 @@ def _library_floor_kw() -> Dict[str, Any]:
 # ---- shadow reads (embedding migration) ----
 
 _SHADOW_QUEUE_MAX = 16          # pending shadow jobs; beyond this a job is dropped, loudly
+# the run ends itself at its deadline with the one-line "not consulted" note; this grace keeps the
+# outer wait from cutting it a moment first (the outer wait then still returns "" if the run hangs)
+_DEADLINE_GRACE_S = 0.25
 _SHADOW_DRAIN_TIMEOUT_S = 30.0  # how long shutdown waits for pending shadow jobs
 _SHADOW_STOP = object()
 _SHADOW_DEFAULT_EMBED_MODEL = "openrouter/openai/text-embedding-3-large"
@@ -1128,18 +1131,19 @@ class ProspectaProvider(MemoryProvider):
         flat = self._config.get(f"recall.prefetch.{key}")
         return None if flat in (None, "") else flat
 
-    def _prefetch_number(self, key: str, env_name: str, default: float, *, whole: bool = False) -> float:
+    def _prefetch_number(self, key: str, env_name: str, default: float, *, whole: bool = False,
+                         positive: bool = False) -> float:
         raw = self._prefetch_setting(env_name, key)
         if raw is None or isinstance(raw, bool):
             return default
         try:
             v = float(str(raw).strip())
-            if v < 0 or v != v or (whole and v != int(v)):
+            if v < 0 or v != v or v == float("inf") or (whole and v != int(v)) or (positive and v == 0):
                 raise ValueError(raw)
             return v
         except (TypeError, ValueError):
-            logger.warning("prospecta: recall.prefetch.%s %r is not a %s >= 0; using %s",
-                           key, raw, "whole number" if whole else "number", default)
+            logger.warning("prospecta: recall.prefetch.%s %r is not a %s %s 0; using %s",
+                           key, raw, "whole number" if whole else "number", ">" if positive else ">=", default)
             return default
 
     def _resolve_prefetch_settings(self) -> Any:
@@ -1163,6 +1167,15 @@ class ProspectaProvider(MemoryProvider):
             contract_path=str(contract) if contract else "",
             max_tokens=int(self._prefetch_number("max_tokens", "PROSPECTA_PREFETCH_MAX_TOKENS", 0, whole=True)),
             deadline_s=min(deadline, 7.0) if deadline > 0 else _pc.DEADLINE_S,
+            # each stage is also capped by what is left of the deadline (_Run.budget)
+            decision_timeout_s=self._prefetch_number("decision_timeout_seconds", "PROSPECTA_PREFETCH_DECISION_TIMEOUT",
+                                                     _pc.DECISION_TIMEOUT_S, positive=True),
+            writer_timeout_s=self._prefetch_number("writer_timeout_seconds", "PROSPECTA_PREFETCH_WRITER_TIMEOUT",
+                                                   _pc.WRITER_TIMEOUT_S, positive=True),
+            search_timeout_s=self._prefetch_number("search_timeout_seconds", "PROSPECTA_PREFETCH_SEARCH_TIMEOUT",
+                                                   _pc.SEARCH_TIMEOUT_S, positive=True),
+            rank_timeout_s=self._prefetch_number("rank_timeout_seconds", "PROSPECTA_PREFETCH_RANK_TIMEOUT",
+                                                 _pc.RANK_TIMEOUT_S, positive=True),
             paste_chars=int(self._prefetch_number("paste_chars", "PROSPECTA_PREFETCH_PASTE_CHARS",
                                                   _pc.PASTE_CHARS, whole=True)) or _pc.PASTE_CHARS,
         )
@@ -2297,7 +2310,7 @@ class ProspectaProvider(MemoryProvider):
         try:
             brief = _pc.run_bounded(lambda: _pc.run_contract(
                 query, agent_last=agent_last, turns=turns, deps=deps, settings=cfg, contract=contract,
-                ahead=ahead, started=started), cfg.deadline_s)
+                ahead=ahead, started=started), cfg.deadline_s + _DEADLINE_GRACE_S)
         except TimeoutError:
             logger.warning("prospecta prefetch: no answer within %.1f s; this turn goes without memory",
                            cfg.deadline_s)

@@ -263,6 +263,17 @@ picks up a change with no gateway restart; env wins over config):
 | `max_tokens` | `0` (off) | `PROSPECTA_PREFETCH_MAX_TOKENS` |
 | `deadline_seconds` | `5` | `PROSPECTA_PREFETCH_DEADLINE` |
 | `paste_chars` | `50000` | `PROSPECTA_PREFETCH_PASTE_CHARS` |
+| `decision_timeout_seconds` | `1.0` | `PROSPECTA_PREFETCH_DECISION_TIMEOUT` |
+| `writer_timeout_seconds` | `1.5` | `PROSPECTA_PREFETCH_WRITER_TIMEOUT` |
+| `search_timeout_seconds` | `4.5` | `PROSPECTA_PREFETCH_SEARCH_TIMEOUT` |
+| `rank_timeout_seconds` | `1.0` | `PROSPECTA_PREFETCH_RANK_TIMEOUT` |
+
+The four `*_timeout_seconds` limits are per stage and must be above 0 (a bad
+value logs one warning and the default is used). They are not added up: each
+stage is also capped by what is left of `deadline_seconds`, so the deadline
+always wins. The search default is 4.5 s because a cold search of one question
+(embedding plus the dense, keyword and graph lanes) can take 1.2 to 2.5 s; a
+search that has not answered by its limit gives the "not consulted" line.
 
 Both models are called with the profile's own keys (`OPENROUTER_API_KEY`), and
 see only what the agent sees: the person's line and the agent's last answer.

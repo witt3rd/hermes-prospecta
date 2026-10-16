@@ -694,11 +694,11 @@ def test_the_deadline_is_honoured_and_a_late_answer_is_dropped(plugin_module, ca
     t0 = time.monotonic()
     with caplog.at_level(logging.INFO):
         out = p.prefetch("What did we decide about the Henley branch roof?")
-    assert out == "" and time.monotonic() - t0 < 1.0
-    assert [r.levelno for r in caplog.records] == [logging.WARNING]
-    assert "0.4" in caplog.text and "Henley" not in caplog.text
+    assert out == "(memory was not consulted: the search did not answer in time)"
+    assert time.monotonic() - t0 < 1.0
+    assert "Henley" not in caplog.text and "late note" not in out
     time.sleep(1.4)                                  # the late worker finishes: nothing is injected afterwards
-    assert p._last_brief is None
+    assert p._last_brief.text == out and "late note" not in p._last_brief.text
 
 
 def test_the_default_deadline_is_below_cores_wait(plugin_module):
@@ -816,3 +816,88 @@ def test_the_lanes_union_runs_through_the_provider(plugin_module):
     out = p.prefetch("What did we decide about the Henley branch roof?")
     assert out.index("[source: kw:1") < out.index("[source: note:a")         # keyword-first union
     assert "date: 2026-02-02" in out
+
+
+# ---------------------------------------------------------------------------- the stage limits
+
+STAGE_KEYS = {"decision_timeout_seconds": "decision_timeout_s", "writer_timeout_seconds": "writer_timeout_s",
+              "search_timeout_seconds": "search_timeout_s", "rank_timeout_seconds": "rank_timeout_s"}
+STAGE_ENV = {"decision_timeout_seconds": "PROSPECTA_PREFETCH_DECISION_TIMEOUT",
+             "writer_timeout_seconds": "PROSPECTA_PREFETCH_WRITER_TIMEOUT",
+             "search_timeout_seconds": "PROSPECTA_PREFETCH_SEARCH_TIMEOUT",
+             "rank_timeout_seconds": "PROSPECTA_PREFETCH_RANK_TIMEOUT"}
+
+
+def test_stage_limit_defaults(plugin_module):
+    s = plugin_module.ProspectaProvider()._resolve_prefetch_settings()
+    assert (s.decision_timeout_s, s.writer_timeout_s, s.search_timeout_s, s.rank_timeout_s) == (1.0, 1.5, 4.5, 1.0)
+
+
+@pytest.mark.parametrize("key", list(STAGE_KEYS))
+def test_each_stage_limit_is_overridden_nested_flat_and_env(plugin_module, monkeypatch, key):
+    attr = STAGE_KEYS[key]
+    p = plugin_module.ProspectaProvider()
+    p._config = {"recall": {"prefetch": {key: "3.25"}}}
+    s = p._resolve_prefetch_settings()
+    assert getattr(s, attr) == 3.25
+    assert [getattr(s, a) for a in STAGE_KEYS.values() if a != attr] == [
+        getattr(pc.Settings(), a) for a in STAGE_KEYS.values() if a != attr]
+    p._config = {f"recall.prefetch.{key}": 2}
+    assert getattr(p._resolve_prefetch_settings(), attr) == 2.0
+    monkeypatch.setenv(STAGE_ENV[key], "0.75")
+    assert getattr(p._resolve_prefetch_settings(), attr) == 0.75
+
+
+@pytest.mark.parametrize("key", list(STAGE_KEYS))
+@pytest.mark.parametrize("bad", ["soon", "-1", "0", "nan", "inf"])
+def test_bad_stage_limit_falls_back_with_one_warning(plugin_module, caplog, key, bad):
+    p = plugin_module.ProspectaProvider()
+    p._config = {"recall": {"prefetch": {key: bad}}}
+    with caplog.at_level(logging.WARNING):
+        s = p._resolve_prefetch_settings()
+    assert getattr(s, STAGE_KEYS[key]) == getattr(pc.Settings(), STAGE_KEYS[key])
+    assert [r.levelno for r in caplog.records] == [logging.WARNING] and key in caplog.text
+
+
+def _timed_search(plugin_module, search_s, **cfg):
+    store = FakeStore(default=[item("roof", "the roof note")], delay=search_s)
+    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
+    p = provider(plugin_module, config=CONTRACT_ON, store=store, jev=jev, writer=FakeWriter())
+    p._prefetch_cfg = pc.Settings(mode="contract", **cfg)
+    return p.prefetch("What did we decide about the Henley branch roof?")
+
+
+def test_a_search_of_4s_is_under_the_default_limit_and_returns_a_block(plugin_module):
+    # the defaults of the stages add up to more than the deadline; the search is still given its 4.5 s
+    out = _timed_search(plugin_module, 0.4, search_timeout_s=0.5, deadline_s=1.0)  # scaled: 0.4 < 0.5 limit
+    assert "the roof note" in out and "not consulted" not in out
+    s = pc.Settings()
+    assert s.search_timeout_s == 4.5 and s.deadline_s >= 4.5 + 0.3
+
+
+def test_a_slow_search_still_gets_a_block_through_the_real_defaults(plugin_module):
+    out = _timed_search(plugin_module, 4.0, deadline_s=7.0)
+    assert "the roof note" in out
+
+
+def test_a_search_of_6s_gets_the_not_consulted_line(plugin_module):
+    out = _timed_search(plugin_module, 6.0, deadline_s=7.0)
+    assert out == "(memory was not consulted: the search did not answer in time)"
+
+
+def test_the_deadline_wins_over_the_stage_limits(plugin_module):
+    t0 = time.monotonic()
+    out = _timed_search(plugin_module, 6.0, deadline_s=1.0, search_timeout_s=4.5)
+    assert out == "(memory was not consulted: the search did not answer in time)"
+    assert time.monotonic() - t0 < 1.5
+
+
+def test_the_stage_budget_is_capped_by_what_is_left_of_the_deadline():
+    now = [0.0]
+    deps = pc.Deps(search=lambda q: [], dates=lambda i: {}, clock=lambda: now[0])
+    run = pc._Run(deps, pc.Settings(deadline_s=7.0), pc.load_contract(), started=0.0)
+    assert run.budget(4.5) == 4.5
+    now[0] = 3.0
+    assert run.budget(4.5) == 4.0
+    now[0] = 8.0
+    assert run.budget(4.5) == 0.0
