@@ -40,6 +40,12 @@ Note dates (see README): every new note is saved with its local date
 (``metadata={"created_on": ...}``, ``timezone`` config, default
 America/Los_Angeles) so the library's date filter can find it.
 
+Prefetch (OFF by default; see README, "Prefetch"): with ``prefetch_enabled`` on,
+``recall.prefetch.mode`` picks the old synthesised answer ('off', the default) or the
+written recall contract ('contract', ``prefetch_contract.py``: one typed decision per
+message, questions only when needed, the lanes, one rank call, a labelled block, no
+synthesis, never fails a turn).
+
 Lifecycle hooks: sync_turn (non-blocking daemon thread), on_session_end,
                   shutdown. Prefetch OPT-IN via config (default OFF —
                   spine cost should not be a surprise tax).
@@ -54,6 +60,7 @@ import queue
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone as _utc_tz
 from pathlib import Path
@@ -64,9 +71,11 @@ from agent.memory_provider import MemoryProvider
 try:  # as a package (how hermes loads the plugin) ...
     from . import recall_fusion as _rf
     from . import date_cue_gate as _dcg
+    from . import prefetch_contract as _pc
 except ImportError:  # ... or with the checkout on sys.path (tests, console scripts)
     import recall_fusion as _rf
     import date_cue_gate as _dcg
+    import prefetch_contract as _pc
 
 logger = logging.getLogger(__name__)
 
@@ -836,6 +845,16 @@ class ProspectaProvider(MemoryProvider):
         self._conn_watch: Optional[_ConnectionWatch] = None
         self._date_gate_held = False
         self._keyword: Optional[Any] = None  # _rf.KeywordLeg; None = no keyword leg
+        # recall.prefetch (the written recall contract): settings read per session at initialize;
+        # per-session state kept from sync_turn; the injectable Jev transport and question model
+        self._prefetch_cfg: Optional[Any] = None  # _pc.Settings
+        self._state_lock = threading.Lock()
+        self._exchanges: "OrderedDict[str, tuple]" = OrderedDict()  # session -> (assistant's last answer, turns)
+        self._ahead: Dict[str, Any] = {}  # session -> _pc.AheadEntry
+        self._ahead_running: set = set()  # (session, key) pairs being prepared
+        self._jev_transport: Optional[Any] = None   # tests / hosts: a (request, timeout) -> response callable
+        self._writer_llm: Optional[Any] = None      # tests / hosts: the question model
+        self._last_brief: Optional[Any] = None      # the last contract run's record (no text is logged)
 
     # ---- identity ----
 
@@ -1093,6 +1112,71 @@ class ProspectaProvider(MemoryProvider):
             logger.warning("prospecta: recall.%s %r is not a number >= 0; using %s", key, raw, default)
             return default
 
+    # ---- recall.prefetch (the written recall contract) ----
+
+    def _prefetch_setting(self, env_name: str, key: str) -> Any:
+        """A ``recall.prefetch.*`` option: env (when non-empty) wins; then
+        ``{"recall": {"prefetch": {key: ...}}}``; then the flat ``"recall.prefetch.key"``
+        that ``hermes memory setup`` writes. None when unset."""
+        raw = os.environ.get(env_name)
+        if raw is not None and raw.strip():
+            return raw.strip()
+        nested = self._config.get("recall")
+        nested = nested.get("prefetch") if isinstance(nested, dict) else None
+        if isinstance(nested, dict) and nested.get(key) not in (None, ""):
+            return nested[key]
+        flat = self._config.get(f"recall.prefetch.{key}")
+        return None if flat in (None, "") else flat
+
+    def _prefetch_number(self, key: str, env_name: str, default: float, *, whole: bool = False) -> float:
+        raw = self._prefetch_setting(env_name, key)
+        if raw is None or isinstance(raw, bool):
+            return default
+        try:
+            v = float(str(raw).strip())
+            if v < 0 or v != v or (whole and v != int(v)):
+                raise ValueError(raw)
+            return v
+        except (TypeError, ValueError):
+            logger.warning("prospecta: recall.prefetch.%s %r is not a %s >= 0; using %s",
+                           key, raw, "whole number" if whole else "number", default)
+            return default
+
+    def _resolve_prefetch_settings(self) -> Any:
+        """The ``recall.prefetch.*`` options. Read at initialize (each session), so flipping the
+        mode in prospecta.json or the environment needs no gateway restart."""
+        raw_mode = self._prefetch_setting("PROSPECTA_PREFETCH_MODE", "mode")
+        mode = _pc.DEFAULT_MODE if raw_mode is None else str(raw_mode).strip().lower()
+        if mode not in _pc.MODES:
+            logger.warning("prospecta: recall.prefetch.mode %r is not one of %s; using %r",
+                           raw_mode, list(_pc.MODES), _pc.DEFAULT_MODE)
+            mode = _pc.DEFAULT_MODE
+        decision = self._prefetch_setting("PROSPECTA_PREFETCH_DECISION_MODEL", "decision_model")
+        question = self._prefetch_setting("PROSPECTA_PREFETCH_QUESTION_MODEL", "question_model")
+        contract = self._prefetch_setting("PROSPECTA_PREFETCH_CONTRACT", "contract_path")
+        # below core's own wait (8 s) so a slow turn is ours to end, not core's to time out
+        deadline = self._prefetch_number("deadline_seconds", "PROSPECTA_PREFETCH_DEADLINE", _pc.DEADLINE_S)
+        return _pc.Settings(
+            mode=mode,
+            decision_model=str(decision) if decision else _pc.DEFAULT_DECISION_MODEL,
+            question_model=str(question) if question else _pc.DEFAULT_QUESTION_MODEL,
+            contract_path=str(contract) if contract else "",
+            max_tokens=int(self._prefetch_number("max_tokens", "PROSPECTA_PREFETCH_MAX_TOKENS", 0, whole=True)),
+            deadline_s=min(deadline, 7.0) if deadline > 0 else _pc.DEADLINE_S,
+            paste_chars=int(self._prefetch_number("paste_chars", "PROSPECTA_PREFETCH_PASTE_CHARS",
+                                                  _pc.PASTE_CHARS, whole=True)) or _pc.PASTE_CHARS,
+        )
+
+    def _prefetch_settings(self) -> Any:
+        return self._prefetch_cfg if self._prefetch_cfg is not None else self._resolve_prefetch_settings()
+
+    def _prefetch_enabled(self) -> bool:
+        """The master switch (default OFF): ``prefetch_enabled`` or the PROSPECTA_PREFETCH env."""
+        return (
+            bool(self._config.get("prefetch_enabled"))
+            and str(self._config.get("prefetch_enabled")).lower() not in ("false", "0", "")
+        ) or bool(os.environ.get("PROSPECTA_PREFETCH"))
+
     def _start_keyword(self, bank_id: str) -> None:
         """The keyword leg over the main bank, on the main Memory's own pool.
         Only built when something uses it: the union, or the shadow log's
@@ -1292,6 +1376,32 @@ class ProspectaProvider(MemoryProvider):
                 "key": "recall.keyword_batch_pause_ms",
                 "description": "Pause, in milliseconds, after each database batch while the keyword index is built or extended, so the build never starves the gateway. Default 50. 0 = no pause. PROSPECTA_RECALL_KEYWORD_PAUSE_MS env overrides.",
                 "default": str(int(_rf.DEFAULT_PAUSE_S * 1000)),
+            },
+            {
+                "key": "recall.prefetch.mode",
+                "description": "The pre-turn recall (only when prefetch_enabled is true): 'off' (default: the old prefetch, one model-written answer) or 'contract' (the written recall contract: one decision per message, questions only when needed, a labelled block of the notes that answer, no synthesis). Read when a session starts. PROSPECTA_PREFETCH_MODE env overrides.",
+                "default": _pc.DEFAULT_MODE,
+                "choices": list(_pc.MODES),
+            },
+            {
+                "key": "recall.prefetch.decision_model",
+                "description": "The decision model for the contract prefetch (a typed System One model, called through OpenRouter with the profile's key). Default typesafe/jev-1.14. PROSPECTA_PREFETCH_DECISION_MODEL env overrides.",
+                "default": _pc.DEFAULT_DECISION_MODEL,
+            },
+            {
+                "key": "recall.prefetch.question_model",
+                "description": "The small text model that writes the questions (LiteLLM id, called with the profile's key). Default openrouter/qwen/qwen3.8-flash. PROSPECTA_PREFETCH_QUESTION_MODEL env overrides.",
+                "default": _pc.DEFAULT_QUESTION_MODEL,
+            },
+            {
+                "key": "recall.prefetch.contract_path",
+                "description": "The recall contract file (the Jev questions, the question-writer prompt, the block's words). Default: the bundled contract/recall-contract-v1.md. PROSPECTA_PREFETCH_CONTRACT env overrides.",
+                "default": "",
+            },
+            {
+                "key": "recall.prefetch.max_tokens",
+                "description": "Safety valve on the contract prefetch block: leave out (whole, never cut) the entries that would take it past this many estimated tokens. 0 (default) = off: the block is sized by relevance alone. PROSPECTA_PREFETCH_MAX_TOKENS env overrides.",
+                "default": "0",
             },
             {
                 "key": "shadow_mode",
@@ -1703,6 +1813,7 @@ class ProspectaProvider(MemoryProvider):
             self._date_gate_held = _dcg.install()
             _dcg.set_timeout(self._recall_date_timeout())
 
+        self._prefetch_cfg = self._resolve_prefetch_settings()
         self._start_keyword(bank_id)
         self._start_shadow(bank_id)
         self._start_dual_write(bank_id)
@@ -2059,6 +2170,7 @@ class ProspectaProvider(MemoryProvider):
             return
 
         sid = session_id or self._session_id
+        self._keep_exchange(sid, assistant_content)
         turn_date = self._note_date_metadata()  # the turn's own day, fixed when the turn ends
 
         def _sync() -> None:
@@ -2081,14 +2193,42 @@ class ProspectaProvider(MemoryProvider):
         self._sync_thread = threading.Thread(target=_sync, daemon=True, name="prospecta-sync")
         self._sync_thread.start()
 
+    def _keep_exchange(self, sid: str, assistant_content: Any) -> None:
+        """The agent's last answer of each session (whole) and how many turns it has had: the
+        contract's ``agent_last``. Bounded to the 64 most recent sessions."""
+        try:
+            text = assistant_content if isinstance(assistant_content, str) else str(assistant_content or "")
+            with self._state_lock:
+                turns = self._exchanges.pop(sid, ("", 0))[1] + 1
+                self._exchanges[sid] = (text, turns)
+                while len(self._exchanges) > 64:
+                    self._exchanges.popitem(last=False)
+        except Exception:
+            logger.debug("prospecta: could not keep the last answer", exc_info=True)
+
+    def _last_exchange(self, sid: str) -> "tuple":
+        with self._state_lock:
+            return self._exchanges.get(sid, ("", 0))
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        # OFF by default — opt-in via config or env.
-        enabled = (
-            bool(self._config.get("prefetch_enabled"))
-            and str(self._config.get("prefetch_enabled")).lower() not in ("false", "0", "")
-        ) or bool(os.environ.get("PROSPECTA_PREFETCH"))
-        if not enabled or self._memory is None:
+        # OFF by default: ``prefetch_enabled`` is the master switch. With it on,
+        # ``recall.prefetch.mode`` picks the path: 'off' (default) keeps the old synthesised
+        # answer, 'contract' runs the written recall contract. Neither ever fails a turn.
+        if not self._prefetch_enabled() or self._memory is None:
             return ""
+        try:
+            cfg = self._prefetch_settings()
+            if not cfg.active:
+                return self._prefetch_synth(query)
+            return self._prefetch_contract(query, session_id or self._session_id, cfg)
+        except Exception as e:
+            # one line, no text: the type, and the contract's own message when the contract is the problem
+            logger.warning("prospecta prefetch failed (this turn goes without memory): %s%s",
+                           type(e).__name__, f": {e}" if isinstance(e, _pc.ContractError) else "")
+            return ""
+
+    def _prefetch_synth(self, query: str) -> str:
+        """The old prefetch (``recall.prefetch.mode: off``): the model-written answer."""
         try:
             t0 = time.monotonic()
             result = self._memory.recall_synth(query)
@@ -2108,6 +2248,109 @@ class ProspectaProvider(MemoryProvider):
         except Exception as e:
             logger.warning("prospecta prefetch failed: %s", e)
             return ""
+
+    # ---- recall.prefetch.mode: contract ----
+
+    def _contract_deps(self, cfg: Any) -> Any:
+        transport = self._jev_transport
+        if transport is None:
+            transport = _pc.default_transport()
+        writer = self._writer_llm
+        if writer is None:
+            try:
+                writer = _pc.default_writer_llm(cfg.question_model)
+            except Exception:  # no LiteLLM: the contract's fallback sentence stands in
+                writer = None
+        return _pc.Deps(search=self._contract_lane_search, dates=self._note_dates,
+                        transport=transport, writer_llm=writer)
+
+    def _contract_lane_search(self, question: str) -> List[Any]:
+        """One question through Prospecta's lanes: the dense chunk lane (with the library's own
+        floor when it has one; the date lane runs inside it), the raw keyword lane, fused by
+        ``recall.fusion``. Whole notes, no token budget, no cut."""
+        pool = _rf.BLOCK_POOL
+        store_items = list(self._memory.search(question, mode="hybrid", limit=pool, **_library_floor_kw()))
+        leg = self._keyword
+        kw_status, kw_hits = ("off", [])
+        if leg is not None:
+            kw_status, kw_hits = leg.search(question, pool)
+            if kw_status != "ok":
+                kw_hits = []
+        by_doc = kw_status == "ok" and leg is not None and leg.unit == "document"
+        if self._recall_fusion() == "keyword_first_union" and (kw_hits or by_doc):
+            fused = _rf.keyword_first_union(kw_hits, store_items, slots=pool, by_document=by_doc)
+            if by_doc:
+                fused = _rf.with_document_text(
+                    fused, leg.documents(str(getattr(it, "document_id", "")) for it in fused), 0)
+            return fused
+        return store_items[:pool]
+
+    def _prefetch_contract(self, query: str, sid: str, cfg: Any) -> str:
+        contract = _pc.load_contract(cfg.contract_path or None)
+        started = time.monotonic()
+        agent_last, turns = self._last_exchange(sid)
+        with self._state_lock:
+            ahead = self._ahead.get(sid)
+        if ahead is not None and started - ahead.at > _pc.AHEAD_TTL_S:
+            ahead = None
+        deps = self._contract_deps(cfg)
+        try:
+            brief = _pc.run_bounded(lambda: _pc.run_contract(
+                query, agent_last=agent_last, turns=turns, deps=deps, settings=cfg, contract=contract,
+                ahead=ahead, started=started), cfg.deadline_s)
+        except TimeoutError:
+            logger.warning("prospecta prefetch: no answer within %.1f s; this turn goes without memory",
+                           cfg.deadline_s)
+            return ""
+        self._last_brief = brief
+        if brief.ahead_used:
+            with self._state_lock:
+                self._ahead.pop(sid, None)
+        return brief.text
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Ahead of the next turn (contract mode only): when the agent's own last answer ended on a
+        proposal, prepare the block its go-ahead will need while the person answers. Keyed on that
+        answer (kept from sync_turn), not on ``query`` (the person's text). Runs on its own thread
+        and never raises."""
+        try:
+            if not self._prefetch_enabled() or self._memory is None:
+                return
+            cfg = self._prefetch_settings()
+            if not cfg.active:
+                return
+            sid = session_id or self._session_id
+            agent_last, _ = self._last_exchange(sid)
+            if not agent_last or not _pc.looks_like_proposal(agent_last):
+                return
+            key = _pc.ahead_key(agent_last)
+            with self._state_lock:
+                have = self._ahead.get(sid)
+                if (have is not None and have.key == key) or (sid, key) in self._ahead_running:
+                    return
+                self._ahead_running.add((sid, key))
+            threading.Thread(target=self._prepare_ahead, args=(sid, key, agent_last, cfg),
+                             daemon=True, name="prospecta-ahead").start()
+        except Exception:
+            logger.debug("prospecta queue_prefetch failed", exc_info=True)
+
+    def _prepare_ahead(self, sid: str, key: str, agent_last: str, cfg: Any) -> None:
+        try:
+            contract = _pc.load_contract(cfg.contract_path or None)
+            deps = self._contract_deps(cfg)
+            started = time.monotonic()
+            entry = _pc.run_bounded(lambda: _pc.run_ahead(
+                agent_last, deps=deps, settings=cfg, contract=contract, started=started), cfg.deadline_s)
+            if entry is not None:
+                with self._state_lock:
+                    self._ahead[sid] = entry
+                    while len(self._ahead) > 64:
+                        self._ahead.pop(next(iter(self._ahead)))
+        except Exception:
+            logger.debug("prospecta ahead failed", exc_info=True)
+        finally:
+            with self._state_lock:
+                self._ahead_running.discard((sid, key))
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         t = self._sync_thread

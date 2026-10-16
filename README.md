@@ -170,9 +170,114 @@ synthesis paths) are unchanged.
 
 ## Prefetch
 
-**OFF by default.** Spine cost: two LLM calls per recall (formulate +
-synthesize). Enable via `prefetch_enabled: true` in
-`$HERMES_HOME/prospecta.json` or env `PROSPECTA_PREFETCH=1`.
+**OFF by default.** Enable via `prefetch_enabled: true` in
+`$HERMES_HOME/prospecta.json` or env `PROSPECTA_PREFETCH=1`. That is the master
+switch: with it off nothing below runs. With it on, `recall.prefetch.mode`
+picks the path:
+
+- `off` (the default): the old prefetch, unchanged. Two LLM calls per recall
+  (formulate + synthesize); the injected text is one model-written answer.
+  Kept for rollback.
+- `contract`: the written recall contract, below.
+
+### Prefetch, mode `contract`
+
+One typed decision per chat message, questions written only when needed, the
+plugin's lanes asked, one rank call, a labelled block. No answer is
+synthesised. The design is the recall flow design's Hermes column; the words it
+fixes (the Jev question list, the question-writer prompt, the block's
+sentences) are in a file, not in code (see below).
+
+Per message, before the turn:
+
+1. **Gate (free).** Hermes core already skips a bare "yes", "ok", "do it" and
+   the like. The plugin also skips an empty message, a slash command and a
+   message too large for anything to read (over 1,000,000 characters). A long
+   paste (over `paste_chars`, default 50,000) is not cut and not asked: it is
+   marked as material by its size and goes whole to the question writer.
+2. **Decide.** One call to the decision model (`typesafe/jev-1.14` through
+   OpenRouter's System One door, typed answers, about $0.0001) with the state
+   (the agent's last answer, kept per session from `sync_turn`; the new line;
+   how many turns the session has had) and the contract's eight questions:
+   `line_kind`, `stands_alone`, `needs_memory`, `need_decisions`,
+   `need_library`, `need_conversations`, `need_work`, `need_person`.
+   `social` is always zero questions; `needs_memory` below 0.5 is zero
+   questions (nothing is searched, nothing is written, nothing is injected, and
+   the turn pays one decision call). The `need_*` at 0.5 or above are the
+   sources to ask; none at 0.5 means all. Prospecta banks tell conversations
+   (the turns the plugin retained) from everything else, so `need_conversations`
+   alone keeps only the turns and any other `need_*` alone leaves the turns out.
+   A go-ahead or an answer that still needs something outside the thread
+   (`needs_memory` at 0.5 or above) is asked, from the agent's last answer.
+3. **Questions.** A single standalone question is asked as written. Otherwise
+   Prospecta's own `formulate_queries` runs with the contract's question-writer
+   prompt and the agent's last answer as context, on the small text model
+   (`recall.prefetch.question_model`), and returns 0 to 3 questions.
+4. **Ask.** Each question goes, in parallel, through the plugin's lanes: the
+   dense chunk lane (with the library's floor when it has one), the raw keyword
+   lane and the date lane (the date-cue gate and its timeout apply as for
+   `prospecta_search`), fused by `recall.fusion` (`keyword_first_union`). One
+   Jev rank call scores the best 16 of the union (the request limit of the
+   venue's ranker). Entries scored 2 ("partly answers") or 3 ("holds the
+   answer") go in the block; the rest are counted ("N more matched less
+   well"). If Jev cannot rank, the first five of each question stand and the
+   block says the order is the search's own.
+5. **Block.** A markdown block: the contract's header paragraph, `Asked:`
+   lines, then each entry as `[source: ... | date: ... | rated: ...]` and its
+   whole text. It is sized by relevance: no count cap, no entry is ever cut.
+   `recall.prefetch.max_tokens` (default 0 = off) is a safety valve that leaves
+   out whole entries that would take the block past it. The tool path
+   (`prospecta_search`) keeps its own 1,500-token block. When memory could not
+   be searched the block is one line, `(memory was not consulted: <reason>)`;
+   when the search found nothing that answers, one line says so.
+
+**Never fails a turn.** The whole function is wrapped, and it has a deadline of
+5 s from the call (core waits 8 s; `deadline_seconds`, at most 7). Each stage
+has a fallback: no decision in 1 s (or a refusal, or no key) means a rule
+(three words or fewer: nothing; anything else is asked as written, and the block
+says "Questions formed without the decision model."); no questions in 1.5 s
+(or bad JSON, or no model) means the sentence Jev rates most relevant from the
+agent's last answer, or the line itself, whole (never a paste, never a bare
+reply); a search that fails gives the one "not consulted" line. Past the
+deadline the turn runs without memory and a late answer is dropped.
+
+**Logging.** Nothing is logged per turn. The only line is one warning (no text)
+when a turn goes without memory because of an error or the deadline.
+
+**Ahead.** Core calls `queue_prefetch` after each turn with the person's text.
+In contract mode the plugin ignores that text and, when the agent's own last
+answer ended on a proposal ("Shall I draft it?"), prepares the block its
+go-ahead will need on its own thread, keyed on that answer. The next turn uses
+it, once, if the decision is `answer` or `go_ahead` for the same answer. (A bare
+"yes" never reaches the plugin: core's filter skips it; "ok do it" does.)
+
+**Switches and files** (all read when a session starts, so the next session
+picks up a change with no gateway restart; env wins over config):
+
+| Key (`{"recall": {"prefetch": {...}}}` or flat `recall.prefetch.*`) | Default | Env |
+|---|---|---|
+| `mode` | `off` (`off` or `contract`) | `PROSPECTA_PREFETCH_MODE` |
+| `decision_model` | `typesafe/jev-1.14` | `PROSPECTA_PREFETCH_DECISION_MODEL` |
+| `question_model` | `openrouter/qwen/qwen3.8-flash` (a LiteLLM id) | `PROSPECTA_PREFETCH_QUESTION_MODEL` |
+| `contract_path` | bundled `contract/recall-contract-v1.md` | `PROSPECTA_PREFETCH_CONTRACT` |
+| `max_tokens` | `0` (off) | `PROSPECTA_PREFETCH_MAX_TOKENS` |
+| `deadline_seconds` | `5` | `PROSPECTA_PREFETCH_DEADLINE` |
+| `paste_chars` | `50000` | `PROSPECTA_PREFETCH_PASTE_CHARS` |
+
+Both models are called with the profile's own keys (`OPENROUTER_API_KEY`), and
+see only what the agent sees: the person's line and the agent's last answer.
+
+**The contract file.** `contract/recall-contract-v1.md` holds, word for word
+from the design: the Jev question list (`jev-questions`, JSON), the
+question-writer prompt (`question-writer-prompt`), the block's first paragraph
+(`block-intro`) and the fixed sentences (`lines`: the `Asked:` line, "Nothing in
+it answers this", "N more matched less well", the search-order line, "Questions
+formed without the decision model", the "not consulted" line and the two
+ratings). Swapping the file (`contract_path`) is enough to change any of them;
+the file must keep the section names and the eight question ids. Everything
+else is code: the gate, the 0.5 and 2-of-3 thresholds, the source mapping,
+the parallel asking, the rank pool of 16, the deadline and every fallback, the
+block's `[source | date | rated]` entry label, and the timings.
 
 ## Shadow reads
 
@@ -310,7 +415,7 @@ something else since is left alone.
 
 ## Configuration
 
-`get_config_schema()` exposes twenty-three fields (`hermes memory setup` walks them):
+`get_config_schema()` exposes thirty-seven fields (`hermes memory setup` walks them):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -345,6 +450,11 @@ something else since is left alone.
 | `recall.keyword_unit` | `documents` | what the leg indexes: `documents` (the bank's raw notes, present in every bank) or `chunks` (the old behaviour: chunk items); `PROSPECTA_RECALL_KEYWORD_UNIT` env overrides |
 | `recall.keyword_index_warn_mb` | `0` (off) | log a WARNING when the keyword index's estimated size exceeds this many MB (soft threshold, nothing is turned off); `PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB` env overrides |
 | `recall.keyword_batch_pause_ms` | `50` | pause after each database page while the index is built or extended; `PROSPECTA_RECALL_KEYWORD_PAUSE_MS` env overrides |
+| `recall.prefetch.mode` | `off` | `off` (the old prefetch) or `contract` (the written recall contract), see [Prefetch](#prefetch); `PROSPECTA_PREFETCH_MODE` env overrides |
+| `recall.prefetch.decision_model` | `typesafe/jev-1.14` | the decision model of the contract prefetch; `PROSPECTA_PREFETCH_DECISION_MODEL` env overrides |
+| `recall.prefetch.question_model` | `openrouter/qwen/qwen3.8-flash` | the small text model that writes the questions; `PROSPECTA_PREFETCH_QUESTION_MODEL` env overrides |
+| `recall.prefetch.contract_path` | empty (the bundled file) | the recall contract file; `PROSPECTA_PREFETCH_CONTRACT` env overrides |
+| `recall.prefetch.max_tokens` | `0` (off) | safety valve on the contract block; `PROSPECTA_PREFETCH_MAX_TOKENS` env overrides |
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
 
 Persisted to `$HERMES_HOME/prospecta.json`.
