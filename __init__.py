@@ -852,6 +852,7 @@ class ProspectaProvider(MemoryProvider):
         # per-session state kept from sync_turn; the injectable Jev transport and question model
         self._prefetch_cfg: Optional[Any] = None  # _pc.Settings
         self._state_lock = threading.Lock()
+        self._echoes: "OrderedDict[str, list]" = OrderedDict()  # session -> texts of its last two retained turns
         self._exchanges: "OrderedDict[str, tuple]" = OrderedDict()  # session -> (assistant's last answer, turns)
         self._ahead: Dict[str, Any] = {}  # session -> _pc.AheadEntry
         self._ahead_running: set = set()  # (session, key) pairs being prepared
@@ -1178,6 +1179,8 @@ class ProspectaProvider(MemoryProvider):
                                                  _pc.RANK_TIMEOUT_S, positive=True),
             paste_chars=int(self._prefetch_number("paste_chars", "PROSPECTA_PREFETCH_PASTE_CHARS",
                                                   _pc.PASTE_CHARS, whole=True)) or _pc.PASTE_CHARS,
+            drop_echoes=str(self._prefetch_setting("PROSPECTA_PREFETCH_DROP_ECHOES", "drop_echoes")
+                            ).strip().lower() not in ("false", "0", "no", "off"),
         )
 
     def _prefetch_settings(self) -> Any:
@@ -2183,7 +2186,7 @@ class ProspectaProvider(MemoryProvider):
             return
 
         sid = session_id or self._session_id
-        self._keep_exchange(sid, assistant_content)
+        self._keep_exchange(sid, assistant_content, f"<user>: {user_content}\n\n<assistant>: {assistant_content}")
         turn_date = self._note_date_metadata()  # the turn's own day, fixed when the turn ends
 
         def _sync() -> None:
@@ -2206,7 +2209,7 @@ class ProspectaProvider(MemoryProvider):
         self._sync_thread = threading.Thread(target=_sync, daemon=True, name="prospecta-sync")
         self._sync_thread.start()
 
-    def _keep_exchange(self, sid: str, assistant_content: Any) -> None:
+    def _keep_exchange(self, sid: str, assistant_content: Any, turn_text: str = "") -> None:
         """The agent's last answer of each session (whole) and how many turns it has had: the
         contract's ``agent_last``. Bounded to the 64 most recent sessions."""
         try:
@@ -2216,6 +2219,10 @@ class ProspectaProvider(MemoryProvider):
                 self._exchanges[sid] = (text, turns)
                 while len(self._exchanges) > 64:
                     self._exchanges.popitem(last=False)
+                if turn_text:
+                    self._echoes[sid] = (self._echoes.pop(sid, []) + [turn_text])[-2:]
+                    while len(self._echoes) > 64:
+                        self._echoes.popitem(last=False)
         except Exception:
             logger.debug("prospecta: could not keep the last answer", exc_info=True)
 
@@ -2228,11 +2235,14 @@ class ProspectaProvider(MemoryProvider):
                 if sid in self._exchanges:
                     return
             text = self._read_last_assistant(sid)
+            turns = self._read_last_turns(sid)
             with self._state_lock:
                 if sid not in self._exchanges:
                     self._exchanges[sid] = (text, 0)
                     while len(self._exchanges) > 64:
                         self._exchanges.popitem(last=False)
+                    if turns and sid not in self._echoes:
+                        self._echoes[sid] = turns
         except Exception:
             logger.debug("prospecta: could not recover the last answer", exc_info=True)
 
@@ -2262,6 +2272,48 @@ class ProspectaProvider(MemoryProvider):
                     conn.close()
                 except Exception:
                     pass
+
+    def _read_last_turns(self, sid: str) -> List[str]:
+        """The last two user+assistant pairs of ``sid`` from ``state.db`` (read-only), each as the
+        text sync_turn retains. [] on any error."""
+        if self._hermes_home is None or not sid:
+            return []
+        db = Path(self._hermes_home) / "state.db"
+        if not db.is_file():
+            return []
+        import sqlite3
+        conn = None
+        try:
+            conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=0.2)
+            conn.execute("PRAGMA busy_timeout = 200")
+            rows = conn.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? AND role IN ('user', 'assistant') "
+                "AND content IS NOT NULL AND content != '' ORDER BY timestamp DESC, id DESC LIMIT 40",
+                (sid,)).fetchall()
+            rows.reverse()
+            pairs: List[str] = []
+            user = None
+            for role, content in rows:
+                if not isinstance(content, str):
+                    continue
+                if role == "user":
+                    user = content
+                elif user is not None:
+                    pairs.append(f"<user>: {user}\n\n<assistant>: {content}")
+                    user = None
+            return pairs[-2:]
+        except Exception:
+            return []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _echo_texts(self, sid: str) -> List[str]:
+        with self._state_lock:
+            return list(self._echoes.get(sid, []))
 
     def _last_exchange(self, sid: str) -> "tuple":
         with self._state_lock:
@@ -2355,7 +2407,8 @@ class ProspectaProvider(MemoryProvider):
         try:
             brief = _pc.run_bounded(lambda: _pc.run_contract(
                 query, agent_last=agent_last, turns=turns, deps=deps, settings=cfg, contract=contract,
-                ahead=ahead, started=started), cfg.deadline_s + _DEADLINE_GRACE_S)
+                ahead=ahead, started=started, session_id=sid,
+                echoes=self._echo_texts(sid) if cfg.drop_echoes else ()), cfg.deadline_s + _DEADLINE_GRACE_S)
         except TimeoutError:
             logger.warning("prospecta prefetch: no answer within %.1f s; this turn goes without memory",
                            cfg.deadline_s)

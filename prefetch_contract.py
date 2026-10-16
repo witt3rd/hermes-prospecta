@@ -175,6 +175,7 @@ class Settings:
     search_timeout_s: float = SEARCH_TIMEOUT_S
     rank_timeout_s: float = RANK_TIMEOUT_S
     paste_chars: int = PASTE_CHARS
+    drop_echoes: bool = True            # leave out the records that are the thread's own last turns
 
     @property
     def active(self) -> bool:
@@ -523,6 +524,10 @@ def allowed(item: Any, sources: Sequence[str]) -> bool:
     return wants_turns if is_turn else wants_notes
 
 
+def _norm(text: Any) -> str:
+    return " ".join(str(text or "").split())
+
+
 def _entry(item: Any, dates: Dict[int, str]) -> Entry:
     text = getattr(item, "original_chunk", None) or getattr(item, "content", "") or ""
     doc = str(getattr(item, "document_id", "") or "")
@@ -622,6 +627,20 @@ class _Run:
         self.deps, self.s, self.c = deps, settings, contract
         self.deadline = started + settings.deadline_s
         self.brief = Brief()
+        self.session_id = ""
+        self.echoes: Tuple[str, ...] = ()
+
+    def is_echo(self, e: "Entry") -> bool:
+        """A retained turn of the current session whose text is, or holds, one of the texts the
+        agent already has in view (its last answer, its last two turns). Never raises."""
+        try:
+            if not self.echoes or not self.session_id or not e.source.startswith(
+                    f"{_TURN_SOURCE_PREFIX}{self.session_id}:"):
+                return False
+            text = _norm(e.text)
+            return any(k in text for k in self.echoes)
+        except Exception:
+            return False
 
     def left(self) -> float:
         return self.deadline - self.deps.clock()
@@ -704,7 +723,8 @@ class _Run:
                     dates = self.deps.dates(items) if items else {}
                 except Exception:
                     dates = {}
-                lists.append([_entry(it, dates) for it in items])
+                entries = [_entry(it, dates) for it in items]
+                lists.append([e for e in entries if not self.is_echo(e)])
             else:
                 errors.append(type(f.exception()).__name__ if f in done else "timeout")
         return lists, errors
@@ -756,10 +776,14 @@ class _Run:
 
 def run_contract(line: str, *, agent_last: str, turns: int, deps: Deps, settings: Settings,
                  contract: Contract, thread: str = "", ahead: Optional[AheadEntry] = None,
-                 started: Optional[float] = None) -> Brief:
+                 started: Optional[float] = None, session_id: str = "",
+                 echoes: Sequence[str] = ()) -> Brief:
     """One turn: gate, decide, questions, ask, rank, block. Never raises for a stage failing; the
     caller still wraps it (``prefetch``)."""
     run = _Run(deps, settings, contract, deps.clock() if started is None else started)
+    if settings.drop_echoes:
+        run.session_id = session_id or ""
+        run.echoes = tuple(k for k in (_norm(x) for x in [*echoes, agent_last]) if k)
     b = run.brief
     verdict, line = gate(line)
     if verdict == "skip":

@@ -1033,3 +1033,120 @@ def test_recovery_never_fails_the_turn(plugin_module, tmp_path, monkeypatch):
     monkeypatch.setattr(p, "_read_last_assistant", lambda sid: (_ for _ in ()).throw(RuntimeError("boom")))
     p._recover_last_answer("s1")
     assert p._last_exchange("s1") == ("", 0)
+
+
+# ---------------------------------------------------------------------------- no echoes of the thread's own last turns
+
+def _turn(sid, millis, user, assistant):
+    return item(f"t{millis}", f"<user>: {user}\n\n<assistant>: {assistant}", source=f"turn:{sid}:{millis}")
+
+
+def _echo_provider(plugin_module, monkeypatch, entries, config=None, turns=3, **kw):
+    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
+    cfg = config if config is not None else CONTRACT_ON
+    p = provider(plugin_module, config=cfg, store=FakeStore(default=entries), jev=jev,
+                 writer=FakeWriter(questions_reply("What about the roof?")), **kw)
+    for i in range(1, turns + 1):
+        _sync(p, f"user line {i}", f"assistant reply {i}", monkeypatch)
+    return p, jev
+
+
+def _all_turns():
+    return [_turn("s1", i, f"user line {i}", f"assistant reply {i}") for i in (1, 2, 3)]
+
+
+def test_the_last_two_turns_and_the_last_answer_are_dropped_older_turn_kept(plugin_module, monkeypatch):
+    entries = _all_turns() + [item("roof", "The roof is to be replaced in June.")]
+    p, jev = _echo_provider(plugin_module, monkeypatch, entries)
+    out = p.prefetch("and the roof?")
+    assert "user line 1" in out                                    # long session: an older turn stays
+    assert "user line 2" not in out and "user line 3" not in out
+    assert "The roof is to be replaced" in out
+    assert len(jev.rankings()[0]["questions"]) == 2             # dropped ones never reach the pool
+
+
+def test_the_agents_last_answer_alone_drops_a_record_that_holds_it(plugin_module, monkeypatch):
+    held = _turn("s1", 9, "something", "assistant reply 3 and more")
+    p, jev = _echo_provider(plugin_module, monkeypatch, [held, item("roof", "The roof is fine.")])
+    p._echoes.clear()
+    out = p.prefetch("and the roof?")
+    assert "something" not in out and "The roof is fine." in out
+
+
+def test_whitespace_is_normalised_before_the_compare(plugin_module, monkeypatch):
+    spaced = _turn("s1", 9, "user   line\n3", "assistant  reply 3")
+    p, _ = _echo_provider(plugin_module, monkeypatch, [spaced, item("roof", "The roof is fine.")])
+    assert "user   line" not in p.prefetch("and the roof?")
+
+
+def test_other_sessions_and_notes_with_identical_text_are_kept(plugin_module, monkeypatch):
+    text = "<user>: user line 3\n\n<assistant>: assistant reply 3"
+    entries = [item("other", text, source="turn:s2:5"), item("note", text, source="note:x")]
+    p, jev = _echo_provider(plugin_module, monkeypatch, entries)
+    out = p.prefetch("and the roof?")
+    assert len(jev.rankings()[0]["questions"]) == 2 and out.count("user line 3") == 2
+
+
+def test_the_freed_pool_slot_goes_to_the_next_record_and_more_excludes_dropped(plugin_module, monkeypatch):
+    echo = _turn("s1", 3, "user line 3", "assistant reply 3")
+    others = [item(f"n{i}") for i in range(pc.RANK_POOL + 3)]
+    p, jev = _echo_provider(plugin_module, monkeypatch, [echo] + others)
+    out = p.prefetch("and the roof?")
+    assert len(jev.rankings()[0]["questions"]) == pc.RANK_POOL
+    assert "stored text of n%d" % (pc.RANK_POOL - 1) in out    # the slot the echo would have held
+    assert "user line 3" not in out and out.endswith("3 more matched less well.")
+
+
+def test_drop_echoes_off_keeps_todays_behaviour(plugin_module, monkeypatch):
+    cfg = {"prefetch_enabled": "true", "recall": {"prefetch": {"mode": "contract", "drop_echoes": False}}}
+    p, _ = _echo_provider(plugin_module, monkeypatch, _all_turns(), config=cfg)
+    out = p.prefetch("and the roof?")
+    assert "user line 2" in out and "user line 3" in out
+
+
+def test_drop_echoes_env_off_and_default_on(plugin_module, monkeypatch):
+    assert provider(plugin_module)._prefetch_cfg.drop_echoes is True
+    monkeypatch.setenv("PROSPECTA_PREFETCH_DROP_ECHOES", "false")
+    assert provider(plugin_module)._prefetch_cfg.drop_echoes is False
+    monkeypatch.setenv("PROSPECTA_PREFETCH_DROP_ECHOES", "true")
+    assert provider(plugin_module)._prefetch_cfg.drop_echoes is True
+
+
+def test_sync_turn_keeps_only_the_last_two_whole_turns(plugin_module, monkeypatch):
+    p, _ = _echo_provider(plugin_module, monkeypatch, [], turns=3)
+    assert p._echo_texts("s1") == ["<user>: user line 2\n\n<assistant>: assistant reply 2",
+                                   "<user>: user line 3\n\n<assistant>: assistant reply 3"]
+
+
+def _pairs_db(tmp_path):
+    _state_db(tmp_path / "state.db", [
+        ("s1", "user", "u1", 1), ("s1", "assistant", "a1", 2), ("s1", "user", "u2", 3),
+        ("s1", "assistant", "", 4), ("s1", "assistant", "a2", 5), ("s1", "user", "u3", 6),
+        ("s1", "tool", "t", 7), ("s1", "assistant", "a3", 8), ("s2", "user", "x", 9), ("s2", "assistant", "y", 10)])
+
+
+def test_recovery_reads_the_last_two_pairs_read_only_and_drops_the_echo(plugin_module, tmp_path):
+    _pairs_db(tmp_path)
+    db = tmp_path / "state.db"
+    before, mtime = db.read_bytes(), db.stat().st_mtime_ns
+    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
+    entries = [_turn("s1", 1, "u1", "a1"), _turn("s1", 2, "u2", "a2"), _turn("s1", 3, "u3", "a3")]
+    p = _restarted(plugin_module, tmp_path, store=FakeStore(default=entries), jev=jev,
+                   writer=FakeWriter(questions_reply("What about the roof?")))
+    assert p._read_last_turns("s1") == ["<user>: u2\n\n<assistant>: a2", "<user>: u3\n\n<assistant>: a3"]
+    out = p.prefetch("and the roof?")
+    assert "u1" in out and "u2" not in out and "u3" not in out
+    assert db.read_bytes() == before and db.stat().st_mtime_ns == mtime
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["state.db"]
+
+
+def test_turn_recovery_is_silent_on_errors(plugin_module, tmp_path):
+    import sqlite3
+    p = _restarted(plugin_module, tmp_path)
+    assert p._read_last_turns("s1") == []                           # no file
+    sqlite3.connect(tmp_path / "state.db").close()
+    assert p._read_last_turns("s1") == []                           # no table
+    (tmp_path / "state.db").write_bytes(b"not a database" * 100)
+    assert p._read_last_turns("s1") == []                           # garbage
+    p._hermes_home = None
+    assert p._read_last_turns("s1") == []
