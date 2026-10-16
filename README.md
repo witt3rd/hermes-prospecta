@@ -258,6 +258,8 @@ go-ahead will need on its own thread, keyed on that answer. The next turn uses
 it, once, if the decision is `answer` or `go_ahead` for the same answer. (A bare
 "yes" never reaches the plugin: core's filter skips it; "ok do it" does.)
 
+**No echoes.** The brief never hands the agent back what it already has in view: records of the current session's own retained turns (`turn:<session>:...`) whose text is, or holds, the agent's last answer or one of its last two turns are dropped before ranking (older turns of the same session, other sessions and notes stay). `recall.prefetch.drop_echoes` (default `true`) turns it off.
+
 **Switches and files** (all read when a session starts, so the next session
 picks up a change with no gateway restart; env wins over config):
 
@@ -270,6 +272,7 @@ picks up a change with no gateway restart; env wins over config):
 | `max_tokens` | `0` (off) | `PROSPECTA_PREFETCH_MAX_TOKENS` |
 | `deadline_seconds` | `5` | `PROSPECTA_PREFETCH_DEADLINE` |
 | `paste_chars` | `50000` | `PROSPECTA_PREFETCH_PASTE_CHARS` |
+| `drop_echoes` | `true` | `PROSPECTA_PREFETCH_DROP_ECHOES` |
 | `decision_timeout_seconds` | `1.0` | `PROSPECTA_PREFETCH_DECISION_TIMEOUT` |
 | `writer_timeout_seconds` | `1.5` | `PROSPECTA_PREFETCH_WRITER_TIMEOUT` |
 | `search_timeout_seconds` | `4.5` | `PROSPECTA_PREFETCH_SEARCH_TIMEOUT` |
