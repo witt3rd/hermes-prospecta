@@ -79,6 +79,7 @@ NEED_SOURCES = {
 ALL_SOURCES = tuple(NEED_SOURCES.values())
 LINE_KINDS = ("answer", "go_ahead", "follow_up", "new_ask", "material", "social")
 _TURN_SOURCE_PREFIX = "turn:"
+ECHO_MIN_ANSWER_CHARS = 60
 
 
 class ContractError(Exception):
@@ -783,7 +784,10 @@ def run_contract(line: str, *, agent_last: str, turns: int, deps: Deps, settings
     run = _Run(deps, settings, contract, deps.clock() if started is None else started)
     if settings.drop_echoes:
         run.session_id = session_id or ""
-        run.echoes = tuple(k for k in (_norm(x) for x in [*echoes, agent_last]) if k)
+        # a short last answer ("Done.") would match any older turn that holds those words: below
+        # ECHO_MIN_ANSWER_CHARS only the two whole turns count
+        last = _norm(agent_last)
+        run.echoes = tuple(k for k in [*(_norm(x) for x in echoes), last if len(last) >= ECHO_MIN_ANSWER_CHARS else ""] if k)
     b = run.brief
     verdict, line = gate(line)
     if verdict == "skip":

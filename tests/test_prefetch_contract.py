@@ -1066,8 +1066,10 @@ def test_the_last_two_turns_and_the_last_answer_are_dropped_older_turn_kept(plug
 
 
 def test_the_agents_last_answer_alone_drops_a_record_that_holds_it(plugin_module, monkeypatch):
-    held = _turn("s1", 9, "something", "assistant reply 3 and more")
-    p, jev = _echo_provider(plugin_module, monkeypatch, [held, item("roof", "The roof is fine.")])
+    long = "This is a long last answer of the agent that is over sixty characters."
+    held = _turn("s1", 9, "something", long + " and more")
+    p, jev = _echo_provider(plugin_module, monkeypatch, [held, item("roof", "The roof is fine.")], turns=0)
+    _sync(p, "q", long, monkeypatch)
     p._echoes.clear()
     out = p.prefetch("and the roof?")
     assert "something" not in out and "The roof is fine." in out
@@ -1150,3 +1152,19 @@ def test_turn_recovery_is_silent_on_errors(plugin_module, tmp_path):
     assert p._read_last_turns("s1") == []                           # garbage
     p._hermes_home = None
     assert p._read_last_turns("s1") == []
+
+
+def test_a_short_last_answer_never_drops_an_older_turn_that_holds_it(plugin_module, monkeypatch):
+    old = _turn("s1", 1, "was it finished?", "Done. Everything is in place.")
+    p, _ = _echo_provider(plugin_module, monkeypatch, [old, item("roof", "The roof is fine.")], turns=0)
+    _sync(p, "finish it", "Done.", monkeypatch)
+    out = p.prefetch("and the roof?")
+    assert "Everything is in place." in out
+
+
+def test_a_short_last_answer_still_drops_the_echo_through_the_two_turns(plugin_module, monkeypatch):
+    echo = _turn("s1", 2, "finish it", "Done.")
+    p, _ = _echo_provider(plugin_module, monkeypatch, [echo, item("roof", "The roof is fine.")], turns=0)
+    _sync(p, "finish it", "Done.", monkeypatch)
+    out = p.prefetch("and the roof?")
+    assert "finish it" not in out and "The roof is fine." in out
