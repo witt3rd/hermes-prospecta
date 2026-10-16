@@ -212,7 +212,14 @@ Per message, before the turn:
 3. **Questions.** A single standalone question is asked as written. Otherwise
    Prospecta's own `formulate_queries` runs with the contract's question-writer
    prompt and the agent's last answer as context, on the small text model
-   (`recall.prefetch.question_model`), and returns 0 to 3 questions.
+   (`recall.prefetch.question_model`), and returns 0 to 3 questions. The writer
+   is told the kinds of knowledge only when some `need_*` reached 0.5 (it gets
+   those); otherwise it gets "any" (the search still uses all sources). The
+   agent's last answer is the only earlier turn it sees; at a session's first
+   turn with none kept (after a restart or with a new session id) it is read
+   once, whole, from the latest assistant message in `state.db` of
+   `HERMES_HOME` through a separate read-only connection (silently none on any
+   error).
 4. **Ask.** Each question goes, in parallel, through the plugin's lanes: the
    dense chunk lane (with the library's floor when it has one), the raw keyword
    lane and the date lane (the date-cue gate and its timeout apply as for
