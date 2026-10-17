@@ -20,7 +20,6 @@ Tool surface (visible to the agent):
   - prospecta_retain(content, source=..., index_text=None, tags=None)
   - prospecta_recall(query, limit=10) -> synthesis + cited sources
   - prospecta_search(query, mode="hybrid", limit=10, date_from=, date_to=) -> cited chunks
-  - prospecta_recall_set(query, entity, aliases=None) -> complete cited list (map-reduce)
   (recall/search take an optional depth: standard | deep)
 
 Shadow reads (OFF by default; see README): with ``shadow_bank_id`` set, every
@@ -34,7 +33,7 @@ Recall (see README, "Recall: Stage 1 + Stage 2, cited"): ``prospecta_search`` an
 and ``cross_encoder`` rerank), and every hit carries its citation fields.
 
 Linked / dual writes (OFF by default; see README): ``linked_writes`` builds the
-library's linker for the main Memory; ``dual_write_bank_id`` also retains every
+library CLI's stages for the main Memory and writes chunk children; ``dual_write_bank_id`` also retains every
 note into a second bank on a background thread, with a JSONL retry file.
 
 Note dates (see README): the library stamps every new note's date
@@ -767,7 +766,7 @@ class _ShadowReader(_BackgroundWorker):
 class _DualWriter(_BackgroundWorker):
     """Writes each note the main bank accepted into a second bank, off-path.
 
-    One ``Memory`` for the second bank (its own embedder, linker on, chunk
+    One ``Memory`` for the second bank (its own embedder, chunk
     children on), one daemon thread, the same bounded queue as the shadow
     reader. A note whose content hash is already in the second bank is skipped,
     so the catch-up copy and the dual write cannot duplicate. A failed (or
@@ -1309,12 +1308,12 @@ class ProspectaProvider(MemoryProvider):
             },
             {
                 "key": "linked_writes",
-                "description": "New notes get entities and links like the migrated bank (the library's linker, plus chunk children). Needs OPENROUTER_API_KEY. Default off. PROSPECTA_LINKED_WRITES env overrides.",
+                "description": "New notes get chunk children and the library CLI's stages (synth, rerank, Jev). Needs OPENROUTER_API_KEY. Default off. PROSPECTA_LINKED_WRITES env overrides.",
                 "default": "false",
             },
             {
                 "key": "dual_write_bank_id",
-                "description": "Second bank that every note is also written to (own embedder, linker on), in the background. Must already exist. Empty = OFF (default). PROSPECTA_DUAL_WRITE_BANK env overrides (empty forces off).",
+                "description": "Second bank that every note is also written to (own embedder), in the background. Must already exist. Empty = OFF (default). PROSPECTA_DUAL_WRITE_BANK env overrides (empty forces off).",
                 "default": "",
             },
             {
@@ -1530,16 +1529,15 @@ class ProspectaProvider(MemoryProvider):
             logger.exception("Prospecta shadow reads could not start; shadow is OFF")
 
     def _stage_kwargs(self) -> Dict[str, Any]:
-        """The library CLI's linker/jev/rerank/synth stages (built when
-        OPENROUTER_API_KEY is set). Any problem yields none, loudly."""
+        """The library CLI's jev/rerank/synth stages (built when
+        OPENROUTER_API_KEY is set; the library builds no linker any more, so a
+        PROSPECTA_LINKER value is ignored). Any problem yields none, loudly."""
         try:
             from prospecta.cli._common import _stage_kwargs
             kw = _stage_kwargs()
         except Exception:
-            logger.exception("prospecta could not build the linker stages; none will be used")
+            logger.exception("prospecta could not build the library stages; none will be used")
             return {}
-        if "linker" not in kw:
-            logger.warning("prospecta: no linker built (OPENROUTER_API_KEY unset or PROSPECTA_LINKER=off)")
         return kw
 
     def _recall_stage_kwargs(self) -> Dict[str, Any]:
@@ -1972,25 +1970,6 @@ class ProspectaProvider(MemoryProvider):
                 },
             },
             {
-                "name": "prospecta_recall_set",
-                "description": (
-                    "Complete answer to a SET or discovery question about one person or "
-                    "entity ('what are X's nicknames', 'every project Y mentioned'): reads "
-                    "every note tied to the entity and returns a deduplicated cited list. "
-                    "Slower and costlier than prospecta_recall; use it when completeness "
-                    "matters more than speed."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "The set question."},
-                        "entity": {"type": "string", "description": "The person or entity the set is about."},
-                        "aliases": {"type": "array", "items": {"type": "string"}, "description": "Other names for the entity."},
-                    },
-                    "required": ["query", "entity"],
-                },
-            },
-            {
                 "name": "prospecta_search",
                 "description": (
                     "Hybrid retrieval from prospecta memory without LLM synthesis: semantic, "
@@ -2083,23 +2062,6 @@ class ProspectaProvider(MemoryProvider):
                 return json.dumps({
                     "synthesis": result.synthesis or "",
                     "sources": sources,
-                })
-
-            if tool_name == "prospecta_recall_set":
-                query = args.get("query", "")
-                entity = args.get("entity", "")
-                if not query or not entity:
-                    return json.dumps({"error": "query and entity are required"})
-                if self._llm is None:
-                    return json.dumps({"error": "prospecta_recall_set requires an LLM. Set PROSPECTA_LLM_MODEL env or llm_model in prospecta.json and ensure 'prospecta[defaults]' is installed."})
-                kw = {"entity": entity}
-                if args.get("aliases"):
-                    kw["aliases"] = list(args["aliases"])
-                result = self._memory.recall_mapreduce(query, **kw)
-                return json.dumps({
-                    "synthesis": result.synthesis or "",
-                    "citations": [c if isinstance(c, (str, int, float, dict, list)) else str(c)
-                                  for c in (getattr(result, "citations", None) or [])],
                 })
 
             if tool_name == "prospecta_search":

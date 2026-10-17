@@ -11,15 +11,16 @@ license = { text = "MIT" }
 authors = [{ name = "Forge ⚒️", email = "forge@witt3rd.com" }]
 requires-python = ">=3.11"
 dependencies = [
-    # Pinned to main@67c0706: the hybrid search and RAG library with Mode 1 automatic recall by query
+    # Pinned to main@4e2962d: the hybrid search and RAG library with Mode 1 automatic recall by query
     # expansion (Memory.expand_and_recall), which the contract prefetch calls. This pin carries
     # new-bank defaults (witt3rd/prospecta PR 86), the terms filter and meaning near-copy merge
-    # (PR 87), and the docs overhaul (PR 88). The pin before it was 736bd28. Bump to a later
-    # commit only with a test run against it. The live bank DB migrates on
+    # (PR 87), the docs overhaul (PR 88) and the removal of the retired recall code: linker,
+    # map-reduce, graph and keyword channels (PR 89). The pin before it was 67c0706. Bump to a
+    # later commit only with a test run against it. The live bank DB migrates on
     # initialize (run_migrations).
     # [defaults] = LiteLLM (LLM + default embedder); [embed-sentence-transformers]
     # is declared here, not optional, so a venv rebuild cannot drop the local embedder.
-    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@67c0706ae20ff638bc0d7d37de270a2743951e2d",
+    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@4e2962d7875a3481da92e870ff2386c84b611a20",
     "psycopg[binary]>=3.1",
 ]
 

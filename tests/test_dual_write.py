@@ -251,11 +251,11 @@ def test_linked_writes_asks_for_chunk_children(plugin_module, tmp_path):
 
 def test_stage_kwargs_come_from_the_library_cli(plugin_module, monkeypatch):
     import prospecta.cli._common as common
-    monkeypatch.setattr(common, "_stage_kwargs", lambda: {"linker": "L", "jev": "J"})
-    assert plugin_module.ProspectaProvider()._stage_kwargs() == {"linker": "L", "jev": "J"}
+    monkeypatch.setattr(common, "_stage_kwargs", lambda: {"synth_llm": "S", "jev": "J"})
+    assert plugin_module.ProspectaProvider()._stage_kwargs() == {"synth_llm": "S", "jev": "J"}
 
 
-def test_linker_build_failure_is_logged_and_never_raised(plugin_module, monkeypatch, caplog):
+def test_stage_build_failure_is_logged_and_never_raised(plugin_module, monkeypatch, caplog):
     import prospecta.cli._common as common
     monkeypatch.setattr(common, "_stage_kwargs", lambda: (_ for _ in ()).throw(RuntimeError("no litellm")))
     assert plugin_module.ProspectaProvider()._stage_kwargs() == {}
@@ -272,13 +272,6 @@ def test_failing_main_write_neither_raises_nor_queues(plugin_module, tmp_path, c
 
 
 # ---- real Postgres ----
-
-class _FailingLinker:
-    asynchronous = True
-
-    def link_document(self, conn, bank_id, document_id, calls=None):
-        raise RuntimeError("linker exploded")
-
 
 def _real_provider(plugin_module, pg_url, hermes_home, monkeypatch, cfg):
     from prospecta.db.migrate import run_migrations
@@ -324,14 +317,18 @@ def test_real_banks_dual_write_with_chunks_and_is_idempotent(
     assert _count(pg_url, SECOND, "chunk") == _count(pg_url, "live", "chunk")
 
 
-def test_real_linker_failure_never_fails_the_turn(plugin_module, pg_url, hermes_home, monkeypatch, caplog):
+def test_real_live_profile_values_load_cleanly(plugin_module, pg_url, hermes_home, monkeypatch, caplog):
+    """The live profiles carry linked_writes true, PROSPECTA_LINKER=off, PROSPECTA_JEV=off."""
     p = _real_provider(plugin_module, pg_url, hermes_home, monkeypatch, {"linked_writes": True})
-    monkeypatch.setattr(p, "_stage_kwargs", lambda: {"linker": _FailingLinker()})
+    monkeypatch.setenv("PROSPECTA_LINKER", "off")
+    monkeypatch.setenv("PROSPECTA_JEV", "off")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
     p.initialize("s", hermes_home=str(hermes_home))
     out = json.loads(p.handle_tool_call("prospecta_retain", {"content": "a note", "source": "n"}))
     p.shutdown()
-    assert "document_id" in out and "linker exploded" in caplog.text
-    assert _count(pg_url, "live")[0] == 1
+    assert "document_id" in out and "error" not in out
+    assert _count(pg_url, "live")[0] == 1 and _count(pg_url, "live", "chunk")[1] >= 1
+    assert "linker" not in caplog.text and "Traceback" not in caplog.text
 
 
 def test_real_missing_dual_bank_leaves_it_off(plugin_module, pg_url, hermes_home, monkeypatch, caplog):

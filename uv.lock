@@ -697,7 +697,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "prospecta", extras = ["defaults", "embed-sentence-transformers"], git = "https://github.com/witt3rd/prospecta.git?rev=67c0706ae20ff638bc0d7d37de270a2743951e2d" },
+    { name = "prospecta", extras = ["defaults", "embed-sentence-transformers"], git = "https://github.com/witt3rd/prospecta.git?rev=4e2962d7875a3481da92e870ff2386c84b611a20" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'test'", specifier = ">=3.1" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7" },
@@ -1745,7 +1745,7 @@ wheels = [
 [[package]]
 name = "prospecta"
 version = "0.1.0.dev0"
-source = { git = "https://github.com/witt3rd/prospecta.git?rev=67c0706ae20ff638bc0d7d37de270a2743951e2d#67c0706ae20ff638bc0d7d37de270a2743951e2d" }
+source = { git = "https://github.com/witt3rd/prospecta.git?rev=4e2962d7875a3481da92e870ff2386c84b611a20#4e2962d7875a3481da92e870ff2386c84b611a20" }
 dependencies = [
     { name = "jinja2" },
     { name = "litellm" },
