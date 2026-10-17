@@ -1,5 +1,6 @@
-"""The explicit tools on the library's hybrid search: ``prospecta_search`` and ``prospecta_recall`` return
-cited hits (source, date, kind, how it matched, relevance, the matched words in context, the whole chunk).
+"""The explicit tools on the library's hybrid search: ``prospecta_search`` returns cited hits (source, date,
+kind, how it matched, relevance, the matched words in context, the whole chunk) and ``prospecta_recall`` the
+library's ``Memory.ask`` (Stage 1 + Stage 2, a grounded answer with [n] citations and the cited sources).
 
 Offline (a fake Memory, invented text) except the last tests, which use the Postgres test container with
 the stub embedder, the real library (Stage 1 ``hybrid_chunk`` + Stage 2 ``cross_encoder`` over a fake
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 import psycopg
 import pytest
 
-from tests.conftest import CountingLLM, FakeRerank
+from tests.conftest import CountingLLM, FakeRerank, check_call
 
 CITED = {"n", "source", "document_id", "created_on", "kind", "match_kind", "relevance_score", "exact_snippet", "text"}
 
@@ -34,30 +35,30 @@ def hit(name, text=None, *, day="2026-03-02", kind="note", match="semantic", sni
 
 
 class FakeMemory:
-    def __init__(self, items=(), ranked=True, lexical=0):
-        self.items, self.ranked, self.lexical = list(items), ranked, lexical
+    """Stands in for a Memory. Every call is checked against the real library's signature (``check_call``),
+    so an argument the library removed (``mode``) or a method it no longer has (``recall_synth``) fails here."""
+
+    def __init__(self, items=(), ranked=True, gate=None):
+        self.items, self.ranked, self.gate = list(items), ranked, gate
         self.calls, self.asked = [], []
 
     def search(self, q, **kw):
+        check_call("search", q, **kw)
         self.calls.append((q, kw))
-        if kw.get("mode") == "lexical":
-            return [object()] * self.lexical
         if kw.get("_trace") is not None:
             kw["_trace"].append({"rerank": {"fallback_reason": None} if self.ranked else None})
         return list(self.items[: kw.get("limit", 10)])
 
-    def recall_synth(self, q, **kw):
-        self.calls.append((q, {"synth": True, **kw}))
-        return SimpleNamespace(synthesis="The roof is to be replaced.", sources=self.items,
-                               queries=[SimpleNamespace(text=q)])
-
     def ask(self, q, **kw):
+        check_call("ask", q, **kw)
         self.asked.append((q, kw))
+        gated = bool(kw.get("sufficiency"))
         return SimpleNamespace(
             answer="The roof is to be replaced in June [1].", rendered="The roof is to be replaced in June [1].\n\nSources:\n[1] ...",
             citations=[{"n": 1, "known": True, "source": "note:roof", "created_on": "2026-03-02", "snippet": "s",
-                        "exact_snippet": None}], items=self.items, sufficient=True, retried=False,
-            gate={"score": 0.9, "threshold": 0.7, "model": "typesafe/jev-1.14"})
+                        "exact_snippet": "the <<roof>> is replaced"}], items=self.items,
+            sufficient=True if gated else None, retried=False,
+            gate={"score": 0.9, "threshold": 0.7, "model": "typesafe/jev-1.14"} if gated else None)
 
     def _tracer(self, *a, **k):
         pass
@@ -106,13 +107,21 @@ def test_search_says_whether_stage_2_graded_the_hits(plugin_module):
     assert _call(_p(plugin_module, [hit("a")], ranked=False))["reranked"] is False
 
 
-def test_search_passes_mode_limit_depth_and_a_validated_date_window(plugin_module):
+def test_search_passes_limit_depth_and_a_validated_date_window(plugin_module):
     p = _p(plugin_module, [hit("a")])
-    _call(p, mode="hybrid", limit=7, depth="deep", date_from="2026-07-01", date_to=" 2026-07-31 ")
+    _call(p, limit=7, depth="deep", date_from="2026-07-01", date_to=" 2026-07-31 ")
     (q, kw), = p._memory.calls
-    assert q == "q" and kw["mode"] == "hybrid" and kw["limit"] == 7 and kw["depth"] == "deep"
+    assert q == "q" and kw["limit"] == 7 and kw["depth"] == "deep"
     assert kw["date_from"] == "2026-07-01" and kw["date_to"] == "2026-07-31"
     assert "excluded_sources" not in kw                         # the agent's own search leaves nothing out
+
+
+def test_search_never_passes_mode_even_when_an_old_prompt_still_sends_one(plugin_module):
+    """The library has one retrieval path (Stage 1 + Stage 2): ``mode`` is gone from its search. A model
+    that still sends the argument gets the same search, not an error."""
+    p = _p(plugin_module, [hit("a")])
+    out = _call(p, mode="lexical", limit=3)
+    assert out["count"] == 1 and "mode" not in p._memory.calls[0][1]
 
 
 def test_search_sends_no_date_arguments_unless_given(plugin_module):
@@ -141,26 +150,44 @@ def test_the_search_schema_and_guide_name_the_citation_fields_and_the_window(plu
     p = plugin_module.ProspectaProvider()
     schemas = {s["name"]: s for s in p.get_tool_schemas()}
     props = schemas["prospecta_search"]["parameters"]["properties"]
-    assert {"query", "mode", "limit", "depth", "date_from", "date_to"} <= set(props)
+    assert set(props) == {"query", "limit", "depth", "date_from", "date_to"}      # no mode: one retrieval path
     assert "exact_snippet" in schemas["prospecta_search"]["description"]
     assert "date_from" not in schemas["prospecta_recall"]["parameters"]["properties"]
+    assert set(schemas["prospecta_retain"]["parameters"]["properties"]) == {"content", "source", "tags"}
     assert "chunks, with no model call" in schemas["prospecta_retain"]["description"].replace("\n", " ")
     guide = plugin_module._TOOL_GUIDE
     assert "exact_snippet" in guide and "date_from / date_to" in guide and "keyword" not in guide.lower()
 
 
-# ---- prospecta_recall: the synthesis path, and ask() with Stage 3 only when the profile enables it ----
+# ---- prospecta_recall: the library's ask() (Mode 2B); Stage 3 only when the profile enables it ----
 
-def test_recall_defaults_to_the_synthesis_path_with_cited_sources(plugin_module):
-    p = _p(plugin_module, [hit("a", match="exact+semantic", snippet="the <<roof>> failed")])
-    out = _call(p, "prospecta_recall", limit=4, depth="deep")
-    assert out["synthesis"] == "The roof is to be replaced." and not p._memory.asked
+def test_recall_answers_through_ask_with_stage_1_and_stage_2_and_no_stage_3_by_default(plugin_module):
+    p = _p(plugin_module, [hit("roof", "The roof is to be replaced in June.", match="exact+semantic",
+                               snippet="the <<roof>> is replaced")])
+    out = _call(p, "prospecta_recall", limit=6, depth="deep")
+    (q, kw), = p._memory.asked
+    assert q == "q" and kw == {"limit": 6, "sufficiency": False, "depth": "deep"}   # Stage 3 explicitly off
+    assert p._memory.calls == []                                   # one ask(): no separate search
+    assert out["answer"] == "The roof is to be replaced in June [1]." and out["synthesis"].endswith("[1] ...")
+    assert out["citations"][0]["source"] == "note:roof" and out["citations"][0]["snippet"] == "s"
+    assert out["citations"][0]["exact_snippet"] == "the <<roof>> is replaced"
     (src,) = out["sources"]
-    assert src["source"] == "note:a" and src["created_on"] == "2026-03-02" and src["kind"] == "note"
-    assert src["match_kind"] == "exact+semantic" and src["exact_snippet"] == "the <<roof>> failed"
-    assert src["relevance_score"] == 0.83 and src["rank"] == 1 and src["rrf_score"] == 0.0164
-    assert "text" not in src                                       # the answer already read it
-    assert p._memory.calls[0][1]["limit"] == 4 and p._memory.calls[0][1]["depth"] == "deep"
+    assert src["n"] == 1 and src["source"] == "note:roof" and src["created_on"] == "2026-03-02"
+    assert src["kind"] == "note" and src["match_kind"] == "exact+semantic" and src["relevance_score"] == 0.83
+    assert src["exact_snippet"] == "the <<roof>> is replaced" and "text" not in src   # the answer already read it
+    assert not {"sufficient", "retried", "gate"} & set(out)       # no Stage 3 ran, so none is reported
+
+
+def test_recall_sends_no_depth_when_the_agent_gives_none_and_a_default_limit_of_ten(plugin_module):
+    p = _p(plugin_module, [hit("a")])
+    _call(p, "prospecta_recall")
+    assert p._memory.asked == [("q", {"limit": 10, "sufficiency": False})]
+
+
+def test_recall_never_calls_the_removed_recall_synth(plugin_module):
+    """FakeMemory has no ``recall_synth`` (the library removed it): a call would be an error result."""
+    p = _p(plugin_module, [hit("a")])
+    assert "error" not in _call(p, "prospecta_recall")
 
 
 def test_stage_3_is_off_by_default_and_read_from_config_or_env(plugin_module, monkeypatch):
@@ -177,12 +204,11 @@ def test_stage_3_is_off_by_default_and_read_from_config_or_env(plugin_module, mo
     assert "recall.stage3" in {f["key"] for f in p.get_config_schema()}
 
 
-def test_recall_uses_ask_with_the_stage_3_gate_only_when_the_profile_enables_it(plugin_module):
+def test_recall_adds_the_stage_3_gate_only_when_the_profile_enables_it(plugin_module):
     p = _p(plugin_module, [hit("roof", "The roof is to be replaced in June.")], config={"recall": {"stage3": "true"}})
     out = _call(p, "prospecta_recall", limit=6, depth="deep")
     (q, kw), = p._memory.asked
     assert q == "q" and kw == {"limit": 6, "sufficiency": True, "depth": "deep"}
-    assert not any(kw.get("synth") for _, kw in p._memory.calls)    # recall_synth did not run
     assert out["answer"] == "The roof is to be replaced in June [1]." and out["synthesis"].endswith("[1] ...")
     assert out["citations"][0]["source"] == "note:roof" and out["sufficient"] is True and out["retried"] is False
     assert out["gate"]["threshold"] == 0.7
@@ -232,6 +258,7 @@ class NewMemory:
         self.results, self.closed = results, False
 
     def search(self, q, **kw):
+        check_call("search", q, **kw)
         return list(self.results)
 
     def close(self):
@@ -245,9 +272,9 @@ def origin_ids(monkeypatch):
                         lambda memory, bank, results: [r.document_id.split("-", 1)[1] for r in results])
 
 
-def _shadow_provider(plugin_module, old, new, lexical):
+def _shadow_provider(plugin_module, old, new):
     p = plugin_module.ProspectaProvider()
-    p._memory = FakeMemory([_rm(s, OLD) for s in old], lexical=lexical)
+    p._memory = FakeMemory([_rm(s, OLD) for s in old])
     p._memory.events = []
     p._memory._tracer = lambda kind, payload: p._memory.events.append(payload)
     p._shadow = plugin_module._ShadowReader(
@@ -261,14 +288,16 @@ def _drain(p):
 
 
 def test_shadow_pair_carries_counts_and_the_false_abstain_rate(plugin_module, origin_ids, caplog):
-    p = _shadow_provider(plugin_module, old=[], new=["a", "c"], lexical=1)
+    """A question is answerable when either side found something; a side that found nothing then abstained
+    falsely. (The library's lexical-only search is gone, so no third leg is asked.)"""
+    p = _shadow_provider(plugin_module, old=[], new=["a", "c"])
     with caplog.at_level(logging.INFO):
         p.handle_tool_call("prospecta_search", {"query": "secret words"})
         p.handle_tool_call("prospecta_search", {"query": "secret words"})
         _drain(p)
     old_row, new_row = p._memory.events[:2]
     sh = old_row["trace"]["shadow"]
-    assert (sh["old_n"], sh["new_n"], sh["kw_n"]) == (0, 2, 1)
+    assert (sh["old_n"], sh["new_n"]) == (0, 2) and "kw_n" not in sh
     assert sh["abstain"]["old_abstain"] == 1 and sh["abstain"]["old_false_abstain"] == 1
     assert sh["abstain"]["answerable"] == 1
     last = p._memory.events[-1]["trace"]["shadow"]["abstain"]
@@ -276,46 +305,29 @@ def test_shadow_pair_carries_counts_and_the_false_abstain_rate(plugin_module, or
     line = [r.getMessage() for r in caplog.records if "shadow pair" in r.getMessage()][-1]
     assert "abstain old 2/2 (100.0%) false-abstain old 2/2 (100.0%)" in line
     assert "abstain new 0/2 (0.0%) false-abstain new 0/2 (0.0%)" in line
-    assert "old_n=0 new_n=2 kw_n=1" in line
+    assert "old_n=0 new_n=2" in line and "kw_n" not in line
     assert "secret" not in line and "chunk" not in line     # counts only, no content
-    # the evidence is the library's own lexical search of the old bank, asked in the worker
-    modes = [kw["mode"] for _, kw in p._memory.calls]
-    assert modes.count("hybrid") == 2 and modes.count("lexical") == 2
-
-
-def test_shadow_lexical_count_failure_is_n_a_and_still_prints_the_rate(plugin_module, origin_ids, caplog):
-    p = _shadow_provider(plugin_module, old=["a"], new=[], lexical=0)
-    real = p._memory.search
-
-    def search(q, **kw):
-        if kw.get("mode") == "lexical":
-            raise RuntimeError("lexical down")
-        return real(q, **kw)
-    p._memory.search = search
-    with caplog.at_level(logging.INFO):
-        p.handle_tool_call("prospecta_search", {"query": "q"})
-        _drain(p)
-    line = [r.getMessage() for r in caplog.records if "shadow pair" in r.getMessage()][-1]
-    assert "kw_n=n/a" in line and "false-abstain new 1/1 (100.0%)" in line
-    assert p._memory.events[0]["trace"]["shadow"]["kw_n"] is None
+    assert len(p._memory.calls) == 2                        # the old bank is searched by the tool only, not again for evidence
 
 
 def test_shadow_compares_the_same_cited_list_the_agent_got(plugin_module, origin_ids):
-    p = _shadow_provider(plugin_module, old=["a", "b"], new=["a", "c"], lexical=1)
+    p = _shadow_provider(plugin_module, old=["a", "b"], new=["a", "c"])
     p.handle_tool_call("prospecta_search", {"query": "q", "limit": 5})
     _drain(p)
     assert p._memory.events[0]["trace"]["shadow"]["old_origin_document_ids"] == ["a", "b"]
 
 
-def test_shadow_recall_tools_count_lexical_evidence_in_the_worker(plugin_module, origin_ids):
-    p = _shadow_provider(plugin_module, old=["a"], new=[], lexical=1)
+def test_shadow_recall_compares_the_notes_ask_cited(plugin_module, origin_ids):
+    p = _shadow_provider(plugin_module, old=["a"], new=[])
     p._llm = object()
-    p._memory.recall_synth = lambda q, **kw: SimpleNamespace(
-        synthesis="old answer", sources=[], queries=[SimpleNamespace(text="q1")])
     p.handle_tool_call("prospecta_recall", {"query": "q"})
     _drain(p)
-    sh = p._memory.events[0]["trace"]["shadow"]
-    assert sh["kw_n"] == 1 and sh["old_n"] == 0 and sh["abstain"]["old_false_abstain"] == 1
+    old_row, new_row = p._memory.events
+    sh = old_row["trace"]["shadow"]
+    assert sh["tool"] == "prospecta_recall" and sh["old_n"] == 1 and sh["new_n"] == 0
+    assert sh["abstain"]["old_false_abstain"] == 0 and sh["abstain"]["new_false_abstain"] == 1
+    assert old_row["synthesis"] == "The roof is to be replaced in June [1]." and new_row["synthesis"] is None
+    assert old_row["mode"] == new_row["mode"] == "hybrid"
 
 
 # ---- real Postgres, the real library: Stage 1 + Stage 2 ----
@@ -354,14 +366,78 @@ def test_real_search_window_and_a_failing_reranker(hybrid_bank):
     assert out["results"][0]["relevance_score"] is not None
 
 
-def test_real_recall_synth_returns_cited_sources(hybrid_bank):
-    p = hybrid_bank(llm=CountingLLM(queries=("Henley branch roof",)))
+class Writer:
+    """The answer model of ``ask()`` (the Memory's ``llm``): it records the prompt it was given."""
+
+    def __init__(self, answer="The roof will be replaced in June [1]."):
+        self.answer, self.prompts = answer, []
+
+    def __call__(self, messages=None, *, json_mode=False, **kw):
+        self.prompts.append(messages[0]["content"])
+        return self.answer
+
+
+def test_real_recall_is_the_librarys_ask_stage_1_and_stage_2_then_one_cited_answer(hybrid_bank):
+    writer = Writer()
+    p = hybrid_bank(llm=writer)
     p._retain("The Henley branch roof will be replaced in June.", source="note:new", metadata={"created_on": "2026-10-12"})
-    out = _call(p, "prospecta_recall", query="Henley branch roof")
-    assert out["synthesis"] == "A synthesised answer."
+    p._retain("The Henley branch roof leaks; the board will look at it in July.", source="note:old",
+              metadata={"created_on": "2026-07-14"})
+    out = _call(p, "prospecta_recall", query="When will the Henley branch roof be replaced?")
+    assert out["answer"] == "The roof will be replaced in June [1]."
+    assert out["synthesis"].startswith(out["answer"]) and "Sources:" in out["synthesis"]
+    assert p.rerank.requests                                         # Stage 2 ran (the cross-encoder, over the fake transport)
+    assert len(writer.prompts) == 1                                  # one model call: the answer (no query writer, no formulate)
+    assert "The Henley branch roof will be replaced in June." in writer.prompts[0]   # grounded in the cited chunks
+    assert "[1] source=" in writer.prompts[0] and "date=2026-10-12" in writer.prompts[0]
+    first = out["sources"][0]
+    assert set(first) >= CITED - {"text"} and "text" not in first
+    assert first["created_on"] and first["match_kind"] and first["relevance_score"] is not None
+    cited = {c["n"]: c for c in out["citations"]}
+    assert cited[1]["known"] and cited[1]["source"] == first["source"] and cited[1]["snippet"]
+    assert "sufficient" not in out and p._memory._jev is None       # Stage 3 is off: no gate, no decision model call
+
+
+def test_real_tools_on_an_old_shaped_bank_an_empty_channel_config_and_no_recall_config(hybrid_bank):
+    """augur and forge store ``channel_config = []`` and no ``recall_config``: the library reads that as its default
+    Stage 1 (no Stage 2), and both explicit tools work on it."""
+    p = hybrid_bank(hybrid=False, llm=Writer())
+    p._retain("The Henley branch roof will be replaced in June.", source="note:new", metadata={"created_on": "2026-10-12"})
+    found = _call(p, query="Henley branch roof", date_from="2026-10-01")
+    assert [r["source"] for r in found["results"]] == ["note:new"] and found["reranked"] is False
+    asked = _call(p, "prospecta_recall", query="When is the Henley branch roof replaced?")
+    assert asked["answer"] == "The roof will be replaced in June [1]." and [s["source"] for s in asked["sources"]] == ["note:new"]
+    assert not p.rerank.requests                                    # no Stage 2 on this bank
+
+
+def test_real_recall_exposes_the_exact_snippet_of_a_phrase_match(hybrid_bank):
+    p = hybrid_bank(llm=Writer("They watched it at the party [1]."))
+    p._retain("We watched Electric Dreams at the party and everyone cheered.", source="note:party",
+              metadata={"created_on": "2026-10-12"})
+    out = _call(p, "prospecta_recall", query='"electric dreams"')
     (src,) = out["sources"]
-    assert src["source"] == "note:new" and src["created_on"] == "2026-10-12" and src["match_kind"]
-    assert src["relevance_score"] is not None and set(src) >= CITED - {"text"} and "text" not in src
+    assert src["source"] == "note:party" and "<<Electric>> <<Dreams>>" in src["exact_snippet"]
+    (cite,) = out["citations"]
+    assert cite["source"] == "note:party" and "<<Electric>> <<Dreams>>" in cite["exact_snippet"]
+
+
+def test_real_recall_with_nothing_in_memory_says_so_and_calls_no_model(hybrid_bank):
+    writer = Writer()
+    p = hybrid_bank(llm=writer)
+    out = _call(p, "prospecta_recall", query="What colour is the Henley branch roof?")
+    assert out["answer"] == "not in memory" and out["sources"] == [] and out["citations"] == []
+    assert writer.prompts == []
+
+
+def test_real_recall_honours_depth_and_limit(hybrid_bank, pg_url):
+    p = hybrid_bank(llm=Writer())
+    for i in range(5):
+        p._retain(f"The Henley branch roof report number {i}: the roof needs work.", source=f"note:{i}",
+                  metadata={"created_on": "2026-10-12"})
+    out = _call(p, "prospecta_recall", query="Henley branch roof report", limit=2, depth="deep")
+    assert len(out["sources"]) == 2
+    assert "error" not in _call(p, "prospecta_recall", query="Henley branch roof", depth="standard")
+    assert [r[0] for r in _rows(pg_url, "SELECT depth FROM recall_events ORDER BY created_at")] == ["deep", "standard"]
 
 
 def test_real_recall_through_ask_with_the_stage_3_gate_on(hybrid_bank):
@@ -372,10 +448,6 @@ def test_real_recall_through_ask_with_the_stage_3_gate_on(hybrid_bank):
     def gate(request, timeout):
         seen.append(request)
         return {"answers": {"p0": {"type": "score", "score": 3}}, "usage": {"cost": 0.0}}
-
-    class Writer:
-        def __call__(self, messages=None, *, json_mode=False, **kw):
-            return "The roof will be replaced in June [1]."
 
     p = hybrid_bank(config={"recall": {"stage3": "true"}}, llm=Writer())
     p._memory._jev = JevScore(gate)                                # the library's own model, no profile value
@@ -391,13 +463,15 @@ def test_real_recall_through_ask_with_the_stage_3_gate_on(hybrid_bank):
     assert [s["source"] for s in out["sources"]] == ["note:new"]
 
 
-def test_a_note_retained_with_index_text_is_still_found_by_stage_1(hybrid_bank, pg_url):
+def test_a_retain_call_that_still_sends_index_text_writes_the_note_as_chunks_only(hybrid_bank, pg_url):
+    """The tool has no ``index_text`` argument any more (the library has none): a model that still sends one
+    gets the note saved as chunks, findable by Stage 1, with no question item."""
     p = hybrid_bank()
     out = json.loads(p.handle_tool_call("prospecta_retain", {
         "content": "Augur Prospecta live smoke: host-wide Roger PostgreSQL is active.",
         "source": "smoke:index-text", "index_text": "What is Augur using as his Prospecta substrate?"}))
-    assert out["source"] == "smoke:index-text"
-    kinds = sorted(r[0] for r in _rows(pg_url, "SELECT kind FROM memory_items"))
-    assert kinds == ["chunk", "question"]                          # the question key and the chunks, both
+    assert out["source"] == "smoke:index-text" and "error" not in out
+    kinds = sorted({r[0] for r in _rows(pg_url, "SELECT kind FROM memory_items")})
+    assert kinds == ["chunk"]
     hits = _call(p, query="Prospecta substrate PostgreSQL")["results"]
     assert [h["source"] for h in hits] == ["smoke:index-text"] and hits[0]["text"].startswith("Augur Prospecta live smoke")

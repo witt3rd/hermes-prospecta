@@ -1,4 +1,4 @@
-"""Shadow reads: old/new pairs for search + recall_synth, off the old path."""
+"""Shadow reads: old/new pairs for search and ask (retrieval only on the shadow side), off the old path."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.conftest import stub_embed, stub_llm
+from tests.conftest import check_call, stub_embed, stub_llm
 
 OLD, NEW = "old_bank", "new_bank"
 
@@ -17,7 +17,7 @@ def _rm(source, bank):
     from prospecta._types import RecalledMemory
     return RecalledMemory(
         content=f"c {source}", original_chunk=f"chunk {source}", source=source, score=0.5,
-        scores={"semantic": 0.5, "lexical": 0.0, "lexical_body": 0.0, "rrf": 0.5},
+        scores={"hybrid_chunk": 0.5, "rrf": 0.5},
         metadata={}, bank_id=bank, document_id=f"{bank}-{source}",
     )
 
@@ -27,18 +27,21 @@ class OldMemory:
 
     def __init__(self):
         self.items = [_rm("a", OLD), _rm("b", OLD)]
-        self.synth = SimpleNamespace(
-            synthesis="old answer", sources=self.items, queries=[SimpleNamespace(text="q1")])
+        self.asked = SimpleNamespace(
+            answer="old answer [1]", rendered="old answer [1]\n\nSources", citations=[], items=self.items,
+            sufficient=None, retried=False, gate=None)
         self.events = []
         self.calls = []
 
     def search(self, q, **kw):
+        check_call("search", q, **kw)
         self.calls.append(("search", q))
         return self.items
 
-    def recall_synth(self, q, **kw):
-        self.calls.append(("recall_synth", q))
-        return self.synth
+    def ask(self, q, **kw):
+        check_call("ask", q, **kw)
+        self.calls.append(("ask", q))
+        return self.asked
 
     def _tracer(self, kind, payload):
         self.events.append((kind, payload))
@@ -47,20 +50,16 @@ class OldMemory:
 class NewMemory:
     def __init__(self, *, delay=0.0, fail=None):
         self.delay, self.fail = delay, fail
-        self.searches, self.synths, self.closed = [], [], False
+        self.searches, self.closed = [], False
 
     def search(self, q, **kw):
+        check_call("search", q, **kw)
         self.searches.append((q, kw))
         if self.delay:
             time.sleep(self.delay)
         if self.fail:
             raise self.fail
         return [_rm("a", NEW), _rm("c", NEW)]
-
-    def recall_synth(self, q, **kw):
-        self.synths.append((q, kw))
-        return SimpleNamespace(synthesis="new answer", sources=[_rm("a", NEW)],
-                               queries=[SimpleNamespace(text="nq")])
 
     def close(self):
         self.closed = True
@@ -76,14 +75,14 @@ def origin_ids(monkeypatch, request):
         lib, "_origin_ids", lambda memory, bank, results: [r.document_id.split("-", 1)[1] for r in results])
 
 
-def _provider(plugin_module, *, shadow=True, mode="search", new=None):
+def _provider(plugin_module, *, shadow=True, new=None):
     p = plugin_module.ProspectaProvider()
     p._memory = OldMemory()
     p._llm = object()
     p._new = new or NewMemory()
     if shadow:
         p._shadow = plugin_module._ShadowReader(
-            p._memory, p._new, bank_id=OLD, shadow_bank_id=NEW, mode=mode)
+            p._memory, p._new, bank_id=OLD, shadow_bank_id=NEW)
     return p
 
 
@@ -125,61 +124,77 @@ def test_result_is_exactly_the_old_one(plugin_module):
     on = _provider(plugin_module)
     for tool, args in (("prospecta_search", {"query": "x"}), ("prospecta_recall", {"query": "x"})):
         assert on.handle_tool_call(tool, args) == off.handle_tool_call(tool, args)
-    assert on._memory.calls == off._memory.calls == [("search", "x"), ("recall_synth", "x")]
+    assert on._memory.calls == off._memory.calls == [("search", "x"), ("ask", "x")]
     assert on._memory.items == off._memory.items
     _drain(on)
-    assert "new answer" not in json.dumps(_pairs(on))  # search mode: never the new synthesis
+    # search old/new, recall old/new: the shadow side never carries an answer
+    assert [e["synthesis"] for e in _pairs(on)] == [None, None, "old answer [1]", None]
 
 
 def test_search_pair_recorded(plugin_module):
     p = _provider(plugin_module)
-    p.handle_tool_call("prospecta_search", {"query": "x", "mode": "semantic", "limit": 3, "depth": "deep"})
+    p.handle_tool_call("prospecta_search", {"query": "x", "limit": 3, "depth": "deep"})
     _drain(p)
     old, new = _pairs(p)
     assert (old["bank_id"], new["bank_id"]) == (OLD, NEW)
-    assert p._new.searches == [("x", {"mode": "semantic", "limit": 3, "depth": "deep"})]
+    assert p._new.searches == [("x", {"limit": 3, "depth": "deep"})]       # the library's current signature: no mode
     so, sn = old["trace"]["shadow"], new["trace"]["shadow"]
     assert so["id"] == sn["id"] and (so["role"], sn["role"]) == ("old", "new")
     assert (so["peer_bank"], sn["peer_bank"]) == (NEW, OLD)
-    assert so["tool"] == "prospecta_search" and so["shadow_mode"] == "search"
+    assert so["tool"] == "prospecta_search" and so["shadow_mode"] == "search" and "kw_n" not in so
     assert so["old_origin_document_ids"] == ["a", "b"] and so["new_origin_document_ids"] == ["a", "c"]
     assert so["jaccard"] == pytest.approx(1 / 3)
     assert isinstance(so["old_ms"], int) and isinstance(so["new_ms"], int)
     assert old["duration_ms"] == so["old_ms"] and new["duration_ms"] == so["new_ms"]
-    assert old["mode"] == new["mode"] == "semantic" and old["depth"] == "deep"
+    assert old["mode"] == new["mode"] == "hybrid" and old["depth"] == "deep"      # recall_events.mode is NOT NULL: always hybrid
     assert [r["source"] for r in new["results"]] == ["a", "c"]
     assert p._new.closed
 
 
-def test_recall_pair_search_mode_uses_old_queries_and_no_llm(plugin_module):
+def test_recall_pair_runs_the_same_question_on_the_shadow_bank_retrieval_only(plugin_module):
     p = _provider(plugin_module)
     p.handle_tool_call("prospecta_recall", {"query": "what?"})
     _drain(p)
     old, new = _pairs(p)
-    assert old["synthesis"] == "old answer" and new["synthesis"] is None
+    assert old["synthesis"] == "old answer [1]" and new["synthesis"] is None     # no model call on the shadow side
     assert old["trace"]["shadow"]["tool"] == "prospecta_recall"
-    assert [q for q, _ in p._new.searches] == ["q1"]  # the old side's formulated query
-    assert p._new.synths == []
+    assert [q for q, _ in p._new.searches] == ["what?"]
+    assert [r["source"] for r in old["results"]] == ["a", "b"] and [r["source"] for r in new["results"]] == ["a", "c"]
 
 
-def test_recall_pair_full_mode_runs_recall_synth_on_shadow(plugin_module):
-    p = _provider(plugin_module, mode="full")
-    p.handle_tool_call("prospecta_recall", {"query": "what?"})
-    p.handle_tool_call("prospecta_search", {"query": "x"})
-    _drain(p)
-    recall_old, recall_new, search_old, search_new = _pairs(p)
-    assert recall_new["synthesis"] == "new answer" and recall_new["trace"]["shadow"]["shadow_mode"] == "full"
-    assert [q for q, _ in p._new.synths] == ["what?"]
-    assert search_new["synthesis"] is None  # search tool is always retrieval-only
-    assert [q for q, _ in p._new.searches] == ["x"]
-
-
-def test_prefetch_is_shadowed(plugin_module, monkeypatch):
+def test_the_shadow_has_no_full_mode_and_nothing_is_shadowed_but_search_and_recall(plugin_module, monkeypatch):
+    """``shadow_mode: full`` re-ran recall_synth on the shadow bank; the library has no recall_synth now."""
+    assert "shadow_mode" not in {f["key"] for f in plugin_module.ProspectaProvider().get_config_schema()}
+    assert not hasattr(plugin_module.ProspectaProvider, "_prefetch_synth")
+    import inspect
+    assert "mode" not in inspect.signature(plugin_module._ShadowReader.__init__).parameters
     monkeypatch.setenv("PROSPECTA_PREFETCH", "1")
     p = _provider(plugin_module)
-    assert "old answer" in p.prefetch("hi")
+    assert p.prefetch("hi") == "" and p._memory.calls == []         # the old synthesised prefetch is gone
     _drain(p)
-    assert _pairs(p)[0]["trace"]["shadow"]["tool"] == "prefetch"
+    assert _pairs(p) == []
+
+
+def test_a_stale_shadow_mode_full_starts_the_search_shadow_with_one_warning(plugin_module, monkeypatch, caplog):
+    monkeypatch.delenv("PROSPECTA_SHADOW_BANK", raising=False)
+    p = plugin_module.ProspectaProvider()
+    p._config = {"shadow_bank_id": NEW, "shadow_mode": "full"}
+    p._memory, p._llm, p._database_url = OldMemory(), object(), "postgresql://x"
+    monkeypatch.setattr(p, "_build_shadow_embedder", lambda m, d: stub_embed)
+    new = NewMemory()
+    monkeypatch.setattr(plugin_module, "_build_memory", lambda *a, **k: new)
+    with caplog.at_level("WARNING"):
+        p._start_shadow(OLD)
+    assert p._shadow is not None and p._shadow._shadow is new
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= 30]
+    assert len(warned) == 1 and "shadow_mode" in warned[0] and "full" in warned[0]
+    p._shadow.stop()
+    p._config = {"shadow_bank_id": NEW, "shadow_mode": "search"}      # the other value is read silently
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        p._start_shadow(OLD)
+    assert p._shadow is not None and not [r for r in caplog.records if r.levelno >= 30]
+    p._shadow.stop()
 
 
 def test_shadow_failure_does_not_affect_result_and_is_recorded(plugin_module, caplog):
@@ -286,10 +301,9 @@ def test_pair_is_stored_in_recall_events(plugin_module, pg_url, hermes_home, mon
     run_migrations(database_url=pg_url)
     new_mem = Memory(database_url=pg_url, embed=stub_embed, bank_id="live_v2")
     new_mem.create_bank("live_v2", embedding_dim=32)
-    new_mem.retain("the quick brown fox", source="fox.md", index_text=["quick brown fox"],
-                   child_chunks=True)           # Stage 1 (the default of a bank created fresh) reads chunk items only
+    new_mem.retain("the quick brown fox", source="fox.md")
     p.initialize("s", hermes_home=str(hermes_home))
-    p._retain("the quick brown fox", source="fox.md", index_text=["quick brown fox"])
+    p._retain("the quick brown fox", source="fox.md")
 
     with psycopg.connect(pg_url, autocommit=True) as conn, conn.cursor() as cur:  # as a migrated bank is
         cur.execute(

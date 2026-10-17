@@ -11,16 +11,16 @@ license = { text = "MIT" }
 authors = [{ name = "Forge ⚒️", email = "forge@witt3rd.com" }]
 requires-python = ">=3.11"
 dependencies = [
-    # Pinned to main@4e2962d: the hybrid search and RAG library with Mode 1 automatic recall by query
-    # expansion (Memory.expand_and_recall), which the contract prefetch calls. This pin carries
-    # new-bank defaults (witt3rd/prospecta PR 86), the terms filter and meaning near-copy merge
-    # (PR 87), the docs overhaul (PR 88) and the removal of the retired recall code: linker,
-    # map-reduce, graph and keyword channels (PR 89). The pin before it was 67c0706. Bump to a
-    # later commit only with a test run against it. The live bank DB migrates on
-    # initialize (run_migrations).
+    # Pinned to main@fe68efd: the hybrid search and RAG library after the removal of all remaining legacy
+    # (witt3rd/prospecta PR 90): one read path (Stage 1 hybrid_chunk + Stage 2 cross-encoder), Mode 1
+    # expansion (Memory.expand_and_recall), Mode 2A search, Mode 2B ask (Memory.ask, which prospecta_recall
+    # calls) and Stage 3; a chunk-only write path (retain takes no index_text / child_chunks); no
+    # recall_synth, no search(mode=), no linker. The pin before it was 4e2962d. It is re-pointed to the tag
+    # v1.0.0 once the release exists. Bump to a later commit only with a test run against it. The
+    # live bank DB migrates on initialize (run_migrations).
     # [defaults] = LiteLLM (LLM + default embedder); [embed-sentence-transformers]
     # is declared here, not optional, so a venv rebuild cannot drop the local embedder.
-    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@4e2962d7875a3481da92e870ff2386c84b611a20",
+    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@fe68efdac7d12e4208afb3019a30fe7284509a96",
     "psycopg[binary]>=3.1",
 ]
 
@@ -34,7 +34,7 @@ hermes-prospecta-fill-note-dates = "fill_note_dates:main"
 test = ["pytest>=7", "testcontainers[postgres]>=4", "psycopg[binary]>=3.1"]
 
 [tool.setuptools]
-py-modules = ["__init__", "cli", "health", "importer", "backup", "fill_note_dates", "abstention", "date_cue_gate", "prefetch_contract"]
+py-modules = ["__init__", "cli", "health", "importer", "backup", "fill_note_dates", "abstention", "prefetch_contract"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

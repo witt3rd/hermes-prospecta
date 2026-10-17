@@ -27,7 +27,7 @@ ROOF_SEARCH = "Henley branch roof decision"
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for k in ("PROSPECTA_PREFETCH", "PROSPECTA_PREFETCH_MODE", "PROSPECTA_DECISION_MODEL", "PROSPECTA_RERANKER_MODEL",
-              "PROSPECTA_QUERY_WRITER_MODEL", "PROSPECTA_RECALL_STAGE3", "PROSPECTA_TIMEZONE", "PROSPECTA_LINKED_WRITES",
+              "PROSPECTA_QUERY_WRITER_MODEL", "PROSPECTA_RECALL_STAGE3", "PROSPECTA_TIMEZONE",
               "PROSPECTA_DUAL_WRITE_BANK", "PROSPECTA_SHADOW_BANK", "PROSPECTA_JEV_MODEL"):
         monkeypatch.delenv(k, raising=False)
 
@@ -271,10 +271,24 @@ def test_a_named_period_is_a_search_s_own_window_from_the_librarys_writer(make):
 
 # ---------------------------------------------------------------------------- never fails, logs nothing, records nothing
 
-def test_a_bank_without_the_hybrid_channel_gives_the_not_consulted_line_never_an_error(make):
+def test_a_bank_with_an_empty_channel_config_is_the_hybrid_default_and_the_turn_gets_memory(make):
+    """An old bank (augur, forge) stores ``channel_config = []``: the library reads that as ``hybrid_chunk`` with its
+    default parameters, so the expansion runs on Stage 1 and the turn gets its block, not a "not consulted" line."""
     p = make(hybrid=False, decision=jev_decision("new_ask", 0.9, stands=0.95, scope="past_week"))
+    with p._memory._pool.connection() as conn:
+        assert conn.execute("SELECT channel_config FROM banks WHERE bank_id = 'hyb'").fetchone()[0] == []
     note(p, NEW_ROOF, "note:new", "2026-10-12")
-    assert p.prefetch(ROOF_Q) == "(memory was not consulted: the search failed)"
+    out = p.prefetch(ROOF_Q)
+    assert NEW_ROOF in out and "not consulted" not in out
+    assert not p.rerank.requests                                  # no recall_config: no Stage 2, Stage 1's own order
+
+
+def test_a_bank_whose_hybrid_channel_is_switched_off_gives_the_not_consulted_line_never_an_error(make):
+    """``enabled: false`` is an explicit choice the library keeps: nothing is retrieved, and the turn says so."""
+    p = make(decision=jev_decision("new_ask", 0.9, stands=0.95, scope="past_week"))
+    note(p, NEW_ROOF, "note:new", "2026-10-12")
+    p._memory.set_channel_config([{"name": "hybrid_chunk", "enabled": False, "weight": 1}])
+    assert p.prefetch(ROOF_Q).startswith("(memory was not consulted")
 
 
 def test_a_successful_turn_logs_nothing_and_records_no_recall_event(make, pg_url, caplog):
@@ -417,13 +431,32 @@ def test_the_search_tool_still_runs_the_librarys_stage_1_and_stage_2_without_the
 # ---------------------------------------------------------------------------- the bank check at initialise
 
 def test_the_stage_check_says_what_the_bank_lacks_for_the_expansion(make, caplog):
+    """A bank with an empty channel_config has Stage 1 (the default); what it lacks is the Stage 2 rerank."""
     p = make(hybrid=False)
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         p._check_recall_stages("hyb")
-    assert "no hybrid_chunk channel" in caplog.text and "cross_encoder" in caplog.text
+    assert "hybrid_chunk" not in caplog.text and "cross_encoder" in caplog.text
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+
+def test_the_stage_check_says_so_when_the_hybrid_channel_is_switched_off(make, caplog):
+    p = make()
+    p._memory.set_channel_config([{"name": "hybrid_chunk", "enabled": False, "weight": 1}])
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        p._check_recall_stages("hyb")
+    assert "hybrid_chunk channel" in caplog.text and "switched off" in caplog.text
     assert "every turn goes without memory" in caplog.text
-    assert [r.levelno for r in caplog.records] == [logging.WARNING, logging.WARNING]
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+
+def test_the_stage_check_is_silent_on_a_bank_with_stage_1_and_stage_2(make, caplog):
+    p = make()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        p._check_recall_stages("hyb")
+    assert not caplog.records
 
 
 def test_the_stage_check_says_so_when_the_library_has_no_expansion_entry_point(make, caplog):

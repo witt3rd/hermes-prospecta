@@ -17,8 +17,9 @@ def _p(plugin_module, **cfg):
 
 def test_guide_on_by_default(plugin_module):
     block = _p(plugin_module).system_prompt_block()
-    for word in ("prospecta_search", "prospecta_recall", "depth", "date", "generated question", "automatic"):
+    for word in ("prospecta_search", "prospecta_recall", "depth", "date", "[n]", "automatic"):
         assert word in block
+    assert "generated question" not in block and "synthesized" not in block      # question items are gone
     assert plugin_module._TOOL_GUIDE in block
 
 
@@ -43,3 +44,4 @@ def test_block_grows_only_by_the_guide(plugin_module):
     assert len(on) == len(base) + 2 + len(plugin_module._TOOL_GUIDE)
     assert len(plugin_module._TOOL_GUIDE.splitlines()) <= 12
     assert base.startswith("You have access to prospecta memory")
+    assert "bilateral" not in base and "[n]" in base      # the base block says what the tools do now

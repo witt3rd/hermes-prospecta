@@ -11,19 +11,20 @@ def test_get_config_schema_has_expected_fields(plugin_module):
     expected = {
         "database_url", "bank_id", "embedder_kind", "embedder_model",
         "llm_model", "embedding_dim", "prefetch_enabled",
-        "shadow_bank_id", "shadow_embed_model", "shadow_embedding_dim", "shadow_mode",
-        "linked_writes", "dual_write_bank_id", "dual_write_embed_model",
+        "shadow_bank_id", "shadow_embed_model", "shadow_embedding_dim",
+        "dual_write_bank_id", "dual_write_embed_model",
         "dual_write_embedding_dim", "dual_write_retry_path", "timezone", "hash_precheck",
         "max_connections", "tool_guide", "pool_idle_seconds", "connection_watch",
         "connection_watch_percent", "decision_model", "query_writer_model", "reranker_model", "recall.stage3",
-        "recall.date_cue_gate", "recall.date_timeout_seconds",
         "recall.prefetch.mode", "recall.prefetch.contract_path", "recall.prefetch.max_tokens",
     }
     assert keys == expected
     gone = {"note_date", "recall.fusion", "recall.block_tokens", "recall.keyword", "recall.keyword_unit",
             "recall.keyword_index_warn_mb", "recall.keyword_batch_pause_ms", "recall.prefetch.decision_model",
-            "recall.prefetch.question_model"}
-    assert not gone & keys         # the plugin's own lanes, the note-date switch and the old model keys are gone
+            "recall.prefetch.question_model",
+            "linked_writes", "shadow_mode", "recall.date_cue_gate", "recall.date_timeout_seconds"}
+    # the plugin's own lanes, the note-date switch, the old model keys and the settings of removed code are gone
+    assert not gone & keys
 
 
 def test_save_config_writes_json(plugin_module, tmp_path):

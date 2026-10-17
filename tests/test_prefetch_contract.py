@@ -636,21 +636,17 @@ def test_settings_lost_the_writer_and_search_timeouts():
 # ---------------------------------------------------------------------------- provider: switch, settings, never fails
 
 class FakeMemory:
-    """The provider's Memory: ``expand_and_recall`` is the fake expansion; the old prefetch still has recall_synth."""
+    """The provider's Memory: ``expand_and_recall`` is the fake expansion. It has nothing else: the library has no
+    ``recall_synth`` (the old synthesised prefetch) and the prefetch never searches by itself."""
 
-    def __init__(self, expansion, synth=None):
-        self.expansion, self.synth_calls = expansion, []
+    def __init__(self, expansion):
+        self.expansion = expansion
 
     def expand_and_recall(self, prompt, kind="chat", **kw):
         return self.expansion(prompt, kind, **kw)
 
     def search(self, *a, **k):
         raise AssertionError("the contract prefetch never calls search: it is one expansion")
-
-    def recall_synth(self, q, **kw):
-        self.synth_calls.append(q)
-        from types import SimpleNamespace
-        return SimpleNamespace(synthesis="An old synthesised answer.", sources=[SimpleNamespace(source="s1")])
 
     def _tracer(self, *a, **k):
         pass
@@ -684,11 +680,15 @@ def provider(plugin_module, *, config=None, expansion=None, jev=None):
 CONTRACT_ON = {"prefetch_enabled": "true", "recall": {"prefetch": {"mode": "contract"}}}
 
 
-def test_defaults_are_off_and_flat_nested_and_env_settings_read(plugin_module, monkeypatch):
+def test_defaults_are_contract_and_flat_nested_and_env_settings_read(plugin_module, monkeypatch):
+    """``contract`` is the only prefetch there is; ``off`` is no prefetch. ``prefetch_enabled`` (default off) is
+    the master switch, so the default mode costs nothing until a profile turns the prefetch on."""
     p = plugin_module.ProspectaProvider()
     s = p._resolve_prefetch_settings()
     assert (s.mode, s.decision_model, s.query_writer_model, s.max_tokens, s.deadline_s) == (
-        "off", None, None, 0, 5.0)
+        "contract", None, None, 0, 5.0) and s.active
+    assert pc.MODES == ("contract", "off") and pc.DEFAULT_MODE == "contract"
+    assert p._prefetch_enabled() is False
     assert p._reranker_model() is None and p._decision_model() is None
     p._config = {"recall.prefetch.mode": "contract", "recall.prefetch.max_tokens": "800",
                  "recall.prefetch.contract_path": "/x/c.md"}
@@ -697,7 +697,8 @@ def test_defaults_are_off_and_flat_nested_and_env_settings_read(plugin_module, m
     p._config = {"recall": {"prefetch": {"mode": "contract"}}}
     assert p._resolve_prefetch_settings().mode == "contract"
     monkeypatch.setenv("PROSPECTA_PREFETCH_MODE", "off")
-    assert p._resolve_prefetch_settings().mode == "off"
+    s = p._resolve_prefetch_settings()
+    assert s.mode == "off" and not s.active
 
 
 def test_the_models_are_the_profiles_only_the_library_resolves_the_environment_and_the_defaults(plugin_module, monkeypatch):
@@ -785,40 +786,54 @@ def test_the_other_old_settings_stay_ignored_loudly_one_line_each(plugin_module,
     assert not caplog.records
 
 
-def test_bad_mode_is_off_with_a_warning(plugin_module, caplog):
+def test_bad_mode_is_the_default_with_a_warning(plugin_module, caplog):
     p = plugin_module.ProspectaProvider()
     p._config = {"recall": {"prefetch": {"mode": "full", "max_tokens": "lots"}}}
     with caplog.at_level(logging.WARNING):
         s = p._resolve_prefetch_settings()
-    assert s.mode == "off" and s.max_tokens == 0 and "full" in caplog.text and "lots" in caplog.text
+    assert s.mode == "contract" and s.max_tokens == 0 and "full" in caplog.text and "lots" in caplog.text
+    assert "'contract'" in caplog.text and "'off'" in caplog.text        # it says what the two modes are
 
 
 def test_mode_is_read_at_initialize_so_the_next_session_picks_it_up(plugin_module):
     p = plugin_module.ProspectaProvider()
     p._config = {"prefetch_enabled": "true"}
-    assert p._resolve_prefetch_settings().mode == "off"
-    p._config = {"prefetch_enabled": "true", "recall": {"prefetch": {"mode": "contract"}}}
     assert p._resolve_prefetch_settings().mode == "contract"
+    p._config = {"prefetch_enabled": "true", "recall": {"prefetch": {"mode": "off"}}}
+    assert p._resolve_prefetch_settings().mode == "off"
 
 
 def test_prefetch_disabled_changes_nothing_even_with_mode_contract(plugin_module):
     jev, expansion = FakeJev(decision=jev_decision("new_ask", 0.9)), FakeExpansion()
     p = provider(plugin_module, config={"recall": {"prefetch": {"mode": "contract"}}}, expansion=expansion, jev=jev)
     assert p.prefetch(ROOF_Q) == ""
-    assert not jev.requests and not expansion.calls and p._memory.synth_calls == []
+    assert not jev.requests and not expansion.calls
     p._config = {"prefetch_enabled": "false", "recall": {"prefetch": {"mode": "contract"}}}
     assert p.prefetch(ROOF_Q) == "" and not jev.requests
 
 
-def test_mode_off_keeps_the_old_synthesised_prefetch(plugin_module):
+def test_mode_off_is_no_prefetch_at_all_even_with_the_master_switch_on(plugin_module, caplog):
+    """``off`` used to be the old synthesised answer (recall_synth: gone from the library). It is no prefetch now: no
+    decision call, no search, nothing injected, nothing prepared ahead, no warning."""
     jev, expansion = FakeJev(decision=jev_decision("new_ask", 0.9)), FakeExpansion()
-    p = provider(plugin_module, config={"prefetch_enabled": "true"}, expansion=expansion, jev=jev)
-    out = p.prefetch("What did we decide?")
-    assert "An old synthesised answer." in out and out.startswith("<prospecta-recall>")
-    assert p._memory.synth_calls == ["What did we decide?"] and not jev.requests and not expansion.calls
-    p.queue_prefetch("anything")
-    time.sleep(0.1)
-    assert not jev.requests and not expansion.calls
+    config = {"prefetch_enabled": "true", "recall": {"prefetch": {"mode": "off"}}}
+    p = provider(plugin_module, config=config, expansion=expansion, jev=jev)
+    with caplog.at_level(logging.DEBUG):
+        assert p.prefetch("What did we decide?") == ""
+        p.queue_prefetch("anything")
+        time.sleep(0.1)
+    assert not jev.requests and not expansion.calls and not caplog.records
+
+
+def test_a_profile_that_enables_the_prefetch_and_names_no_mode_gets_the_contract(plugin_module):
+    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
+    p = provider(plugin_module, config={"prefetch_enabled": "true"}, jev=jev,
+                 expansion=FakeExpansion(expanded(["Henley roof"], [item("roof", "The roof is to be replaced in June.")])))
+    assert "The roof is to be replaced in June." in p.prefetch(ROOF_Q) and len(jev.requests) == 1
+
+
+def test_the_old_synthesised_prefetch_is_gone_from_the_provider(plugin_module):
+    assert not hasattr(plugin_module.ProspectaProvider, "_prefetch_synth")
 
 
 def test_mode_contract_never_synthesises_and_never_searches_itself(plugin_module):
@@ -827,7 +842,7 @@ def test_mode_contract_never_synthesises_and_never_searches_itself(plugin_module
                  expansion=FakeExpansion(expanded(["Henley roof"], [item("roof", "The roof is to be replaced in June.")])))
     out = p.prefetch(ROOF_Q)
     assert "The roof is to be replaced in June." in out
-    assert p._memory.synth_calls == [] and p._last_brief.decision == "ask" and "<prospecta-recall>" not in out
+    assert p._last_brief.decision == "ask" and "<prospecta-recall>" not in out
 
 
 def test_a_successful_turn_writes_no_recall_log_line(plugin_module, caplog):
@@ -1034,7 +1049,8 @@ def test_no_ahead_unless_the_agent_ended_on_a_proposal(plugin_module, monkeypatc
 
 
 def test_no_ahead_with_the_switch_off(plugin_module, monkeypatch):
-    for config in ({"prefetch_enabled": "true"}, {"recall": {"prefetch": {"mode": "contract"}}}):
+    for config in ({"prefetch_enabled": "true", "recall": {"prefetch": {"mode": "off"}}},     # mode off
+                   {"recall": {"prefetch": {"mode": "contract"}}}):                           # master switch off
         p = provider(plugin_module, config=config, jev=FakeJev(decision=jev_decision("go_ahead", 0.9)))
         _sync(p, "x", OPENER_AGENT_LAST, monkeypatch)
         p.queue_prefetch("x", session_id="s1")
@@ -1339,7 +1355,7 @@ def test_the_provider_returns_nothing_for_a_skill_turn_in_either_mode(plugin_mod
     p = provider(plugin_module, config=config, jev=jev)
     with caplog.at_level(logging.DEBUG):
         assert p.prefetch(SKILL_TURNS[shape]) == ""
-    assert not jev.requests and not p.expansion.calls and p._memory.synth_calls == []
+    assert not jev.requests and not p.expansion.calls
     assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
     for word in ("harbour", "Henley", "substrate", "SILENT", "cron job"):       # no text of the turn is logged
         assert word not in caplog.text

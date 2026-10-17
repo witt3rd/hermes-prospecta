@@ -10,7 +10,6 @@ def test_handle_retain_returns_document_id(provider_with_stubs):
         {
             "content": "Kelly's birthday is May 14.",
             "source": "fact:kelly-birthday",
-            "index_text": ["When is Kelly's birthday?"],  # bypass LLM
             "tags": ["personal"],
         },
     )
@@ -19,32 +18,27 @@ def test_handle_retain_returns_document_id(provider_with_stubs):
     assert data["source"] == "fact:kelly-birthday"
 
 
-def test_handle_recall_returns_synthesis(provider_with_stubs):
+def test_handle_recall_returns_the_grounded_answer_and_its_cited_sources(provider_with_stubs):
     # Populate one document directly.
     provider_with_stubs._memory.retain(
         content="The capital of France is Paris.",
         source="fact:france",
-        index_text=["What is the capital of France?"],
     )
     result = provider_with_stubs.handle_tool_call(
         "prospecta_recall",
         {"query": "What is the capital of France?", "limit": 5},
     )
     data = json.loads(result)
-    assert "synthesis" in data
-    assert "sources" in data
-    assert isinstance(data["sources"], list)
+    assert data["answer"] == "Synthesized answer based on memory."      # the library's ask(): the stub model's reply
+    assert "synthesis" in data and isinstance(data["citations"], list)
+    assert [s["source"] for s in data["sources"]] == ["fact:france"]
 
 
 def test_handle_search_returns_chunks(provider_with_stubs):
-    provider_with_stubs._retain(               # as the tool writes it: Stage 1 reads chunk items only
-        "The capital of France is Paris.",
-        source="fact:france",
-        index_text=["What is the capital of France?"],
-    )
+    provider_with_stubs._retain("The capital of France is Paris.", source="fact:france")   # as the tool writes it
     result = provider_with_stubs.handle_tool_call(
         "prospecta_search",
-        {"query": "France", "mode": "hybrid", "limit": 5},
+        {"query": "France", "limit": 5},
     )
     data = json.loads(result)
     assert data["count"] == len(data["results"]) >= 1

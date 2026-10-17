@@ -1,4 +1,5 @@
-"""Linked writes and dual write: a second bank kept current off the turn's path."""
+"""Dual write: a second bank kept current off the turn's path (the write path is chunk-only: no model call, no
+index_text, no child_chunks)."""
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +9,7 @@ import time
 
 import pytest
 
-from tests.conftest import stub_embed, stub_llm
+from tests.conftest import check_call, stub_embed, stub_llm
 
 MAIN, SECOND = "main_bank", "second_bank"
 
@@ -51,6 +52,7 @@ class FakeMemory:
         self._pool = _Pool(self.hashes)
 
     def retain(self, content, **kw):
+        check_call("retain", content, **kw)        # what the real library's retain accepts
         if self.delay:
             time.sleep(self.delay)
         if self.fail:
@@ -63,12 +65,11 @@ class FakeMemory:
         self.closed = True
 
 
-def _provider(plugin_module, tmp_path, *, dual=True, linked=False, second=None, main=None):
+def _provider(plugin_module, tmp_path, *, dual=True, second=None, main=None):
     p = plugin_module.ProspectaProvider()
     p._memory = main or FakeMemory()
     p._llm = None  # no model: a turn is written as chunks with no model call either way
     p._hermes_home = tmp_path
-    p._linked_writes = linked
     p.retry = tmp_path / "retry.jsonl"
     p.second = second or FakeMemory()
     if dual:
@@ -92,41 +93,36 @@ def _retry_lines(p):
 
 # ---- off by default ----
 
-def test_both_off_by_default_changes_nothing(plugin_module, tmp_path, monkeypatch):
+def test_dual_write_is_off_by_default_and_changes_nothing(plugin_module, tmp_path, monkeypatch):
     monkeypatch.delenv("PROSPECTA_DUAL_WRITE_BANK", raising=False)
-    monkeypatch.delenv("PROSPECTA_LINKED_WRITES", raising=False)
     import prospecta.memory
     monkeypatch.setattr(prospecta.memory, "Memory",
                         lambda **kw: pytest.fail("a second Memory was built"))
     before = threading.active_count()
     p = _provider(plugin_module, tmp_path, dual=False)
     p._config = {}
-    assert p._resolve_linked_writes() is False and p._resolve_dual_write_bank_id() == ""
+    assert p._resolve_dual_write_bank_id() == ""
     p._start_dual_write(MAIN)
     assert p._dual is None and threading.active_count() == before
     _turn(p)
     (content, kw), = p._memory.calls
-    assert "child_chunks" not in kw and kw["tags"] == ["conversation"]
+    assert set(kw) == {"source", "tags"} and kw["tags"] == ["conversation"]     # chunk-only: nothing else is passed
     assert not p.retry.exists()
 
 
 def test_settings_resolve_from_config_and_env(plugin_module, monkeypatch):
     p = plugin_module.ProspectaProvider()
-    p._config = {"linked_writes": "true", "dual_write_bank_id": "from_cfg"}
+    p._config = {"dual_write_bank_id": "from_cfg"}
     monkeypatch.delenv("PROSPECTA_DUAL_WRITE_BANK", raising=False)
-    monkeypatch.delenv("PROSPECTA_LINKED_WRITES", raising=False)
-    assert p._resolve_linked_writes() and p._resolve_dual_write_bank_id() == "from_cfg"
-    p._config = {"linked_writes": False}
-    assert not p._resolve_linked_writes()
-    p._config = {"linked_writes": "false", "dual_write_bank_id": "from_cfg"}
-    monkeypatch.setenv("PROSPECTA_LINKED_WRITES", "1")
+    assert p._resolve_dual_write_bank_id() == "from_cfg"
     monkeypatch.setenv("PROSPECTA_DUAL_WRITE_BANK", "from_env")
-    assert p._resolve_linked_writes() and p._resolve_dual_write_bank_id() == "from_env"
+    assert p._resolve_dual_write_bank_id() == "from_env"
     monkeypatch.setenv("PROSPECTA_DUAL_WRITE_BANK", "")
     assert p._resolve_dual_write_bank_id() == ""
     keys = {f["key"] for f in p.get_config_schema()}
-    assert {"linked_writes", "dual_write_bank_id", "dual_write_embed_model",
+    assert {"dual_write_bank_id", "dual_write_embed_model",
             "dual_write_embedding_dim", "dual_write_retry_path"} <= keys
+    assert "linked_writes" not in keys             # it had no effect left: the write path is chunk-only
 
 
 # ---- on ----
@@ -135,13 +131,11 @@ def test_second_bank_receives_the_same_note(plugin_module, tmp_path):
     p = _provider(plugin_module, tmp_path)
     _turn(p, "hello", "world")
     out = json.loads(p.handle_tool_call(
-        "prospecta_retain", {"content": "a fact", "source": "fact:1", "tags": ["x"], "index_text": ["q?"]}))
+        "prospecta_retain", {"content": "a fact", "source": "fact:1", "tags": ["x"]}))
     assert out["document_id"] == "doc-2"
     _drain(p)
-    assert [(c, {k: v for k, v in kw.items() if k != "source"}) for c, kw in p.second.calls] == [
-        (c, {**{k: v for k, v in kw.items() if k != "source"}, "child_chunks": True})
-        for c, kw in p._memory.calls]
-    assert [kw["source"] for _, kw in p.second.calls] == [kw["source"] for _, kw in p._memory.calls]
+    assert p.second.calls == p._memory.calls                       # the same chunk-only write, to the second bank
+    assert p._memory.calls[1] == ("a fact", {"source": "fact:1", "tags": ["x"]})
     assert p.second.closed and not p.retry.exists()
 
 
@@ -182,6 +176,15 @@ def test_retry_file_replays_once(plugin_module, tmp_path):
     w = plugin_module._DualWriter(p.second, bank_id=SECOND, retry_path=p.retry)  # next initialize
     w.stop()
     assert len(p.second.calls) == 2
+
+
+def test_a_retry_line_saved_by_an_older_version_replays_without_its_index_text(plugin_module, tmp_path):
+    """Old retry files carry ``index_text`` (the library no longer takes it): the replay writes the chunks only."""
+    p = _provider(plugin_module, tmp_path, dual=False)
+    p.retry.write_text(json.dumps({"content": "old note", "source": "s1", "tags": ["t"],
+                                   "index_text": ["a question?"], "error": "x", "failed_at": 1}) + "\n")
+    plugin_module._DualWriter(p.second, bank_id=SECOND, retry_path=p.retry).stop()
+    assert p.second.calls == [("old note", {"source": "s1", "tags": ["t"]})] and not p.retry.exists()
 
 
 def test_replay_failure_stays_in_the_retry_file(plugin_module, tmp_path):
@@ -241,29 +244,10 @@ def test_dual_start_failures_leave_it_off(plugin_module, tmp_path, monkeypatch, 
     assert p._dual is None
 
 
-# ---- linked writes ----
-
-def test_linked_writes_asks_for_chunk_children(plugin_module, tmp_path):
-    p = _provider(plugin_module, tmp_path, dual=False, linked=True)
-    _turn(p)
-    assert p._memory.calls[0][1]["child_chunks"] is True
-
-
-def test_stage_kwargs_come_from_the_library_cli(plugin_module, monkeypatch):
-    import prospecta.cli._common as common
-    monkeypatch.setattr(common, "_stage_kwargs", lambda: {"synth_llm": "S", "jev": "J"})
-    assert plugin_module.ProspectaProvider()._stage_kwargs() == {"synth_llm": "S", "jev": "J"}
-
-
-def test_stage_build_failure_is_logged_and_never_raised(plugin_module, monkeypatch, caplog):
-    import prospecta.cli._common as common
-    monkeypatch.setattr(common, "_stage_kwargs", lambda: (_ for _ in ()).throw(RuntimeError("no litellm")))
-    assert plugin_module.ProspectaProvider()._stage_kwargs() == {}
-    assert "no litellm" in caplog.text and "Traceback" in caplog.text
-
+# ---- the main write ----
 
 def test_failing_main_write_neither_raises_nor_queues(plugin_module, tmp_path, caplog):
-    p = _provider(plugin_module, tmp_path, linked=True, main=FakeMemory(fail=RuntimeError("main down")))
+    p = _provider(plugin_module, tmp_path, main=FakeMemory(fail=RuntimeError("main down")))
     _turn(p)
     assert json.loads(p.handle_tool_call(
         "prospecta_retain", {"content": "c", "source": "s"}))["error"] == "main down"
@@ -277,7 +261,7 @@ def _real_provider(plugin_module, pg_url, hermes_home, monkeypatch, cfg):
     from prospecta.db.migrate import run_migrations
     from prospecta.memory import Memory
     monkeypatch.setenv("DATABASE_URL", pg_url)
-    for var in ("PROSPECTA_DUAL_WRITE_BANK", "PROSPECTA_LINKED_WRITES"):
+    for var in ("PROSPECTA_DUAL_WRITE_BANK", "PROSPECTA_LINKED_WRITES", "PROSPECTA_LINKER", "PROSPECTA_JEV"):
         monkeypatch.delenv(var, raising=False)
     (hermes_home / "prospecta.json").write_text(json.dumps(
         {"bank_id": "live", "embedding_dim": "32", **cfg}))
@@ -292,48 +276,33 @@ def _real_provider(plugin_module, pg_url, hermes_home, monkeypatch, cfg):
     return p
 
 
-def _count(pg_url, bank, kind=None):
+def _count(pg_url, bank, kind):
+    """(documents, items of this kind) of a bank."""
     import psycopg
     with psycopg.connect(pg_url) as conn:
         docs = conn.execute("SELECT count(*) FROM documents WHERE bank_id = %s", (bank,)).fetchone()[0]
         items = conn.execute(
-            "SELECT count(*) FROM memory_items WHERE bank_id = %s AND kind = %s",
-            (bank, kind or "question")).fetchone()[0]
+            "SELECT count(*) FROM memory_items WHERE bank_id = %s AND kind = %s", (bank, kind)).fetchone()[0]
     return docs, items
 
 
-def test_real_banks_dual_write_with_chunks_and_is_idempotent(
+def test_real_banks_dual_write_chunks_only_and_is_idempotent(
         plugin_module, pg_url, hermes_home, monkeypatch):
     p = _real_provider(plugin_module, pg_url, hermes_home, monkeypatch, {
-        "linked_writes": "true", "dual_write_bank_id": SECOND, "dual_write_embedding_dim": "32"})
-    monkeypatch.setattr(p, "_stage_kwargs", lambda: {})
+        "dual_write_bank_id": SECOND, "dual_write_embedding_dim": "32"})
     p.initialize("s", hermes_home=str(hermes_home))
     p.handle_tool_call("prospecta_retain", {"content": "Paris is in France.\n\nIt is large.", "source": "fact:1"})
     p.handle_tool_call("prospecta_retain", {"content": "Paris is in France.\n\nIt is large.", "source": "fact:1"})
     p.shutdown()
-    assert _count(pg_url, "live") == (1, _count(pg_url, "live")[1])
-    assert _count(pg_url, "live", "chunk")[1] >= 1  # linked_writes: chunk children on the main bank
-    assert _count(pg_url, SECOND) == (1, _count(pg_url, "live")[1])
+    for bank in ("live", SECOND):
+        docs, chunks = _count(pg_url, bank, "chunk")
+        assert docs == 1 and chunks >= 1                          # the note is chunks, in both banks
+        assert _count(pg_url, bank, "question")[1] == 0           # no question item: the write path is chunk-only
     assert _count(pg_url, SECOND, "chunk") == _count(pg_url, "live", "chunk")
-
-
-def test_real_live_profile_values_load_cleanly(plugin_module, pg_url, hermes_home, monkeypatch, caplog):
-    """The live profiles carry linked_writes true, PROSPECTA_LINKER=off, PROSPECTA_JEV=off."""
-    p = _real_provider(plugin_module, pg_url, hermes_home, monkeypatch, {"linked_writes": True})
-    monkeypatch.setenv("PROSPECTA_LINKER", "off")
-    monkeypatch.setenv("PROSPECTA_JEV", "off")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
-    p.initialize("s", hermes_home=str(hermes_home))
-    out = json.loads(p.handle_tool_call("prospecta_retain", {"content": "a note", "source": "n"}))
-    p.shutdown()
-    assert "document_id" in out and "error" not in out
-    assert _count(pg_url, "live")[0] == 1 and _count(pg_url, "live", "chunk")[1] >= 1
-    assert "linker" not in caplog.text and "Traceback" not in caplog.text
 
 
 def test_real_missing_dual_bank_leaves_it_off(plugin_module, pg_url, hermes_home, monkeypatch, caplog):
     p = _real_provider(plugin_module, pg_url, hermes_home, monkeypatch, {"dual_write_bank_id": "nope"})
-    monkeypatch.setattr(p, "_stage_kwargs", lambda: {})
     p.initialize("s", hermes_home=str(hermes_home))
     assert p._dual is None and "No such bank" in caplog.text
     p.shutdown()

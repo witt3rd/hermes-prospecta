@@ -11,42 +11,46 @@ Substrate: Postgres + pgvector. Two deployment modes:
   - Embedded: plugin spins up docker-compose Postgres on first init.
 
 LLM: reads PROSPECTA_LLM_MODEL env (or config llm_model) and calls
-     prospecta.defaults.make_default_llm — same pattern as Hindsight.
+     prospecta.defaults.make_default_llm — same pattern as Hindsight. It is the
+     model that writes the answer of ``prospecta_recall`` (the library's ``ask``)
+     and the callable the library's query writer uses (with its own model id).
      No Hermes ctx.llm dependency.
 Embedder: uses prospecta.defaults make_default_embedder (LiteLLM-backed),
           OR a configured-per-plugin embedder via prospecta.embed.*.
 
 Tool surface (visible to the agent):
-  - prospecta_retain(content, source=..., index_text=None, tags=None)
-  - prospecta_recall(query, limit=10) -> synthesis + cited sources
-  - prospecta_search(query, mode="hybrid", limit=10, date_from=, date_to=) -> cited chunks
-  (recall/search take an optional depth: standard | deep)
+  - prospecta_retain(content, source=..., tags=None)
+  - prospecta_recall(query, limit=10, depth=None) -> a grounded answer with [n] citations + the cited sources
+  - prospecta_search(query, limit=10, depth=None, date_from=, date_to=) -> cited chunks
+  (depth: standard | deep, the width of the pool the cross-encoder reads)
 
 Shadow reads (OFF by default; see README): with ``shadow_bank_id`` set, every
-search / recall / prefetch is also run against that bank on a background
+search / recall is also run against that bank (retrieval only) on a background
 thread and the old/new pair is stored in recall_events. The agent only ever
 sees the old bank's answer. The shadow log prints the false-abstain rate beside
 every abstention figure.
 
-Recall (see README, "Recall: Stage 1 + Stage 2, cited"): ``prospecta_search`` and
-``prospecta_recall`` read through the library (the bank's ``hybrid_chunk`` channel
-and ``cross_encoder`` rerank), and every hit carries its citation fields.
+Recall (see README, "Recall: Stage 1 + Stage 2, cited"): ``prospecta_search`` reads
+through the library (the bank's ``hybrid_chunk`` channel and ``cross_encoder`` rerank)
+and ``prospecta_recall`` is the library's ``Memory.ask`` over the same two stages
+(Mode 2B), with the Stage 3 sufficiency gate only when the profile turns it on.
+Every hit carries its citation fields.
 
-Linked / dual writes (OFF by default; see README): ``linked_writes`` builds the
-library CLI's stages for the main Memory and writes chunk children; ``dual_write_bank_id`` also retains every
-note into a second bank on a background thread, with a JSONL retry file.
+Dual write (OFF by default; see README): ``dual_write_bank_id`` also retains every
+note into a second bank on a background thread, with a JSONL retry file. The write
+path is chunk-only: ``retain(content, source, tags, metadata)`` and nothing else.
 
 Note dates (see README): the library stamps every new note's date
 (``documents.created_on``); the ``timezone`` config (default America/Los_Angeles)
 is the zone of that day (handed to the library as PROSPECTA_TIMEZONE).
 
 Prefetch (OFF by default; see README, "Prefetch"): with ``prefetch_enabled`` on,
-``recall.prefetch.mode`` picks the old synthesised answer ('off', the default) or the
-written recall contract ('contract', ``prefetch_contract.py``: one typed decision per
-message (needs memory? which period of time?), then the library's query expansion
-(``Memory.expand_and_recall``: the message becomes structured searches, run in parallel
-through Stage 1 + Stage 2 with the thread's last turns excluded in SQL, one cited block),
-no synthesis, never fails a turn).
+``recall.prefetch.mode`` is ``contract`` (the default: the written recall contract,
+``prefetch_contract.py``: one typed decision per message (needs memory? which period of
+time?), then the library's query expansion (``Memory.expand_and_recall``: the message
+becomes structured searches, run in parallel through Stage 1 + Stage 2 with the thread's
+last turns excluded in SQL, one cited block), no synthesis, never fails a turn) or ``off``
+(no prefetch at all).
 
 Lifecycle hooks: sync_turn (non-blocking daemon thread), on_session_end,
                   shutdown. Prefetch OPT-IN via config (default OFF —
@@ -72,11 +76,9 @@ from agent.memory_provider import MemoryProvider
 
 try:  # as a package (how hermes loads the plugin) ...
     from . import abstention as _ab
-    from . import date_cue_gate as _dcg
     from . import prefetch_contract as _pc
 except ImportError:  # ... or with the checkout on sys.path (tests, console scripts)
     import abstention as _ab
-    import date_cue_gate as _dcg
     import prefetch_contract as _pc
 
 logger = logging.getLogger(__name__)
@@ -96,14 +98,13 @@ _TOOL_GUIDE = (
     "kind, how it matched, a relevance score, the matched words in context (exact_snippet) and the "
     "whole chunk. Put an \"exact phrase\" in double quotes to match those words side by side; "
     "identifiers and file names match whole. Use it whenever you want to read the notes yourself.\n"
-    "- prospecta_recall: reads the matches and writes one synthesized answer. It costs LLM "
-    "calls, so use it when you need an answer, not a list.\n"
-    "- depth (search and recall): 'standard' suits ordinary questions. 'deep' reads a wider pool "
-    "for about 3x the cost; use it for 'everything about X' or 'every time ...' questions.\n"
+    "- prospecta_recall: reads the best matches and writes one answer from them alone, citing [n] for "
+    "each statement, with the cited sources (and \"not in memory\" when nothing matches). It costs an "
+    "LLM call, so use it when you need an answer, not a list.\n"
+    "- depth (search and recall): 'standard' suits ordinary questions. 'deep' reads a wider pool of "
+    "candidates into the reranker; use it for 'everything about X' or 'every time ...' questions.\n"
     "- date_from / date_to (search, YYYY-MM-DD): only notes dated in that window. A note's date "
     "is the day it was saved unless it carries its own.\n"
-    "- A hit may be a generated question that points to a note, not the note itself. Read the "
-    "note it points to before relying on it.\n"
     "- Retaining is automatic after every turn. Call prospecta_retain only for a fact the "
     "person asks you to remember, with a clear `source`."
 )
@@ -641,23 +642,22 @@ class _ShadowReader(_BackgroundWorker):
     """Replays the old bank's recalls against a second (new) bank, off-path.
 
     The library's ``Memory(shadow_bank_id=...)`` only shadows ``Memory.recall``
-    (this provider calls ``search`` / ``recall_synth``) and opens a fresh
+    (this provider calls ``search`` / ``ask``) and opens a fresh
     connection pool per call, so this reuses its pair format (two
     ``recall_events`` rows sharing ``trace.shadow.id``, with ``jaccard`` over
     original document ids) but keeps ONE shadow ``Memory`` for the provider's
-    life and runs it on ONE daemon worker thread behind a bounded queue.
-    Nothing here raises into, or waits on, the caller.
+    life and runs it on ONE daemon worker thread behind a bounded queue. The
+    shadow side is retrieval only (the same queries through ``search``): no model
+    writes an answer there. Nothing here raises into, or waits on, the caller.
     """
 
     _label = "shadow"
 
-    def __init__(self, memory, shadow_memory, *, bank_id: str, shadow_bank_id: str,
-                 mode: str = "search") -> None:
+    def __init__(self, memory, shadow_memory, *, bank_id: str, shadow_bank_id: str) -> None:
         self._memory = memory            # old-bank Memory: writes both events, resolves ids
         self._shadow = shadow_memory     # new-bank Memory, created once, reused
         self._bank_id = bank_id
         self._shadow_bank_id = shadow_bank_id
-        self._mode = mode                # "search" | "full"
         self._tally = _ab.AbstentionTally()
         super().__init__(shadow_memory)
 
@@ -673,37 +673,18 @@ class _ShadowReader(_BackgroundWorker):
     def _handle(self, job: Dict[str, Any]) -> None:
         self._record(job)
 
-    def _lexical_count(self, job: Dict[str, Any]) -> Optional[int]:
-        """How many hits a plain lexical search of the old bank has for this question (None:
-        unknown): the evidence for the false-abstain rate. It is the library's own lexical mode
-        (Postgres full text), asked here on the worker thread, off the old path."""
-        try:
-            return len(self._memory.search(job["message"], mode="lexical", limit=10))
-        except Exception:
-            logger.exception("prospecta shadow lexical count failed")
-            return None
-
     def _record(self, job: Dict[str, Any]) -> None:
         from prospecta._shadow import _origin_ids
         from prospecta.memory import _serialize_recall_results
 
         depth_kw = {"depth": job["depth"]} if job.get("depth") else {}
         queries = list(job["queries"])
-        synthesis = None
         flat: list = []
         error = None
         t0 = time.monotonic()
         try:
-            if self._mode == "full" and job["tool"] != "prospecta_search":
-                res = self._shadow.recall_synth(
-                    job["message"], limit=job["limit"], mode=job["mode"], **depth_kw)
-                flat = list(res.sources or [])
-                synthesis = res.synthesis
-                queries = [q.text for q in (res.queries or [])] or queries
-            else:
-                for q in queries:
-                    flat.extend(self._shadow.search(
-                        q, mode=job["mode"], limit=job["limit"], **depth_kw))
+            for q in queries:
+                flat.extend(self._shadow.search(q, limit=job["limit"], **depth_kw))
         except Exception as e:
             logger.exception("prospecta shadow %s against %s failed for %r",
                              job["tool"], self._shadow_bank_id, job["message"])
@@ -719,39 +700,38 @@ class _ShadowReader(_BackgroundWorker):
             return
         old_set, new_set = set(old_origin), set(new_origin)
         union = old_set | new_set
-        kw_n = self._lexical_count(job)
         old_found = bool(old_results)
         new_found = None if error else bool(flat)  # None: the new side failed, not an abstention
-        counts = self._tally.record(old_found=old_found, new_found=new_found, kw_found=bool(kw_n))
+        counts = self._tally.record(old_found=old_found, new_found=new_found)
         overlap = {
             "old_origin_document_ids": old_origin,
             "new_origin_document_ids": new_origin,
             "jaccard": (len(old_set & new_set) / len(union)) if union else 1.0,
             # counts only: abstention is "returned nothing"; the false-abstain rate
-            # (abstained where the other side or the keyword leg found something,
-            # over answerable questions) always sits beside it
-            "old_n": len(old_results), "new_n": None if error else len(flat), "kw_n": kw_n,
+            # (abstained where the other side found something, over answerable
+            # questions) always sits beside it
+            "old_n": len(old_results), "new_n": None if error else len(flat),
             "abstain": counts,
         }
-        logger.info("prospecta shadow pair tool=%s old_n=%d new_n=%s kw_n=%s jaccard=%.2f | %s",
+        logger.info("prospecta shadow pair tool=%s old_n=%d new_n=%s jaccard=%.2f | %s",
                     job["tool"], len(old_results), "err" if error else len(flat),
-                    "n/a" if kw_n is None else kw_n, overlap["jaccard"], _ab.format_tally(counts))
+                    overlap["jaccard"], _ab.format_tally(counts))
         shadow_id = str(uuid.uuid4())
         for role, bank, peer, qs, results, syn, ms, err in (
             ("old", self._bank_id, self._shadow_bank_id, job["queries"], old_results,
              job.get("synthesis"), job["old_ms"], None),
-            ("new", self._shadow_bank_id, self._bank_id, queries, flat, synthesis, new_ms, error),
+            ("new", self._shadow_bank_id, self._bank_id, queries, flat, None, new_ms, error),
         ):
             try:
                 self._memory._tracer("recall", {
                     "bank_id": bank,
                     "queries": list(qs),
-                    "mode": job["mode"],
+                    "mode": "hybrid",        # recall_events.mode is NOT NULL; the library has one retrieval path
                     "n_results": len(results),
                     "duration_ms": ms,
                     "trace": {"shadow": {
                         "id": shadow_id, "role": role, "peer_bank": peer, "error": err,
-                        "tool": job["tool"], "shadow_mode": self._mode,
+                        "tool": job["tool"], "shadow_mode": "search",
                         "old_ms": job["old_ms"], "new_ms": new_ms,
                         **overlap,
                     }},
@@ -766,8 +746,8 @@ class _ShadowReader(_BackgroundWorker):
 class _DualWriter(_BackgroundWorker):
     """Writes each note the main bank accepted into a second bank, off-path.
 
-    One ``Memory`` for the second bank (its own embedder, chunk
-    children on), one daemon thread, the same bounded queue as the shadow
+    One ``Memory`` for the second bank (its own embedder; the write is
+    chunk-only, no model call), one daemon thread, the same bounded queue as the shadow
     reader. A note whose content hash is already in the second bank is skipped,
     so the catch-up copy and the dual write cannot duplicate. A failed (or
     queue-overflowing) write is appended to a JSONL retry file; the file is
@@ -803,8 +783,9 @@ class _DualWriter(_BackgroundWorker):
             if found:
                 logger.debug("prospecta dual-write: %s already in %s", job.get("source"), self._bank_id)
                 return
-            kw = {k: job[k] for k in ("source", "tags", "index_text", "metadata") if job.get(k) is not None}
-            self._owned.retain(content=content, child_chunks=True, **kw)
+            # a retry line saved by an older version may carry ``index_text``: the library has none, so it is dropped
+            kw = {k: job[k] for k in ("source", "tags", "metadata") if job.get(k) is not None}
+            self._owned.retain(content=content, **kw)
         except Exception as e:
             logger.exception("prospecta dual-write to %s failed for source %r; queued for retry in %s",
                              self._bank_id, job.get("source"), self._retry_path)
@@ -873,9 +854,7 @@ class ProspectaProvider(MemoryProvider):
         self._llm = None  # built LLM callable; None means no-LLM mode
         self._shadow: Optional[_ShadowReader] = None  # None = shadow reads OFF
         self._dual: Optional[_DualWriter] = None  # None = dual write OFF
-        self._linked_writes = False
         self._conn_watch: Optional[_ConnectionWatch] = None
-        self._date_gate_held = False
         # recall.prefetch (the written recall contract): settings read per session at initialize;
         # per-session state kept from sync_turn; the injectable Jev transport (the library's writer is Memory's llm)
         self._prefetch_cfg: Optional[Any] = None  # _pc.Settings
@@ -1062,28 +1041,6 @@ class ProspectaProvider(MemoryProvider):
         flat = self._config.get(f"recall.{key}")
         return None if flat in (None, "") else flat
 
-    def _recall_date_cue_gate(self) -> bool:
-        """Skip the filter-extraction model call for a question with no date cue?
-        Default on; PROSPECTA_DATE_CUE_GATE env or ``recall.date_cue_gate`` turns it off."""
-        raw = self._recall_setting("PROSPECTA_DATE_CUE_GATE", "date_cue_gate")
-        return ("" if raw is None else str(raw).strip().lower()) not in ("0", "false", "no", "off")
-
-    def _recall_date_timeout(self) -> float:
-        """Hard cap (s) on the date-extraction model call. Default 6; 0 disables.
-        PROSPECTA_DATE_TIMEOUT env or ``recall.date_timeout_seconds``."""
-        raw = self._recall_setting("PROSPECTA_DATE_TIMEOUT", "date_timeout_seconds")
-        if raw is None:
-            return _dcg.DEFAULT_TIMEOUT
-        try:
-            v = float(str(raw).strip())
-            if v < 0 or v != v:
-                raise ValueError(raw)
-            return v
-        except ValueError:
-            logger.warning("prospecta: recall.date_timeout_seconds %r is not a number >= 0; using %s",
-                           raw, _dcg.DEFAULT_TIMEOUT)
-            return _dcg.DEFAULT_TIMEOUT
-
     # ---- recall.prefetch (the written recall contract) ----
 
     def _prefetch_config(self, key: str) -> Any:
@@ -1146,8 +1103,8 @@ class ProspectaProvider(MemoryProvider):
                                    self._prefetch_config("question_model"))
 
     def _recall_stage3(self) -> bool:
-        """Answer ``prospecta_recall`` through the library's ``ask()`` with the Stage 3 sufficiency
-        gate? Default off. PROSPECTA_RECALL_STAGE3 env or ``recall.stage3``."""
+        """Add the Stage 3 sufficiency gate to ``prospecta_recall`` (the library's ``ask()``)? Default off.
+        PROSPECTA_RECALL_STAGE3 env or ``recall.stage3``."""
         raw = self._recall_setting("PROSPECTA_RECALL_STAGE3", "stage3")
         return ("" if raw is None else str(raw).strip().lower()) in ("1", "true", "yes", "on")
 
@@ -1179,7 +1136,8 @@ class ProspectaProvider(MemoryProvider):
         raw_mode = self._prefetch_setting("PROSPECTA_PREFETCH_MODE", "mode")
         mode = _pc.DEFAULT_MODE if raw_mode is None else str(raw_mode).strip().lower()
         if mode not in _pc.MODES:
-            logger.warning("prospecta: recall.prefetch.mode %r is not one of %s; using %r",
+            logger.warning("prospecta: recall.prefetch.mode %r is not one of %s ('contract' runs the recall "
+                           "contract, 'off' is no prefetch); using %r",
                            raw_mode, list(_pc.MODES), _pc.DEFAULT_MODE)
             mode = _pc.DEFAULT_MODE
         contract = self._prefetch_setting("PROSPECTA_PREFETCH_CONTRACT", "contract_path")
@@ -1222,10 +1180,6 @@ class ProspectaProvider(MemoryProvider):
         except Exception:
             self._conn_watch = None
             logger.exception("Prospecta connection watch could not start")
-
-    def _resolve_linked_writes(self) -> bool:
-        return self._resolve_setting("PROSPECTA_LINKED_WRITES", "linked_writes").lower() in (
-            "1", "true", "yes", "on")
 
     def _resolve_dual_write_bank_id(self) -> str:
         """Dual-write bank id; empty means OFF. PROSPECTA_DUAL_WRITE_BANK (even set
@@ -1278,7 +1232,7 @@ class ProspectaProvider(MemoryProvider):
             },
             {
                 "key": "llm_model",
-                "description": "LiteLLM model id for recall synthesis and query formulation (e.g. 'anthropic/claude-haiku-4-5'). Falls back to PROSPECTA_LLM_MODEL env, then prospecta.defaults default.",
+                "description": "LiteLLM model id of the text model: it writes the answer of prospecta_recall (the library's ask()) and is the callable the library's query writer uses (with its own model id, see query_writer_model). Falls back to PROSPECTA_LLM_MODEL env; the plugin refuses to start with neither.",
                 "default": "",
             },
             {
@@ -1288,12 +1242,12 @@ class ProspectaProvider(MemoryProvider):
             },
             {
                 "key": "prefetch_enabled",
-                "description": "Recall before each turn (see recall.prefetch.mode for what runs). Default off.",
+                "description": "Recall before each turn (recall.prefetch.mode 'contract', the default, is what runs; 'off' is no prefetch). Default off.",
                 "default": "false",
             },
             {
                 "key": "shadow_bank_id",
-                "description": "Shadow-read bank: every search/recall is also run against it and the old/new pair is logged to recall_events. Empty = OFF (default). PROSPECTA_SHADOW_BANK env overrides (empty forces off).",
+                "description": "Shadow-read bank: every search/recall is also run against it (retrieval only) and the old/new pair is logged to recall_events. Empty = OFF (default). PROSPECTA_SHADOW_BANK env overrides (empty forces off).",
                 "default": "",
             },
             {
@@ -1307,13 +1261,8 @@ class ProspectaProvider(MemoryProvider):
                 "default": "1536",
             },
             {
-                "key": "linked_writes",
-                "description": "New notes get chunk children and the library CLI's stages (synth, rerank, Jev). Needs OPENROUTER_API_KEY. Default off. PROSPECTA_LINKED_WRITES env overrides.",
-                "default": "false",
-            },
-            {
                 "key": "dual_write_bank_id",
-                "description": "Second bank that every note is also written to (own embedder), in the background. Must already exist. Empty = OFF (default). PROSPECTA_DUAL_WRITE_BANK env overrides (empty forces off).",
+                "description": "Second bank that every note is also written to (own embedder, chunks only), in the background. Must already exist. Empty = OFF (default). PROSPECTA_DUAL_WRITE_BANK env overrides (empty forces off).",
                 "default": "",
             },
             {
@@ -1347,16 +1296,6 @@ class ProspectaProvider(MemoryProvider):
                 "default": "",
             },
             {
-                "key": "recall.date_cue_gate",
-                "description": "Call the filter-extraction model on a search only when the question has a date cue (a month, weekday, 'ago', 'last week', a year, an ISO date, ...); otherwise search with no date filter and no model call. 'true' / 'false'. Default on. PROSPECTA_DATE_CUE_GATE env overrides.",
-                "default": "true",
-            },
-            {
-                "key": "recall.date_timeout_seconds",
-                "description": "Hard wall-clock cap in seconds on the date-extraction model call; on timeout or error the search uses the regex date filter. Default 6. 0 disables. PROSPECTA_DATE_TIMEOUT env overrides.",
-                "default": "6",
-            },
-            {
                 "key": "decision_model",
                 "description": "The Stage 0 decision model: a typed System One model called through OpenRouter with the profile's key. It decides whether memory is needed and for what period of time (contract prefetch), and is the library's Stage 3 gate model. Unset (default): the library's choice, PROSPECTA_DECISION_MODEL else typesafe/jev-1.14. The profile value wins over the environment.",
                 "default": "",
@@ -1373,12 +1312,12 @@ class ProspectaProvider(MemoryProvider):
             },
             {
                 "key": "recall.stage3",
-                "description": "Answer prospecta_recall through the library's ask(): Stage 1 + Stage 2, a grounded answer with [n] citations, and the Stage 3 sufficiency gate (the decision model checks the evidence and one broadened search runs when it falls short). 'true' / 'false'. Default off (prospecta_recall uses recall_synth). PROSPECTA_RECALL_STAGE3 env overrides.",
+                "description": "Add the Stage 3 sufficiency gate to prospecta_recall (the library's ask(): Stage 1 + Stage 2, then a grounded answer with [n] citations): the decision model checks the evidence and one broadened search runs when it falls short. 'true' / 'false'. Default off: ask() answers from Stage 1 + Stage 2 alone. PROSPECTA_RECALL_STAGE3 env overrides.",
                 "default": "false",
             },
             {
                 "key": "recall.prefetch.mode",
-                "description": "The pre-turn recall (only when prefetch_enabled is true): 'off' (default: the old prefetch, one model-written answer) or 'contract' (the written recall contract: one decision per message, then the library's query expansion into parallel searches through Stage 1 + Stage 2, one cited block, no synthesis). Read when a session starts. PROSPECTA_PREFETCH_MODE env overrides.",
+                "description": "The pre-turn recall (only when prefetch_enabled is true): 'contract' (default: the written recall contract: one decision per message, then the library's query expansion into parallel searches through Stage 1 + Stage 2, one cited block, no synthesis) or 'off' (no prefetch at all). Read when a session starts. PROSPECTA_PREFETCH_MODE env overrides.",
                 "default": _pc.DEFAULT_MODE,
                 "choices": list(_pc.MODES),
             },
@@ -1391,12 +1330,6 @@ class ProspectaProvider(MemoryProvider):
                 "key": "recall.prefetch.max_tokens",
                 "description": "Safety valve on the contract prefetch block (the library's): leave out (whole, never cut) the entries that would take it past this many estimated tokens. 0 (default) = not set: the block is sized by relevance alone, unless the bank's recall_config.expansion.max_tokens sets a valve. PROSPECTA_PREFETCH_MAX_TOKENS env overrides.",
                 "default": "0",
-            },
-            {
-                "key": "shadow_mode",
-                "description": "'search' (default): shadow retrieval only, embedding cost. 'full': also shadow recall_synth (LLM, ~0.2-0.4 USD per recall).",
-                "default": "search",
-                "choices": ["search", "full"],
             },
         ]
 
@@ -1494,12 +1427,10 @@ class ProspectaProvider(MemoryProvider):
         try:
             if shadow_bank == bank_id:
                 raise ValueError(f"shadow_bank_id {shadow_bank!r} must differ from bank_id")
-            mode = str(self._config.get("shadow_mode") or "search").strip().lower()
-            if mode not in ("search", "full"):
-                raise ValueError(f"shadow_mode must be 'search' or 'full', got {mode!r}")
-            if mode == "full" and self._llm is None:
-                logger.error("prospecta shadow_mode=full needs an LLM; using 'search'")
-                mode = "search"
+            if str(self._config.get("shadow_mode") or "").strip().lower() == "full":
+                # 'full' re-ran recall_synth on the shadow bank: the library has no recall_synth any more
+                logger.warning("prospecta: shadow_mode 'full' no longer exists (the library has no recall_synth); "
+                               "the shadow bank is read with retrieval only")
             model = (str(self._config.get("shadow_embed_model") or "").strip()
                      or _SHADOW_DEFAULT_EMBED_MODEL)
             try:
@@ -1514,31 +1445,18 @@ class ProspectaProvider(MemoryProvider):
                 self._resolve_pool_idle_seconds(),
                 database_url=self._database_url,
                 embed=self._build_shadow_embedder(model, dim),
-                llm=self._llm if mode == "full" else None,
                 bank_id=shadow_bank,
                 tracer=NoOpTracer(),
             )
             self._shadow = _ShadowReader(
                 self._memory, shadow_memory,
-                bank_id=bank_id, shadow_bank_id=shadow_bank, mode=mode,
+                bank_id=bank_id, shadow_bank_id=shadow_bank,
             )
-            logger.info("Prospecta shadow reads ON: %s -> %s (%s, dim=%s, mode=%s)",
-                        bank_id, shadow_bank, model, dim, mode)
+            logger.info("Prospecta shadow reads ON: %s -> %s (%s, dim=%s)",
+                        bank_id, shadow_bank, model, dim)
         except Exception:
             self._shadow = None
             logger.exception("Prospecta shadow reads could not start; shadow is OFF")
-
-    def _stage_kwargs(self) -> Dict[str, Any]:
-        """The library CLI's jev/rerank/synth stages (built when
-        OPENROUTER_API_KEY is set; the library builds no linker any more, so a
-        PROSPECTA_LINKER value is ignored). Any problem yields none, loudly."""
-        try:
-            from prospecta.cli._common import _stage_kwargs
-            kw = _stage_kwargs()
-        except Exception:
-            logger.exception("prospecta could not build the library stages; none will be used")
-            return {}
-        return kw
 
     def _recall_stage_kwargs(self) -> Dict[str, Any]:
         """Memory arguments for the library's Stage 2 (the cross-encoder, through OpenRouter's rerank
@@ -1583,7 +1501,6 @@ class ProspectaProvider(MemoryProvider):
                 embed=self._build_shadow_embedder(model, dim),
                 llm=self._llm,
                 bank_id=target,
-                **self._stage_kwargs(),
             )
             try:
                 memory.bank_stats(target)  # the bank must already exist
@@ -1663,18 +1580,14 @@ class ProspectaProvider(MemoryProvider):
             return None
 
     def _retain(self, content: str, **kw: Any) -> str:
-        """Write to the main bank (linked when on), then queue the same note for
-        the dual-write bank. The queueing never raises and never waits. The library
-        indexes the note as chunks with no model call (``index_text`` only when the caller
-        gives it) and stamps its day. A note the bank already holds is skipped before
-        any embedding call."""
+        """Write to the main bank, then queue the same note for the dual-write bank. The
+        queueing never raises and never waits. The write path is chunk-only: the library indexes
+        the note as chunks with no model call and stamps its day. A note the bank already holds
+        is skipped before any embedding call."""
         existing = self._existing_note(content, kw)
         if existing is not None:
             return existing
-        # the library's Stage 1 reads chunk items only: a note given question strings (index_text) is
-        # also written as chunks, so it stays findable by it
-        main_kw = dict(kw, child_chunks=True) if self._linked_writes or "index_text" in kw else kw
-        document_id = self._memory.retain(content=content, **main_kw)
+        document_id = self._memory.retain(content=content, **kw)
         dual = self._dual
         if dual is not None:
             try:
@@ -1683,26 +1596,19 @@ class ProspectaProvider(MemoryProvider):
                 logger.exception("prospecta dual-write submit failed for %r", kw.get("source"))
         return document_id
 
-    def _shadow_submit(self, tool: str, message: str, *, old_ms: int, mode: str, limit: int,
-                       depth: Optional[str], items: Any = None, result: Any = None) -> None:
-        """Hand the finished OLD answer (search ``items`` or recall_synth ``result``)
-        to the shadow worker. Never raises, never waits."""
+    def _shadow_submit(self, tool: str, message: str, *, old_ms: int, limit: int,
+                       depth: Optional[str], items: Any = None, answer: Optional[str] = None) -> None:
+        """Hand the finished OLD answer (search or ask ``items``, and ask's ``answer`` text) to the
+        shadow worker, which runs the same question on the shadow bank. Never raises, never waits."""
         shadow = self._shadow
         if shadow is None:
             return
         try:
-            synthesis = None
-            queries = [message]
-            if result is not None:
-                items = result.sources
-                synthesis = result.synthesis
-                queries = [q.text for q in (getattr(result, "queries", None) or [])] or queries
-            job = {
-                "tool": tool, "message": message, "queries": queries,
-                "results": list(items or []), "synthesis": synthesis,
-                "old_ms": old_ms, "mode": mode, "limit": limit, "depth": depth,
-            }
-            shadow.submit(job)
+            shadow.submit({
+                "tool": tool, "message": message, "queries": [message],
+                "results": list(items or []), "synthesis": answer,
+                "old_ms": old_ms, "limit": limit, "depth": depth,
+            })
         except Exception:
             logger.exception("prospecta shadow submit failed")
 
@@ -1747,7 +1653,7 @@ class ProspectaProvider(MemoryProvider):
         except ImportError:
             logger.warning(
                 "prospecta.defaults not available (missing LiteLLM extra). "
-                "recall_synth disabled; retain/search still work."
+                "prospecta_recall disabled; retain/search still work."
             )
             return None
         return make_default_llm(model=self._resolve_llm_model())
@@ -1780,7 +1686,6 @@ class ProspectaProvider(MemoryProvider):
         llm = self._build_llm()
         self._llm = llm  # store on provider so callers use self._llm, not Memory internals
 
-        self._linked_writes = self._resolve_linked_writes()
         self._apply_timezone()
         self._memory = _build_memory(
             self._resolve_max_connections(),
@@ -1789,7 +1694,7 @@ class ProspectaProvider(MemoryProvider):
             bank_id=bank_id,
             llm=llm,
             embed=embed,
-            **{**self._recall_stage_kwargs(), **(self._stage_kwargs() if self._linked_writes else {})},
+            **self._recall_stage_kwargs(),
         )
         try:
             self._memory.create_bank(bank_id, embedding_dim=embedding_dim)
@@ -1799,10 +1704,6 @@ class ProspectaProvider(MemoryProvider):
             if "already exists" not in msg:
                 # prospecta raises BankConfigConflict for dim mismatch; let that propagate
                 raise
-
-        if self._recall_date_cue_gate() and not self._date_gate_held:
-            self._date_gate_held = _dcg.install()
-            _dcg.set_timeout(self._recall_date_timeout())
 
         self._prefetch_cfg = self._resolve_prefetch_settings()
         self._warn_renamed_settings()
@@ -1820,7 +1721,8 @@ class ProspectaProvider(MemoryProvider):
     def _check_recall_stages(self, bank_id: str) -> None:
         """With the contract prefetch on, say once a session (read-only, never raises) what stops the
         library's query expansion from working: a library without ``Memory.expand_and_recall``, a bank
-        with no ``hybrid_chunk`` channel (Stage 1: without it every turn goes without memory) or with no
+        whose ``hybrid_chunk`` channel is switched off (Stage 1: without it every turn goes without memory;
+        an empty or unset ``channel_config`` is the channel's default and is fine) or with no
         ``cross_encoder`` rerank (each search keeps Stage 1's own order)."""
         try:
             if not (self._prefetch_enabled() and self._prefetch_cfg is not None and self._prefetch_cfg.active):
@@ -1838,8 +1740,8 @@ class ProspectaProvider(MemoryProvider):
                 conn.rollback()
             if not any(c.get("name") == "hybrid_chunk" and c.get("enabled", True) for c in channels):
                 logger.warning(
-                    "prospecta: bank %r has no hybrid_chunk channel in its channel_config: the contract "
-                    "prefetch (query expansion) runs on Stage 1, so every turn goes without memory "
+                    "prospecta: bank %r has its hybrid_chunk channel switched off in its channel_config: the "
+                    "contract prefetch (query expansion) runs on Stage 1, so every turn goes without memory "
                     "(README, 'Recall: Stage 1 + Stage 2, cited')", bank_id)
             if not (rerank.get("enabled") and rerank.get("stage") == "cross_encoder"):
                 logger.warning(
@@ -1850,9 +1752,6 @@ class ProspectaProvider(MemoryProvider):
             logger.debug("prospecta: could not check the bank's recall stages", exc_info=True)
 
     def shutdown(self) -> None:
-        if self._date_gate_held:
-            self._date_gate_held = False
-            _dcg.uninstall()
         # Wait briefly for in-flight sync_turn
         t = self._sync_thread
         if t is not None and t.is_alive():
@@ -1892,10 +1791,11 @@ class ProspectaProvider(MemoryProvider):
 
     def _base_prompt_block(self) -> str:
         return (
-            "You have access to prospecta memory — bilateral question-space retrieval. "
+            "You have access to prospecta memory — hybrid search over your notes. "
             "Use `prospecta_retain` to store memorable facts or decisions; supply a clear `source` "
-            "for replace-on-source-match. Use `prospecta_recall` to retrieve a synthesized answer "
-            "about a topic. Use `prospecta_search` for raw chunks when you need to see matches. "
+            "for replace-on-source-match. Use `prospecta_recall` to get an answer about a topic, "
+            "grounded in your notes, with [n] citations and the cited sources. Use `prospecta_search` "
+            "for the cited notes themselves when you need to see matches. "
             "Memory persists across sessions."
         )
 
@@ -1922,16 +1822,6 @@ class ProspectaProvider(MemoryProvider):
                                 "'fact:kelly-birthday'). Used for replace-on-source-match."
                             ),
                         },
-                        "index_text": {
-                            "anyOf": [
-                                {"type": "string"},
-                                {"type": "array", "items": {"type": "string"}},
-                            ],
-                            "description": (
-                                "Optional anticipated questions, kept as extra search keys next "
-                                "to the chunks. Pass a single string or list of strings."
-                            ),
-                        },
                         "tags": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -1944,9 +1834,12 @@ class ProspectaProvider(MemoryProvider):
             {
                 "name": "prospecta_recall",
                 "description": (
-                    "Retrieve and synthesize from prospecta memory: hybrid retrieval and "
-                    "cross-encoder rerank, then an LLM answer. Returns the answer and the cited "
-                    "sources (source, date, kind, match, relevance, exact_snippet)."
+                    "Answer a question from prospecta memory: hybrid retrieval and cross-encoder "
+                    "rerank, then one answer written from the best notes alone, citing [n] for each "
+                    "statement (\"not in memory\" when nothing matches). Returns the answer, the "
+                    "citations (each [n] with its source, date and the supporting sentence, plus "
+                    "exact_snippet where the words matched) and the cited sources (source, date, kind, "
+                    "match, relevance, exact_snippet). Use prospecta_search to read the notes yourself."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1957,13 +1850,13 @@ class ProspectaProvider(MemoryProvider):
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Max results per formulated query.",
+                            "description": "Most notes the answer may cite (and the sources listed).",
                             "default": 10,
                         },
                         "depth": {
                             "type": "string",
                             "enum": ["standard", "deep"],
-                            "description": "Retrieval depth. 'standard' (default) is right for ordinary questions. Use 'deep' for discovery and completeness questions ('everything about X', 'all the ...', 'every time ...'): it reads a wider pool for about 3x the cost.",
+                            "description": "Retrieval depth: how wide a pool of candidates the cross-encoder reads. 'standard' (default) is right for ordinary questions. Use 'deep' for discovery and completeness questions ('everything about X', 'all the ...', 'every time ...').",
                         },
                     },
                     "required": ["query"],
@@ -1972,7 +1865,7 @@ class ProspectaProvider(MemoryProvider):
             {
                 "name": "prospecta_search",
                 "description": (
-                    "Hybrid retrieval from prospecta memory without LLM synthesis: semantic, "
+                    "Hybrid retrieval from prospecta memory without an answer-writing model: semantic, "
                     "stemmed and exact-phrase matching, then a cross-encoder rerank. Returns cited "
                     "hits: source, date, kind, how it matched, relevance, the matched words in "
                     "context (exact_snippet) and the whole chunk. Put an \"exact phrase\" in quotes."
@@ -1981,16 +1874,11 @@ class ProspectaProvider(MemoryProvider):
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "mode": {
-                            "type": "string",
-                            "enum": ["hybrid", "semantic", "lexical"],
-                            "default": "hybrid",
-                        },
                         "limit": {"type": "integer", "default": 10},
                         "depth": {
                             "type": "string",
                             "enum": ["standard", "deep"],
-                            "description": "Retrieval depth. 'standard' (default) is right for ordinary questions. Use 'deep' for discovery and completeness questions ('everything about X', 'all the ...', 'every time ...'): it reads a wider pool for about 3x the cost.",
+                            "description": "Retrieval depth: how wide a pool of candidates the cross-encoder reads. 'standard' (default) is right for ordinary questions. Use 'deep' for discovery and completeness questions ('everything about X', 'all the ...', 'every time ...').",
                         },
                         "date_from": {
                             "type": "string",
@@ -2017,8 +1905,6 @@ class ProspectaProvider(MemoryProvider):
                 if not content or not source:
                     return json.dumps({"error": "content and source are required"})
                 kw: Dict[str, Any] = {"source": source}
-                if "index_text" in args and args["index_text"] is not None:
-                    kw["index_text"] = args["index_text"]
                 if "tags" in args and args["tags"]:
                     kw["tags"] = list(args["tags"])
                 document_id = self._retain(content, **kw)
@@ -2030,39 +1916,7 @@ class ProspectaProvider(MemoryProvider):
                     return json.dumps({"error": "query is required"})
                 if self._llm is None:
                     return json.dumps({"error": "prospecta_recall requires an LLM. Set PROSPECTA_LLM_MODEL env or llm_model in prospecta.json and ensure 'prospecta[defaults]' is installed."})
-                limit = int(args.get("limit", 10))
-                t0 = time.monotonic()
-                if self._recall_stage3():
-                    # the library's ask(): Stage 1 + Stage 2, a grounded answer with [n] citations, and the
-                    # Stage 3 gate (one broadened search when the evidence falls short)
-                    asked = self._memory.ask(query, limit=limit, sufficiency=True, **_depth_kw(args))
-                    self._shadow_submit(
-                        "prospecta_recall", query, items=asked.items, mode="hybrid", limit=limit,
-                        depth=args.get("depth"), old_ms=int((time.monotonic() - t0) * 1000))
-                    return json.dumps({
-                        "synthesis": asked.rendered or "",
-                        "answer": asked.answer or "",
-                        "citations": asked.citations,
-                        "sufficient": asked.sufficient,
-                        "retried": asked.retried,
-                        "gate": asked.gate,
-                        "sources": [_cited_hit(i + 1, it, text=False) for i, it in enumerate(asked.items or [])],
-                    })
-                result = self._memory.recall_synth(query, limit=limit, **_depth_kw(args))
-                self._shadow_submit(
-                    "prospecta_recall", query, result=result, mode="hybrid", limit=limit,
-                    depth=args.get("depth"), old_ms=int((time.monotonic() - t0) * 1000))
-                sources = []
-                for i, hit in enumerate(result.sources or []):
-                    sources.append({
-                        **_cited_hit(i + 1, hit, text=False),
-                        "rank": i + 1,
-                        "rrf_score": (hit.scores or {}).get("rrf") if hasattr(hit, "scores") else None,
-                    })
-                return json.dumps({
-                    "synthesis": result.synthesis or "",
-                    "sources": sources,
-                })
+                return self._recall_tool(query, args)
 
             if tool_name == "prospecta_search":
                 query = args.get("query", "")
@@ -2075,21 +1929,44 @@ class ProspectaProvider(MemoryProvider):
             logger.warning("prospecta tool %s failed: %s", tool_name, e)
             return json.dumps({"error": str(e)})
 
+    # ---- prospecta_recall: the library's ask() (Mode 2B), Stage 3 only when the profile enables it ----
+
+    def _recall_tool(self, query: str, args: Dict[str, Any]) -> str:
+        """The library's ``ask()``: Stage 1 + Stage 2 over the bank, then one model call (the Memory's ``llm``)
+        that answers from the best ``limit`` notes alone and cites ``[n]`` for each statement. With nothing in
+        memory the answer is ``not in memory`` and no model is called. ``depth`` is the library's (the width of
+        the pool the cross-encoder reads). The Stage 3 sufficiency gate (the decision model checks the evidence;
+        one broadened search runs when it falls short) runs only when the profile enables ``recall.stage3``: it
+        is passed explicitly either way, so a bank's own recall_config does not switch it on."""
+        limit = int(args.get("limit", 10))
+        stage3 = self._recall_stage3()
+        t0 = time.monotonic()
+        asked = self._memory.ask(query, limit=limit, sufficiency=stage3, **_depth_kw(args))
+        self._shadow_submit("prospecta_recall", query, items=asked.items, answer=asked.answer, limit=limit,
+                            depth=args.get("depth"), old_ms=int((time.monotonic() - t0) * 1000))
+        out: Dict[str, Any] = {
+            "answer": asked.answer or "",
+            "synthesis": asked.rendered or "",        # the answer followed by its numbered [source | date] sources
+            "citations": asked.citations,
+            "sources": [_cited_hit(i + 1, it, text=False) for i, it in enumerate(asked.items or [])],
+        }
+        if stage3:
+            out.update(sufficient=asked.sufficient, retried=asked.retried, gate=asked.gate)
+        return json.dumps(out)
+
     # ---- prospecta_search: the library's Stage 1 + Stage 2, every hit cited ----
 
     def _search_tool(self, query: str, args: Dict[str, Any]) -> str:
         """The library's search (Stage 1 hybrid candidates, Stage 2 cross-encoder rerank where the
         bank has them), as cited hits: source, date, kind, how it matched, relevance, the matched words
         in context (``exact_snippet``) and the whole chunk. The shadow compares the same list."""
-        mode = args.get("mode", "hybrid")
         limit = int(args.get("limit", 10))
         window = {k: _iso_date(args.get(k), k) for k in ("date_from", "date_to") if args.get(k) not in (None, "")}
         trace: List[Dict[str, Any]] = []
         t0 = time.monotonic()
-        items = list(self._memory.search(query, mode=mode, limit=limit, _trace=trace,
-                                         **_depth_kw(args), **window))
+        items = list(self._memory.search(query, limit=limit, _trace=trace, **_depth_kw(args), **window))
         old_ms = int((time.monotonic() - t0) * 1000)
-        self._shadow_submit("prospecta_search", query, items=items, mode=mode, limit=limit,
+        self._shadow_submit("prospecta_search", query, items=items, limit=limit,
                             depth=args.get("depth"), old_ms=old_ms)
         return json.dumps({
             "results": [_cited_hit(i + 1, it) for i, it in enumerate(items)],
@@ -2228,8 +2105,8 @@ class ProspectaProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         # OFF by default: ``prefetch_enabled`` is the master switch. With it on,
-        # ``recall.prefetch.mode`` picks the path: 'off' (default) keeps the old synthesised
-        # answer, 'contract' runs the written recall contract. Neither ever fails a turn.
+        # ``recall.prefetch.mode`` is 'contract' (default: the written recall contract) or 'off' (no
+        # prefetch at all). It never fails a turn.
         if not self._prefetch_enabled() or self._memory is None:
             return ""
         try:
@@ -2241,35 +2118,13 @@ class ProspectaProvider(MemoryProvider):
                 logger.debug("prospecta prefetch: skill turn (%s); no recall", shape)
                 return ""
             cfg = self._prefetch_settings()
-            if not cfg.active:
-                return self._prefetch_synth(query)
+            if not cfg.active:      # mode 'off'
+                return ""
             return self._prefetch_contract(query, session_id or self._session_id, cfg)
         except Exception as e:
             # one line, no text: the type, and the contract's own message when the contract is the problem
             logger.warning("prospecta prefetch failed (this turn goes without memory): %s%s",
                            type(e).__name__, f": {e}" if isinstance(e, _pc.ContractError) else "")
-            return ""
-
-    def _prefetch_synth(self, query: str) -> str:
-        """The old prefetch (``recall.prefetch.mode: off``): the model-written answer."""
-        try:
-            t0 = time.monotonic()
-            result = self._memory.recall_synth(query)
-            self._shadow_submit(
-                "prefetch", query, result=result, mode="hybrid", limit=10, depth=None,
-                old_ms=int((time.monotonic() - t0) * 1000))
-            if not result.synthesis:
-                return ""
-            srcs = [getattr(s, "source", "") for s in (result.sources or [])[:3]]
-            srcs_str = ", ".join(s for s in srcs if s) or "no sources"
-            return (
-                "<prospecta-recall>\n"
-                f"{result.synthesis}\n\n"
-                f"(sources: {srcs_str})\n"
-                "</prospecta-recall>"
-            )
-        except Exception as e:
-            logger.warning("prospecta prefetch failed: %s", e)
             return ""
 
     # ---- recall.prefetch.mode: contract ----

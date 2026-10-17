@@ -2,8 +2,9 @@
 
 Counts only (no question or note text). Used by the shadow reader (``__init__._ShadowReader``):
 a side *abstains* on a question when it returned nothing; the question is *answerable* when
-the old side, the new side or a plain lexical search of the bank found something; a *false
-abstain* is an abstention on an answerable question.
+the old side or the new side found something; a *false abstain* is an abstention on an answerable
+question. (The library's lexical-only search, once a third leg of this evidence, is gone: it has one
+retrieval path.)
 """
 from __future__ import annotations
 
@@ -15,8 +16,8 @@ class AbstentionTally:
     """Running counts of a shadow comparison.
 
     A side *abstains* on a question when it returned nothing. A question is
-    *answerable* when the old side, the new side or a plain lexical search of
-    the bank (``kw_found``) found something. A *false abstain* is an abstention on an answerable question.
+    *answerable* when the old side or the new side found something. A *false abstain* is an abstention on an
+    answerable question.
     ``new_found=None`` (the new side errored) is left out of the new-side counts.
     """
 
@@ -25,8 +26,8 @@ class AbstentionTally:
         self._c = {"pairs": 0, "answerable": 0, "old_abstain": 0, "old_false_abstain": 0,
                    "new_pairs": 0, "new_abstain": 0, "new_false_abstain": 0}
 
-    def record(self, *, old_found: bool, new_found: Optional[bool], kw_found: bool) -> Dict[str, int]:
-        answerable = bool(old_found or new_found or kw_found)
+    def record(self, *, old_found: bool, new_found: Optional[bool]) -> Dict[str, int]:
+        answerable = bool(old_found or new_found)
         with self._lock:
             c = self._c
             c["pairs"] += 1
