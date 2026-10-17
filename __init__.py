@@ -887,6 +887,7 @@ class ProspectaProvider(MemoryProvider):
         self._ahead_running: set = set()  # (session, key) pairs being prepared
         self._jev_transport: Optional[Any] = None   # tests / hosts: a (request, timeout) -> response callable
         self._last_brief: Optional[Any] = None      # the last contract run's record (no text is logged)
+        self._skill_turn: Optional[str] = None      # the shape of this turn when it is a skill/cron turn (on_turn_start)
 
     # ---- identity ----
 
@@ -2254,6 +2255,15 @@ class ProspectaProvider(MemoryProvider):
         with self._state_lock:
             return self._exchanges.get(sid, ("", 0))
 
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """Core calls this with the WHOLE user message (skill scaffolding included) just before ``prefetch_all``,
+        which hands ``prefetch`` only the user's instruction of a skill turn. Remember whether this turn is a
+        skill/cron invocation; ``prefetch`` and ``queue_prefetch`` read it. Never raises."""
+        try:
+            self._skill_turn = _pc.skill_turn_shape(message)
+        except Exception:
+            self._skill_turn = None
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         # OFF by default: ``prefetch_enabled`` is the master switch. With it on,
         # ``recall.prefetch.mode`` picks the path: 'off' (default) keeps the old synthesised
@@ -2261,6 +2271,13 @@ class ProspectaProvider(MemoryProvider):
         if not self._prefetch_enabled() or self._memory is None:
             return ""
         try:
+            # A skill or cron turn (the on_turn_start flag, or the text's own shape) gets no recall at all: no
+            # decision, no search, no writer call, nothing injected. Only the shape's name is ever logged.
+            shape = self._skill_turn or _pc.skill_turn_shape(query)
+            if shape:
+                self._last_brief = _pc.Brief(reason="skill turn")
+                logger.debug("prospecta prefetch: skill turn (%s); no recall", shape)
+                return ""
             cfg = self._prefetch_settings()
             if not cfg.active:
                 return self._prefetch_synth(query)
@@ -2337,6 +2354,8 @@ class ProspectaProvider(MemoryProvider):
         and never raises."""
         try:
             if not self._prefetch_enabled() or self._memory is None:
+                return
+            if self._skill_turn or _pc.skill_turn_shape(query):      # a skill/cron turn prepares nothing ahead
                 return
             cfg = self._prefetch_settings()
             if not cfg.active:

@@ -287,6 +287,8 @@ channel), has no search that answered, or is late gives the one "not consulted" 
 writes no recall event and no model-call event for a chat message. The only line is one warning
 (no text) when a turn goes without memory because the plugin itself failed or the deadline passed.
 
+**Skill and cron turns get no recall.** A turn that is a skill invocation (a slash skill, a skill bundle, stacked skills, a preloaded or auto-loaded skill) or a cron wake gets no automatic recall at all: no decision call, no search, no writer call, nothing injected (not even the "not consulted" line), nothing prepared ahead. The skill looks up what it needs. The plugin knows from the turn's first line: `on_turn_start` receives the whole message and flags a turn that begins with one of Hermes' `[IMPORTANT: ...]` skill/cron lines; and because core's `prefetch_all` strips a skill's scaffolding, a cron wake reaches `prefetch` as the cron hint plus the job's prompt, so that hint (which starts every cron prompt, with or without a skill) is recognised too. A message that only mentions a skill, or quotes such a line mid-text, is an ordinary turn and expands as usual.
+
 **Ahead.** Core calls `queue_prefetch` after each turn with the person's text.
 In contract mode the plugin ignores that text and, when the agent's own last
 answer ended on a proposal ("Shall I draft it?"), expands it on its own thread
