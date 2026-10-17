@@ -286,9 +286,10 @@ def test_pair_is_stored_in_recall_events(plugin_module, pg_url, hermes_home, mon
     run_migrations(database_url=pg_url)
     new_mem = Memory(database_url=pg_url, embed=stub_embed, bank_id="live_v2")
     new_mem.create_bank("live_v2", embedding_dim=32)
-    new_mem.retain("the quick brown fox", source="fox.md", index_text=["quick brown fox"])
+    new_mem.retain("the quick brown fox", source="fox.md", index_text=["quick brown fox"],
+                   child_chunks=True)           # Stage 1 (the default of a bank created fresh) reads chunk items only
     p.initialize("s", hermes_home=str(hermes_home))
-    p._memory.retain("the quick brown fox", source="fox.md", index_text=["quick brown fox"])
+    p._retain("the quick brown fox", source="fox.md", index_text=["quick brown fox"])
 
     with psycopg.connect(pg_url, autocommit=True) as conn, conn.cursor() as cur:  # as a migrated bank is
         cur.execute(
