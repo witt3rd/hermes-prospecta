@@ -1232,3 +1232,163 @@ def test_every_search_carries_the_same_exclusion_and_window_because_they_are_arg
     assert kw["excluded_sources"] == [r["source"] for r in p._retained]
     assert (kw["date_from"], kw["date_to"]) == ("2026-10-10", "2026-10-17")
     assert "Only notes dated 2026-10-10 to 2026-10-17 were searched." in out
+
+
+# ---------------------------------------------------------------------------- a skill / cron turn gets no automatic recall
+#
+# Invented text of the real shapes. Hermes builds them in agent/skill_commands.py (single skill, stacked,
+# preloaded), agent/skill_bundles.py (bundle), cron/scheduler.py (the cron hint, the skill block, the
+# skipped-skill notice) and gateway/run.py (auto-loaded skill). Core's prefetch_all keeps only the user's
+# instruction of a skill turn, so for a cron wake the plugin sees the cron hint + the job's prompt.
+
+CRON_HINT = ("[IMPORTANT: You are running as a scheduled cron job. DELIVERY: Your final response will be "
+             "automatically delivered to the user — do NOT use send_message or try to deliver the output "
+             "yourself. Just produce your report/output as your final response and the system handles the "
+             "rest. SILENT: If there is genuinely nothing new to report, respond with exactly \"[SILENT]\" "
+             "(nothing else) to suppress delivery. Never combine [SILENT] with content — either report your "
+             "findings normally, or say [SILENT] and nothing more.]\n\n")
+JOB_PROMPT = ("Look through the harbour-notes folder and the kitchen log for anything the person left "
+              "unfinished; session notes live under /srv/example/substrate. Report only what is new.")
+SKILL_BODY = ("# Daily harbour check\n\nWhen woken, open the session log, list open items and write a short "
+              "report. Never deliver it yourself.\n")
+SKILL_LINE = ('[IMPORTANT: The user has invoked the "harbour-check" skill, indicating they want you to follow its '
+              'instructions. The full skill content is loaded below.]')
+INSTRUCTION_MARK = "The user has provided the following instruction alongside the skill invocation: "
+
+SKILL_TURNS = {
+    # what Hermes builds (cron/scheduler.py:3097 + append_user_instruction; skill_commands.py:631)
+    "cron-skill-wake": f"{SKILL_LINE}\n\n{SKILL_BODY}\n{INSTRUCTION_MARK}{CRON_HINT}{JOB_PROMPT}",
+    "slash-skill": f"{SKILL_LINE}\n\n{SKILL_BODY}\n{INSTRUCTION_MARK}tidy the harbour notes",
+    "slash-skill-bare": f"{SKILL_LINE}\n\n{SKILL_BODY}",
+    # skill_bundles.py:347 and skill_commands.py:760
+    "bundle": ('[IMPORTANT: The user has invoked the "harbour" skill bundle, loading 2 skills together. Treat '
+               'every skill below as active guidance for this turn.]\n\nBundle: harbour\n\nUser instruction: '
+               'tidy up\n\n[Loaded as part of the harbour bundle: harbour-check]\n' + SKILL_BODY),
+    "stacked": ('[IMPORTANT: The user has invoked the "/harbour-check /kitchen-log" stacked skill bundle, loading '
+                '2 skills together. Treat every skill below as active guidance for this turn.]\n\n'
+                'Skills loaded: harbour-check, kitchen-log\n\nUser instruction: tidy up\n\n'
+                '[Loaded as part of the stacked skills: harbour-check]\n' + SKILL_BODY),
+    # cron/scheduler.py:3105: core does NOT strip this one (the message does not begin with the invoke marker)
+    "cron-skipped-notice": ("[IMPORTANT: The following skill(s) were listed for this job but could not be found "
+                            "and were skipped: ghost-skill. Start your response with a brief notice so the user "
+                            "is aware, e.g.: '⚠️ Skill(s) not found and skipped: ghost-skill']\n\n" + SKILL_LINE +
+                            f"\n\n{SKILL_BODY}\n{INSTRUCTION_MARK}{CRON_HINT}{JOB_PROMPT}"),
+    # cron/scheduler.py:3014: a cron job WITHOUT a skill, and the remainder core hands over after stripping a skill
+    "cron-hint-only": CRON_HINT + JOB_PROMPT,
+    "cron-hint-with-notepad": CRON_HINT + "## Notepad\n- last seen: Tuesday\n\n" + JOB_PROMPT,
+    # skill_commands.py:826 (preloaded), gateway/run.py:17984 (auto-loaded for a topic/channel)
+    "preloaded": ('[IMPORTANT: The user launched this CLI session with the "harbour-check" skill preloaded. Treat '
+                  'its instructions as active guidance for the duration of this session unless the user '
+                  'overrides them.]\n\n' + SKILL_BODY),
+    "auto-loaded": ('[IMPORTANT: The "harbour-check" skill is auto-loaded. Follow its instructions for this '
+                    'session.]\n\n' + SKILL_BODY + "\n\nWhat did we decide about the Henley branch roof?"),
+}
+
+# Ordinary messages: they may mention a skill, a marker or a cron job, but they do not BEGIN as one.
+ORDINARY_LINES = [
+    ROOF_Q,
+    "Can you write a skill that checks the Henley branch roof every morning?",
+    'What does it mean when a prompt says [IMPORTANT: The user has invoked the "harbour-check" skill? Henley roof.',
+    f'Please explain this text from the log: {SKILL_LINE} and why the Henley roof came up.',
+    "I set up a scheduled cron job last week; what did we decide about the Henley branch roof?",
+    "The user has invoked the harbour-check skill, and what did we decide about the Henley branch roof?",
+    "[IMPORTANT: this is only my own bracketed note] what did we decide about the Henley branch roof?",
+]
+
+
+@pytest.mark.parametrize("shape", sorted(SKILL_TURNS))
+def test_a_skill_or_cron_turn_is_recognised_by_its_shape(shape):
+    assert pc.skill_turn_shape(SKILL_TURNS[shape]) is not None
+
+
+@pytest.mark.parametrize("line", ORDINARY_LINES + ["", "yes", None, 7, ["x"]])
+def test_an_ordinary_line_is_not_a_skill_turn(line):
+    assert pc.skill_turn_shape(line) is None
+
+
+@pytest.mark.parametrize("shape", sorted(SKILL_TURNS))
+def test_a_skill_turn_makes_no_decision_no_search_no_writer_call_and_injects_nothing(shape):
+    jev, expansion = FakeJev(decision=jev_decision("new_ask", 0.95, stands=0.99)), FakeExpansion()
+    b = run(SKILL_TURNS[shape], make_deps(expansion, jev))
+    assert b.text == "" and b.injected == 0 and b.searches == [] and b.cost_usd == 0
+    assert b.reason == "skill turn" and b.decision == "zero"
+    assert not jev.requests and not expansion.calls
+
+
+def test_the_cron_wake_as_core_hands_it_over_is_cron_hint_plus_job_prompt():
+    """Core's prefetch_all hands the plugin ``extract_user_instruction_from_skill_message(content)``: for a cron
+    wake that is everything after the instruction marker, which begins with the cron hint (read on the live
+    profile's state.db: the user row begins with the invoke marker, the stripped remainder with the hint)."""
+    stripped = SKILL_TURNS["cron-skill-wake"].rsplit(INSTRUCTION_MARK, 1)[1]
+    assert stripped.startswith(CRON_HINT) and pc.skill_turn_shape(stripped) == "cron"
+    jev, expansion = FakeJev(decision=jev_decision("new_ask", 0.95)), FakeExpansion()
+    assert run(stripped, make_deps(expansion, jev)).text == "" and not jev.requests and not expansion.calls
+
+
+@pytest.mark.parametrize("line", ORDINARY_LINES)
+def test_an_ordinary_message_about_skills_expands_as_usual(line):
+    b, expansion, jev = ask(line)
+    assert b.text and len(jev.decisions()) == 1 and len(expansion.calls) == 1 and b.reason == ""
+
+
+@pytest.mark.parametrize("mode", ["contract", "off"])
+@pytest.mark.parametrize("shape", sorted(SKILL_TURNS))
+def test_the_provider_returns_nothing_for_a_skill_turn_in_either_mode(plugin_module, mode, shape, caplog):
+    jev = FakeJev(decision=jev_decision("new_ask", 0.95, stands=0.99))
+    config = {"prefetch_enabled": "true", "recall": {"prefetch": {"mode": mode}}}
+    p = provider(plugin_module, config=config, jev=jev)
+    with caplog.at_level(logging.DEBUG):
+        assert p.prefetch(SKILL_TURNS[shape]) == ""
+    assert not jev.requests and not p.expansion.calls and p._memory.synth_calls == []
+    assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+    for word in ("harbour", "Henley", "substrate", "SILENT", "cron job"):       # no text of the turn is logged
+        assert word not in caplog.text
+
+
+def test_a_slash_skill_with_an_instruction_is_caught_through_on_turn_start(plugin_module):
+    """Core strips the skill and hands prefetch only the instruction ('tidy the harbour notes' looks ordinary);
+    on_turn_start gets the whole message first, so the provider knows the turn is a skill invocation."""
+    jev = FakeJev(decision=jev_decision("new_ask", 0.95, stands=0.99))
+    p = provider(plugin_module, config=CONTRACT_ON, jev=jev)
+    p.on_turn_start(3, SKILL_TURNS["slash-skill"])
+    assert p.prefetch("tidy the harbour notes") == "" and not jev.requests and not p.expansion.calls
+    p.on_turn_start(4, ROOF_Q)                                                    # the next turn is ordinary
+    assert "stored text of roof" in p.prefetch(ROOF_Q) and len(p.expansion.calls) == 1
+
+
+def test_a_turn_without_on_turn_start_is_judged_by_its_own_text(plugin_module):
+    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
+    p = provider(plugin_module, config=CONTRACT_ON, jev=jev)
+    assert p.prefetch(CRON_HINT + JOB_PROMPT) == "" and not jev.requests
+    assert p.prefetch(ROOF_Q) != "" and len(p.expansion.calls) == 1
+
+
+def test_on_turn_start_never_raises_and_ordinary_turns_are_unchanged(plugin_module):
+    p = provider(plugin_module, config=CONTRACT_ON, jev=FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95)))
+    for bad in (None, 7, b"x", ["a"], {"k": 1}, object()):
+        p.on_turn_start(1, bad)
+    p.on_turn_start(2, ROOF_Q, remaining_tokens=10, model="m", platform="telegram")
+    assert p.prefetch(ROOF_Q) != ""
+
+
+def test_a_skill_turn_prepares_nothing_ahead_and_leaves_nothing_logged(plugin_module, monkeypatch, caplog):
+    jev = FakeJev(decision=jev_decision("go_ahead", 0.9, stands=0.1, need_library=1))
+    p = provider(plugin_module, config=CONTRACT_ON, jev=jev)
+    _sync(p, "x", OPENER_AGENT_LAST, monkeypatch)                         # the agent ended on a proposal
+    p.on_turn_start(5, SKILL_TURNS["cron-skill-wake"])
+    with caplog.at_level(logging.DEBUG):
+        p.queue_prefetch(CRON_HINT + JOB_PROMPT, session_id="s1")
+        time.sleep(0.3)
+    assert not p.expansion.calls and "s1" not in p._ahead and not jev.requests
+    assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+    p.on_turn_start(6, ROOF_Q)                                            # an ordinary turn prepares ahead again
+    p.queue_prefetch(ROOF_Q, session_id="s1")
+    assert _wait(lambda: "s1" in p._ahead)
+
+
+def test_a_skill_turn_never_raises_even_when_the_library_is_down(plugin_module):
+    p = provider(plugin_module, config=CONTRACT_ON, jev=FakeJev(decision=jev_decision("new_ask", 0.9)))
+    p._memory = None
+    assert p.prefetch(SKILL_TURNS["cron-skill-wake"]) == ""
+    p.on_turn_start(1, SKILL_TURNS["slash-skill"])
+    assert p.prefetch("tidy the harbour notes") == ""

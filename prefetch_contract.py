@@ -224,6 +224,33 @@ def _is_number(v: Any) -> bool:
 
 _SCAFFOLD = re.compile(r"</?memory-context>", re.IGNORECASE)
 
+# A skill or cron turn is not a question to look up: the skill fetches what it needs itself. Every shape Hermes
+# gives such a turn opens with a bracketed ``[IMPORTANT: ...]`` line, so a turn is one of them only when it BEGINS
+# with the line (a message that quotes one mid-text, or only mentions a skill, is ordinary). Where Hermes builds
+# each one: agent/skill_commands.py (invoke line of a slash skill, the stacked-bundle header, the preloaded-skill
+# line), agent/skill_bundles.py (the bundle header), cron/scheduler.py (the cron hint that starts EVERY cron prompt,
+# the skill's invoke line, the skipped-skill notice), gateway/run.py (the auto-loaded-skill line). Core's
+# prefetch_all keeps only the user's instruction of a skill turn, so for a cron wake the plugin sees the cron hint
+# followed by the job's prompt: the hint is the signal that survives. A slash skill typed with an instruction
+# reaches prefetch as that bare instruction; only ``on_turn_start``, which gets the whole message, tells it apart.
+_SKILL_TURN = re.compile(
+    r'\A\s*\[IMPORTANT: (?:'
+    r'(?P<skill>The user has invoked the ")'                          # skill / skill bundle / stacked skills
+    r'|(?P<cron>You are running as a scheduled cron job\.)'           # the cron hint (job with or without a skill)
+    r'|(?P<skipped>The following skill\(s\) were listed for this job)'  # cron: skills not found
+    r'|(?P<preloaded>The user launched this CLI session with the ")'
+    r'|(?P<autoloaded>The "[^"\n]*" skill is auto-loaded\.)'          # gateway topic/channel skill binding
+    r')')
+
+
+def skill_turn_shape(text: Any) -> Optional[str]:
+    """The shape name when ``text`` is a skill or cron turn (it begins with one of Hermes' skill/cron lines),
+    else None. Never raises."""
+    if not isinstance(text, str):
+        return None
+    m = _SKILL_TURN.match(text)
+    return m.lastgroup if m else None
+
 
 def gate(text: Any) -> Tuple[str, str]:
     """('go', text) to go on, else ('skip', reason). Core's trivial-word filter has already run
@@ -234,6 +261,8 @@ def gate(text: Any) -> Tuple[str, str]:
     line = _SCAFFOLD.sub("", text).strip()
     if not line:
         return "skip", "empty"
+    if skill_turn_shape(line):
+        return "skip", "skill turn"
     if line.startswith("/"):
         return "skip", "slash command"
     try:
