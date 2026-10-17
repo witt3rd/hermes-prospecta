@@ -11,16 +11,16 @@ license = { text = "MIT" }
 authors = [{ name = "Forge ⚒️", email = "forge@witt3rd.com" }]
 requires-python = ">=3.11"
 dependencies = [
-    # Pinned to main@fe68efd: the hybrid search and RAG library after the removal of all remaining legacy
-    # (witt3rd/prospecta PR 90): one read path (Stage 1 hybrid_chunk + Stage 2 cross-encoder), Mode 1
-    # expansion (Memory.expand_and_recall), Mode 2A search, Mode 2B ask (Memory.ask, which prospecta_recall
-    # calls) and Stage 3; a chunk-only write path (retain takes no index_text / child_chunks); no
-    # recall_synth, no search(mode=), no linker. The pin before it was 4e2962d. It is re-pointed to the tag
-    # v1.0.0 once the release exists. Bump to a later commit only with a test run against it. The
-    # live bank DB migrates on initialize (run_migrations).
+    # Pinned to the tag v1.0.0 (f8c64e7), the release of main@fe68efd (witt3rd/prospecta PR 90, the removal of
+    # all remaining legacy; the release itself only changed the version, CHANGELOG and README): one read path
+    # (Stage 1 hybrid_chunk + Stage 2 cross-encoder), Mode 1 expansion (Memory.expand_and_recall), Mode 2A
+    # search, Mode 2B ask (Memory.ask, which prospecta_recall calls) and Stage 3; a chunk-only write path
+    # (retain takes no index_text / child_chunks); no recall_synth, no search(mode=), no linker. The pin before
+    # it was 4e2962d. Bump to a later release only with a test run against it. The live bank DB migrates on
+    # initialize (run_migrations).
     # [defaults] = LiteLLM (LLM + default embedder); [embed-sentence-transformers]
     # is declared here, not optional, so a venv rebuild cannot drop the local embedder.
-    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@fe68efdac7d12e4208afb3019a30fe7284509a96",
+    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@f8c64e71323ab0dc832da3734285bb96572989b9",
     "psycopg[binary]>=3.1",
 ]
 
