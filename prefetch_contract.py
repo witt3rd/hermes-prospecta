@@ -1,12 +1,14 @@
 """The pre-turn recall contract for the Hermes plugin (``recall.prefetch.mode: contract``).
 
-One typed decision per chat message, questions written only when needed, the
-plugin's lanes asked in parallel, one rank call for the whole set, no answer
-synthesis, and a labelled block sized by relevance. The design is the written
-recall contract (``contract/recall-contract-v1.md`` carries its words); this
+One typed decision per chat message (is memory needed, and for what period of
+time), questions written only when needed, each question asked of the library's
+Stage 1 (hybrid candidates) + Stage 2 (cross-encoder rerank) in parallel, no answer
+synthesis, and a labelled block of cited evidence. The design is the written
+recall contract (``contract/recall-contract-v1.md`` carries its words) on the
+hybrid architecture of Prospecta's ``docs/postgres-hybrid.md`` (Mode 1A); this
 module is the code that runs it. Nothing here touches the database or the
-network on its own: the provider hands in the search, the date lookup, the
-Jev transport and the text model, so every path runs offline in tests.
+network on its own: the provider hands in the search, the Jev transport and the
+text model, so every path runs offline in tests.
 
 A turn is never failed or held by this module: every stage has a fallback, the
 whole run has a deadline, and a late answer is dropped by the caller
@@ -27,13 +29,9 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
-
-try:  # as a package (how hermes loads the plugin) ...
-    from . import recall_fusion as _rf
-except ImportError:  # ... or with the checkout on sys.path (tests, console scripts)
-    import recall_fusion as _rf
 
 logger = logging.getLogger(__name__)
 
@@ -41,27 +39,30 @@ logger = logging.getLogger(__name__)
 
 MODES = ("off", "contract")
 DEFAULT_MODE = "off"
-DEFAULT_DECISION_MODEL = "typesafe/jev-1.14"
-DEFAULT_QUESTION_MODEL = "openrouter/qwen/qwen3.8-flash"   # the design's cheapest registry model
+# The three models of the hybrid architecture (docs/hybrid-implementation-plan.md section 2): the
+# decision model (Stage 0), the query writer (Stage 0) and the reranker (Stage 2), each configurable
+# (the provider reads the profile config, then the environment, then these defaults).
+DEFAULT_DECISION_MODEL = "typesafe/jev-1.14"                        # env PROSPECTA_DECISION_MODEL
+DEFAULT_QUERY_WRITER_MODEL = "openrouter/google/gemini-2.5-flash-lite"   # env PROSPECTA_QUERY_WRITER_MODEL (a LiteLLM id)
+DEFAULT_RERANKER_MODEL = "qwen/qwen3-reranker-8b"                   # env PROSPECTA_RERANKER_MODEL
 DEFAULT_CONTRACT_PATH = Path(__file__).resolve().parent / "contract" / "recall-contract-v1.md"
 JEV_URL = "https://openrouter.ai/api/v1/systemone"
 
 DEADLINE_S = 5.0            # from the call; core's own wait is 8 s
 DECISION_TIMEOUT_S = 1.0    # no answer in 1 s -> the rule decides
 WRITER_TIMEOUT_S = 1.5      # no answer in 1.5 s -> the fallback sentence
-SEARCH_TIMEOUT_S = 4.5      # the lanes (a cold search of one question takes 1.2-2.5 s); what has answered by then is used
-RANK_TIMEOUT_S = 1.0        # no ranking -> the search's own order
+SEARCH_TIMEOUT_S = 4.5      # Stage 1 + Stage 2 of one question (embedding, one SQL query, the reranker's own 2.5 s); what has answered by then is used
 NEEDS_THRESHOLD = 0.5       # a noul at or above this is "yes"
-RATE_THRESHOLD = 2.0        # Jev's 0..3 score: "partly answers" or better goes in the block
-RANK_POOL = 16              # Jev ranks at most this many candidates in one request (the venue's RANK_POOL)
-FALLBACK_PAGE = 5           # with no ranking: the first page of each question
+SEARCH_LIMIT = 50           # the library's Stage 1 pool: its Stage 2 (floor and top_n) decides what is left, the limit never cuts it
+FALLBACK_PAGE = 5           # with no Stage 2 ranking: the first page of each question, in Stage 1's own order
+SENTENCE_POOL = 16          # the writer's fallback rates at most this many sentences of the agent's last line
 MAX_QUESTIONS = 3
+MAX_PHRASE_QUERIES = 2      # quoted phrases that are also asked on their own (see ``with_phrase_queries``)
 PLAIN_QUESTION_CHARS = 600  # a line longer than this is never asked as written
 PASTE_CHARS = 50_000        # over this the line is material (Jev's 60 KB request window)
 MAX_LINE_CHARS = 1_000_000  # beyond any model's window: nothing reads it
 SHORT_REPLY_WORDS = 3
 AHEAD_TTL_S = 600.0
-LANE_POOL = _rf.BLOCK_POOL
 
 _TRIVIAL_FALLBACK = re.compile(r"^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|hi|hey|hello|"
                                r"yo|sup|continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)"
@@ -78,8 +79,14 @@ NEED_SOURCES = {
 }
 ALL_SOURCES = tuple(NEED_SOURCES.values())
 LINE_KINDS = ("answer", "go_ahead", "follow_up", "new_ask", "material", "social")
-_TURN_SOURCE_PREFIX = "turn:"
-ECHO_MIN_ANSWER_CHARS = 60
+TURN_SOURCE_PREFIX = "turn:"
+
+# Stage 0's time scope: what the decision model may answer, and the window each relative scope means
+# (days back from today, inclusive). "named" is a period the line itself names (a month, a year, a
+# date): the question writer turns it into a range; the decision model cannot.
+TIME_SCOPES = ("none", "recent", "past_week", "past_month", "past_year", "named")
+RELATIVE_DAYS = {"recent": 1, "past_week": 7, "past_month": 31, "past_year": 366}
+MIN_YEAR = 1990
 
 
 class ContractError(Exception):
@@ -167,16 +174,15 @@ def load_contract(path: Any = None) -> Contract:
 class Settings:
     mode: str = DEFAULT_MODE
     decision_model: str = DEFAULT_DECISION_MODEL
-    question_model: str = DEFAULT_QUESTION_MODEL
+    query_writer_model: str = DEFAULT_QUERY_WRITER_MODEL
     contract_path: str = ""
     max_tokens: int = 0                 # safety valve on the block; 0 = off
     deadline_s: float = DEADLINE_S
     decision_timeout_s: float = DECISION_TIMEOUT_S
     writer_timeout_s: float = WRITER_TIMEOUT_S
     search_timeout_s: float = SEARCH_TIMEOUT_S
-    rank_timeout_s: float = RANK_TIMEOUT_S
     paste_chars: int = PASTE_CHARS
-    drop_echoes: bool = True            # leave out the records that are the thread's own last turns
+    drop_echoes: bool = True            # exclude the thread's own last two turns from the search (excluded_sources)
 
     @property
     def active(self) -> bool:
@@ -289,6 +295,7 @@ class Decision:
     needs: Dict[str, float] = field(default_factory=dict)
     by: str = "jev"                 # jev | size | rule
     cost_usd: float = 0.0
+    time_scope: str = "none"        # one of TIME_SCOPES: the period of time the line limits its question to
 
     def sources(self) -> List[str]:
         """The sources to ask: the need_* at or above 0.5; none at 0.5 means all."""
@@ -299,8 +306,9 @@ class Decision:
         return [NEED_SOURCES[k] for k, v in self.needs.items() if k in NEED_SOURCES and v >= NEEDS_THRESHOLD]
 
 
-def build_state(*, line: str, agent_last: str, turns: int, thread: str = "", agent: str = "") -> dict:
-    return {
+def build_state(*, line: str, agent_last: str, turns: int, thread: str = "", agent: str = "",
+                today: str = "") -> dict:
+    state = {
         "agent": agent or "an assistant of one person (a Hermes gateway)",
         "turn": "a message from the person in a chat with the agent",
         "thread": thread or "a conversation with the person",
@@ -309,6 +317,9 @@ def build_state(*, line: str, agent_last: str, turns: int, thread: str = "", age
         "in_view": (f"{turns} earlier turn(s) of this conversation are in the session; the agent's last "
                     "answer is in agent_last; no notes, open work or decisions are in view"),
     }
+    if today:   # what the time_scope question counts back from
+        state["today"] = today
+    return state
 
 
 def decision_request(contract: Contract, model: str, state: dict) -> dict:
@@ -321,7 +332,7 @@ def read_decision(contract: Contract, resp: dict) -> Decision:
     answers = resp.get("answers") if isinstance(resp, dict) else None
     if not isinstance(answers, dict):
         raise ValueError("response has no answers")
-    missing = [k for k in contract.questions if k not in answers]
+    missing = [k for k in contract.questions if k not in answers and k != "time_scope"]   # a window is optional
     if missing:
         raise ValueError("answers lack " + ", ".join(missing))
 
@@ -337,7 +348,28 @@ def read_decision(contract: Contract, resp: dict) -> Decision:
     if kind not in LINE_KINDS:
         raise ValueError("line_kind is not one of the contract's kinds")
     return Decision(line_kind=kind, needs_memory=noul("needs_memory"), stands_alone=noul("stands_alone"),
-                    needs={k: noul(k) for k in NEED_SOURCES}, cost_usd=_cost(resp))
+                    needs={k: noul(k) for k in NEED_SOURCES}, cost_usd=_cost(resp),
+                    time_scope=read_time_scope(contract, answers))
+
+
+def read_time_scope(contract: Contract, answers: dict) -> str:
+    """The time scope the decision model chose, or "none". The question is the contract's own (a
+    contract without it, or a missing or unknown answer, means no window): a search with no date
+    filter loses nothing, a wrong window could, so this never voids the decision."""
+    if "time_scope" not in contract.questions:
+        return "none"
+    a = answers.get("time_scope")
+    choice = a.get("choice") if isinstance(a, dict) else None
+    return choice if choice in TIME_SCOPES else "none"
+
+
+def relative_window(scope: str, today: date) -> Optional[Tuple[str, str]]:
+    """The notes' date window (from, to; ISO, inclusive) a relative time scope means, counted back
+    from ``today``; None for "none" and for "named" (the writer gives that one)."""
+    days = RELATIVE_DAYS.get(scope)
+    if days is None:
+        return None
+    return (today - timedelta(days=days)).isoformat(), today.isoformat()
 
 
 def rule_decision(line: str) -> Decision:
@@ -410,12 +442,11 @@ def is_plain_question(line: str) -> bool:
     return len(parts) == 1 and parts[0].endswith("?")
 
 
-def parse_questions(raw: str) -> List[str]:
-    """The questions in the writer's reply (``{"questions": ["..."]}``; ``{"queries": [{"text": ..}]}``
-    is read too). ValueError when the reply holds no such object; an empty list is a valid zero."""
+def _first_object(raw: str) -> dict:
+    """The first JSON object in a model reply (prose and code fences around it are tolerated);
+    ValueError when there is none."""
     dec = json.JSONDecoder()
     pos = 0
-    obj = None
     while (i := raw.find("{", pos)) >= 0:
         try:
             v, _ = dec.raw_decode(raw, i)
@@ -423,11 +454,15 @@ def parse_questions(raw: str) -> List[str]:
             pos = i + 1
             continue
         if isinstance(v, dict):
-            obj = v
-            break
+            return v
         pos = i + 1
-    if obj is None:
-        raise ValueError("reply holds no JSON object")
+    raise ValueError("reply holds no JSON object")
+
+
+def parse_questions(raw: str) -> List[str]:
+    """The questions in the writer's reply (``{"questions": ["..."]}``; ``{"queries": [{"text": ..}]}``
+    is read too). ValueError when the reply holds no such object; an empty list is a valid zero."""
+    obj = _first_object(raw)
     items = obj.get("questions", obj.get("queries"))
     if not isinstance(items, list):
         raise ValueError("reply has no questions list")
@@ -439,20 +474,109 @@ def parse_questions(raw: str) -> List[str]:
     return out[:MAX_QUESTIONS]
 
 
+def valid_window(date_from: Any, date_to: Any, today: date) -> Optional[Tuple[str, str]]:
+    """A date window (ISO dates, inclusive) the writer gave, if it is a real one: two valid dates,
+    from not after to, not before MIN_YEAR, not past a year ahead. Anything else is no window."""
+    try:
+        lo, hi = date.fromisoformat(str(date_from).strip()), date.fromisoformat(str(date_to).strip())
+    except (TypeError, ValueError):
+        return None
+    if lo > hi or lo.year < MIN_YEAR or hi > today + timedelta(days=366):
+        return None
+    return lo.isoformat(), hi.isoformat()
+
+
+# A "quoted phrase": double quotes (straight or curly) that open after a space or punctuation and close
+# before one, so an inch mark in "a 5" pipe" is not a quote. Postgres reads only the straight quote as a
+# phrase (websearch_to_tsquery), so a phrase is always written back with straight quotes.
+_QUOTED = re.compile(r'(?<!\w)(?:"([^"\n]{2,200}?)"|\u201c([^\u201d\n]{2,200}?)\u201d)(?!\w)')
+
+
+def quoted_phrases(text: str) -> List[str]:
+    """The "quoted phrases" of ``text``, without their quotes, once each, in order."""
+    out: List[str] = []
+    for m in _QUOTED.finditer(text or ""):
+        phrase = (m.group(1) or m.group(2) or "").strip()
+        if phrase and any(c.isalnum() for c in phrase) and phrase not in out:
+            out.append(phrase)
+    return out
+
+
+def keep_quoted(line: str, questions: Sequence[str]) -> List[str]:
+    """The questions with every "quoted phrase" of the person's ``line`` in them, verbatim and in
+    straight quotes (the library reads a quoted phrase as an exact phrase: adjacent, unstemmed). A
+    phrase the model dropped is put back: quoted where its words stayed, else appended to the first
+    question. The model is told to keep them; this is the guard for when it does not."""
+    out = list(questions)
+    if not out:
+        return out
+    for phrase in quoted_phrases(line):
+        quoted = f'"{phrase}"'
+        out = [q.replace(f"\u201c{phrase}\u201d", quoted) for q in out]
+        if any(quoted in q for q in out):
+            continue
+        for i, q in enumerate(out):
+            if phrase in q:
+                out[i] = q.replace(phrase, quoted, 1)
+                break
+        else:
+            out[0] = f"{out[0]} {quoted}"
+    return out
+
+
+def with_phrase_queries(line: str, questions: Sequence[str]) -> List[str]:
+    """The questions, then each "quoted phrase" of the person's ``line`` asked on its own too (at most
+    MAX_PHRASE_QUERIES, none that is already a question). The library reads a question through
+    websearch_to_tsquery, where every word must be in the chunk, so a phrase inside a full question
+    reaches the exact/phrase retriever only for a chunk that also holds all the other words; the
+    phrase alone, in quotes, finds every chunk that holds those words side by side."""
+    out = list(questions)
+    if not out:
+        return out
+    for phrase in quoted_phrases(line)[:MAX_PHRASE_QUERIES]:
+        alone = f'"{phrase}"'
+        if alone not in out:
+            out.append(alone)
+    return out
+
+
+@dataclass
+class Written:
+    """What the question writer gave back: the questions, and (only when the decision model said the
+    line names a period) the window it worked out for it."""
+    questions: List[str]
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    cost_usd: float = 0.0
+
+
 _WRITER_INPUT = (
     "\n\n## Input\n\n"
     "The agent's last line: {{ context }}\n\n"
     "The person's new lines (read as: {{ line_kind }}): {{ message }}\n\n"
     "The thread's purpose: {{ thread }}\n\n"
-    "The kinds of knowledge needed: {{ kinds }}\n"
+    "The kinds of knowledge needed: {{ kinds }}\n\n"
+    "Today: {{ today }}\n\n"
+    "The time scope the decision model found in the new lines: {{ time_scope }}\n"
+)
+
+# Always appended, whatever contract file is loaded: the two rules the hybrid search depends on.
+_WRITER_RULES = (
+    "\n\n## Rules that always apply\n\n"
+    "{% raw %}Keep every \"quoted phrase\" of the person's new lines exactly as written, quotes included, in "
+    "the question it belongs to: never reword it, drop it or split it. When the time scope is `named`, also "
+    "return `\"date_from\"` and `\"date_to\"` (YYYY-MM-DD, both inclusive) next to `\"questions\"`: the "
+    "period the new lines name, counted from today. Otherwise return no dates.{% endraw %}"
 )
 
 
 def write_questions(llm: Callable[..., Any], contract: Contract, *, line: str, agent_last: str,
-                    line_kind: str, kinds: Sequence[str], thread: str, timeout: float) -> Tuple[List[str], float]:
+                    line_kind: str, kinds: Sequence[str], thread: str, timeout: float,
+                    today: str = "", time_scope: str = "none") -> Written:
     """Zero to three questions from Prospecta's own ``formulate_queries``, with ``context`` the
     agent's last answer and the contract's question-writer prompt as the prompt. Raises on any
-    failure (error, bad JSON, no answer in ``timeout``); the caller has the fallback."""
+    failure (error, bad JSON, no answer in ``timeout``); the caller has the fallback. The person's
+    quoted phrases stay in the questions (told in the prompt, guaranteed by ``keep_quoted``)."""
     from prospecta._formulate import formulate_queries
     box: Dict[str, Any] = {}
 
@@ -463,22 +587,31 @@ def write_questions(llm: Callable[..., Any], contract: Contract, *, line: str, a
         if not isinstance(text, str):
             raise ValueError("the question model returned no text")
         box["questions"] = parse_questions(text)  # raises on bad JSON
+        box["reply"] = _first_object(text)
         # formulate_queries only reads {"queries": [{"text": ..}]} and logs a warning on any
         # other shape (or on zero queries); hand it a well-formed stand-in so a turn logs
         # nothing. The real questions are the ones parsed above.
         return json.dumps({"queries": [{"text": line[:80] or "-"}]})
 
-    template = "{% raw %}" + contract.writer_prompt.replace("{% endraw %}", "") + "{% endraw %}" + _WRITER_INPUT
+    template = ("{% raw %}" + contract.writer_prompt.replace("{% endraw %}", "") + "{% endraw %}"
+                + _WRITER_RULES + _WRITER_INPUT)
     run_bounded(lambda: formulate_queries(
         line, llm=writer, context=agent_last or "(none: this is the first message)",
         prompt_override=template,
         extra_context={"thread": thread or "a conversation with the person",
-                       "kinds": ", ".join(kinds) or "any", "line_kind": line_kind}), timeout)
+                       "kinds": ", ".join(kinds) or "any", "line_kind": line_kind,
+                       "today": today or "(not given)", "time_scope": time_scope}), timeout)
     if "questions" not in box:
         raise ValueError("the question model gave no questions")
     out = box.get("out")
     cost = getattr(out, "cost_usd", None)
-    return box["questions"], float(cost) if _is_number(cost) else 0.0
+    reply = box["reply"]
+    window = None
+    if time_scope == "named" and today:
+        window = valid_window(reply.get("date_from"), reply.get("date_to"), date.fromisoformat(today))
+    return Written(questions=keep_quoted(line, box["questions"]),
+                   date_from=window[0] if window else None, date_to=window[1] if window else None,
+                   cost_usd=float(cost) if _is_number(cost) else 0.0)
 
 
 def fallback_question(transport: Optional[Transport], model: str, *, line: str, agent_last: str,
@@ -488,7 +621,7 @@ def fallback_question(transport: Optional[Transport], model: str, *, line: str, 
     or a paste: a pasted text is never asked)."""
     cost = 0.0
     if agent_last and not stands_alone and transport is not None and timeout > 0.05:
-        cands = sentences(agent_last)[-RANK_POOL:]
+        cands = sentences(agent_last)[-SENTENCE_POOL:]
         if len(cands) == 1:
             return cands[0], cost
         if cands:
@@ -505,76 +638,101 @@ def fallback_question(transport: Optional[Transport], model: str, *, line: str, 
     return None, cost
 
 
-# =====================================================================  ask and rank
+# =====================================================================  ask
+
+@dataclass(frozen=True)
+class Scope:
+    """What the library's Stage 1 filters on, in SQL, before it cuts its candidates: the source
+    records the agent already has in view (excluded) and the window of the notes' dates."""
+    excluded_sources: Tuple[str, ...] = ()
+    date_from: Optional[str] = None        # YYYY-MM-DD, inclusive
+    date_to: Optional[str] = None
+
+    @property
+    def window(self) -> Optional[Tuple[str, str]]:
+        return (self.date_from, self.date_to) if self.date_from and self.date_to else None
+
 
 @dataclass
-class Entry:
-    source: str
-    date: str
-    text: str
-    key: Tuple[str, str]
-    score: Optional[float] = None
+class Found:
+    """One question's answer from the library's Stage 1 + Stage 2: the cited items, best first, and
+    whether Stage 2 graded them (False: Stage 1's own order, because Stage 2 is off or failed)."""
+    items: List[Any]
+    ranked: bool = True
 
 
 def allowed(item: Any, sources: Sequence[str]) -> bool:
     """Prospecta tells conversations (the turns it retained) from everything else. Asking only for
     conversations keeps the turns; asking for none of them leaves the turns out."""
-    is_turn = str(getattr(item, "source", "") or "").startswith(_TURN_SOURCE_PREFIX)
+    is_turn = str(getattr(item, "source", "") or "").startswith(TURN_SOURCE_PREFIX)
     wants_turns = "conversations" in sources
     wants_notes = any(s != "conversations" for s in sources)
     return wants_turns if is_turn else wants_notes
 
 
-def _norm(text: Any) -> str:
-    return " ".join(str(text or "").split())
-
-
-def _entry(item: Any, dates: Dict[int, str]) -> Entry:
-    text = getattr(item, "original_chunk", None) or getattr(item, "content", "") or ""
+def _key(item: Any) -> Tuple[str, str]:
     doc = str(getattr(item, "document_id", "") or "")
-    return Entry(source=str(getattr(item, "source", "") or ""), date=dates.get(id(item), ""), text=text,
-                 key=(doc, "") if doc else ("", text))
+    return (doc, "") if doc else ("", str(getattr(item, "original_chunk", "") or ""))
 
 
-def merge_lists(lists: Sequence[Sequence[Entry]], limit: Optional[int] = None) -> List[Entry]:
-    """Round-robin over each question's own order, one note once."""
-    out: List[Entry] = []
-    seen = set()
+def merge_lists(lists: Sequence[Sequence[Any]], limit: Optional[int] = None) -> List[Any]:
+    """Round-robin over each question's own order, one note once. A note two questions both found
+    keeps its place and the answer that has its matched words in context (``exact_snippet``): the
+    phrase asked on its own is what finds those, and the other question's hit must not hide them."""
+    out: List[Any] = []
+    at: Dict[Tuple[str, str], int] = {}
     depth = max((len(x) for x in lists), default=0)
     for i in range(depth):
         for lst in lists:
-            if i < len(lst) and lst[i].key not in seen:
-                seen.add(lst[i].key)
-                out.append(lst[i])
+            if i >= len(lst):
+                continue
+            it, key = lst[i], _key(lst[i])
+            if key not in at:
+                at[key] = len(out)
+                out.append(it)
+            elif getattr(it, "exact_snippet", None) and not getattr(out[at[key]], "exact_snippet", None):
+                out[at[key]] = it
     return out if limit is None else out[:limit]
 
 
 # =====================================================================  block
 
-def build_block(contract: Contract, questions: Sequence[str], rated: Sequence[Entry], *, more: int,
+def estimate_tokens(text: str) -> int:
+    """Token estimate for the ``max_tokens`` valve. The plugin has no tokenizer, so this is a
+    whitespace count scaled for sub-word pieces (English prose runs about 1.3 tokens per word),
+    floored by characters / 4 so that text without spaces (identifiers, paths) is not under-counted."""
+    if not text:
+        return 0
+    return max(math.ceil(len(text.split()) * 1.3), math.ceil(len(text) / 4))
+
+
+def cited_entries(items: Sequence[Any]) -> str:
+    """The library's own cited evidence: for each item, in order, ``[n] source=... | date=... |
+    kind=... | match=...``, an ``Exact match snippet:`` line when a lexical retriever fired, then the
+    whole chunk. Imported when used, so an older library fails this turn (never the plugin's load)."""
+    from prospecta.cited import format_cited_rag_block
+    return format_cited_rag_block(list(items), heading=None)
+
+
+def build_block(contract: Contract, questions: Sequence[str], items: Sequence[Any], *, more: int,
                 notes: Sequence[str], max_tokens: int = 0) -> Tuple[str, int]:
-    """The labelled markdown block and the number of entries in it. ``rated`` are whole entries in
-    the order to show; with ``max_tokens`` > 0 an entry that does not fit is left out whole, never cut."""
-    head = [contract.intro, ""] + [contract.line("asked", question=q) for q in questions]
-    for note in notes:
-        head.append(note)
-    parts: List[str] = []
-    shown = 0
+    """The labelled markdown block and the number of entries in it: the contract's opening paragraph,
+    the ``Asked:`` lines, any notes, then the library's cited entries. ``items`` are whole entries in
+    the order to show; with ``max_tokens`` > 0 an entry that does not fit is left out whole, never cut
+    (the entries that are kept are numbered 1..n)."""
+    head = "\n".join([contract.intro, ""] + [contract.line("asked", question=q) for q in questions]
+                     + list(notes))
+    kept: List[Any] = []
     left_out = 0
-    for e in rated:
-        label = ""
-        if e.score is not None:
-            label = " | rated: " + contract.line("rated-3" if e.score >= 3 else "rated-2")
-        part = f"[source: {e.source or 'unknown'} | date: {e.date or 'undated'}{label}]\n{e.text}"
-        if max_tokens > 0 and _rf.estimate_tokens("\n\n".join(head + parts + [part])) > max_tokens:
+    for it in items:
+        if max_tokens > 0 and estimate_tokens(head + "\n\n" + cited_entries(kept + [it])) > max_tokens:
             left_out += 1
             continue
-        parts.append(part)
-        shown += 1
-    tail = []
+        kept.append(it)
+    parts = [head] + ([cited_entries(kept)] if kept else [])
     if more + left_out > 0:
-        tail.append(contract.line("more", n=more + left_out))
-    return "\n\n".join(["\n".join(head)] + parts + tail), shown
+        parts.append(contract.line("more", n=more + left_out))
+    return "\n\n".join(parts), len(kept)
 
 
 # =====================================================================  the run
@@ -594,6 +752,10 @@ class Brief:
     stages_ms: Dict[str, int] = field(default_factory=dict)
     reason: str = ""
     ahead_used: bool = False
+    time_scope: str = "none"
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    ranked: bool = True             # Stage 2 graded what was injected (False: Stage 1's own order)
 
 
 @dataclass
@@ -616,32 +778,21 @@ def looks_like_proposal(agent_last: str) -> bool:
 @dataclass
 class Deps:
     """Everything the run needs from outside. The provider builds it; tests pass fakes."""
-    search: Callable[[str], List[Any]]               # one question -> fused items (the plugin's lanes)
-    dates: Callable[[List[Any]], Dict[int, str]]     # items -> {id(item): 'YYYY-MM-DD'}
+    search: Callable[[str, Scope], Found]            # one question -> the library's Stage 1 + Stage 2 answer
     transport: Optional[Transport] = None            # Jev (System One); None = unavailable
     writer_llm: Optional[Callable[..., Any]] = None  # the small text model; None = unavailable
     clock: Callable[[], float] = time.monotonic
+    today: Callable[[], date] = date.today           # the calendar day the time scope counts back from
 
 
 class _Run:
-    def __init__(self, deps: Deps, settings: Settings, contract: Contract, started: float) -> None:
+    def __init__(self, deps: Deps, settings: Settings, contract: Contract, started: float,
+                 excluded: Sequence[str] = ()) -> None:
         self.deps, self.s, self.c = deps, settings, contract
         self.deadline = started + settings.deadline_s
         self.brief = Brief()
-        self.session_id = ""
-        self.echoes: Tuple[str, ...] = ()
-
-    def is_echo(self, e: "Entry") -> bool:
-        """A retained turn of the current session whose text is, or holds, one of the texts the
-        agent already has in view (its last answer, its last two turns). Never raises."""
-        try:
-            if not self.echoes or not self.session_id or not e.source.startswith(
-                    f"{_TURN_SOURCE_PREFIX}{self.session_id}:"):
-                return False
-            text = _norm(e.text)
-            return any(k in text for k in self.echoes)
-        except Exception:
-            return False
+        self.excluded: Tuple[str, ...] = tuple(excluded) if settings.drop_echoes else ()
+        self.named: Optional[Tuple[str, str]] = None     # the window the writer worked out for a named period
 
     def left(self) -> float:
         return self.deadline - self.deps.clock()
@@ -656,6 +807,12 @@ class _Run:
         finally:
             self.brief.stages_ms[name] = int((self.deps.clock() - t0) * 1000)
 
+    def today(self) -> date:
+        try:
+            return self.deps.today()
+        except Exception:
+            return date.today()
+
     # -- stages --
 
     def decide(self, line: str, agent_last: str, turns: int, thread: str) -> Decision:
@@ -665,7 +822,8 @@ class _Run:
         try:
             if t is None:
                 raise RuntimeError("no Jev transport")
-            state = build_state(line=line, agent_last=agent_last, turns=turns, thread=thread)
+            state = build_state(line=line, agent_last=agent_last, turns=turns, thread=thread,
+                                today=self.today().isoformat())
             req = decision_request(self.c, self.s.decision_model, state)
             timeout = self.budget(self.s.decision_timeout_s)
             if timeout <= 0:
@@ -680,9 +838,11 @@ class _Run:
     def questions_for(self, d: Decision, line: str, agent_last: str, sources: List[str],
                       thread: str) -> Optional[List[str]]:
         """The questions to ask, [] for none; None when no question can be made (a paste with no
-        working writer)."""
+        working writer). The person's quoted phrases are in them, verbatim. A period the line names
+        (time scope "named") is left in ``self.named``, if the writer worked one out."""
         asked_as_written = (d.by != "size" and d.line_kind in ("new_ask", "follow_up")
-                            and d.stands_alone >= NEEDS_THRESHOLD and is_plain_question(line))
+                            and d.stands_alone >= NEEDS_THRESHOLD and is_plain_question(line)
+                            and d.time_scope != "named")    # a named period needs the writer's range
         if d.by == "rule":
             asked_as_written = len(line) <= PLAIN_QUESTION_CHARS
         if asked_as_written:
@@ -694,107 +854,86 @@ class _Run:
             timeout = self.budget(self.s.writer_timeout_s)
             if timeout <= 0:
                 raise TimeoutError("no time left")
-            qs, cost = self.timed("questions", lambda: write_questions(
+            w = self.timed("questions", lambda: write_questions(
                 self.deps.writer_llm, self.c, line=line, agent_last=agent_last, line_kind=d.line_kind,
-                kinds=d.named_sources(), thread=thread, timeout=timeout))
-            self.brief.cost_usd += cost
-            return qs
+                kinds=d.named_sources(), thread=thread, timeout=timeout,
+                today=self.today().isoformat(), time_scope=d.time_scope))
+            self.brief.cost_usd += w.cost_usd
+            if w.date_from and w.date_to:
+                self.named = (w.date_from, w.date_to)
+            return w.questions
         except Exception as exc:
             logger.debug("prospecta prefetch: question writer failed (%s: %s)", type(exc).__name__, exc)
         q, cost = self.timed("questions_fallback", lambda: fallback_question(
             t, self.s.decision_model, line=line, agent_last=agent_last, stands_alone=d.stands_alone >= NEEDS_THRESHOLD,
             timeout=self.budget(self.s.decision_timeout_s), line_is_real=d.by != "ahead"))
         self.brief.cost_usd += cost
-        return [q] if q else None
+        return keep_quoted(line, [q]) if q else None
 
-    def ask(self, questions: List[str], sources: List[str]) -> Tuple[List[List[Entry]], List[str]]:
-        """Each question through the plugin's lanes at the same time. Returns each question's
-        entries and the errors of those that failed or did not answer in time."""
+    def scope(self, d: Decision) -> Scope:
+        """What Stage 1 filters on: the thread's last turns, and the window of the time scope (a
+        relative one is counted from today; a named one is the writer's, if it gave a valid one)."""
+        window = relative_window(d.time_scope, self.today()) or (self.named if d.time_scope == "named" else None)
+        return Scope(excluded_sources=self.excluded, date_from=window[0] if window else None,
+                     date_to=window[1] if window else None)
+
+    def ask(self, questions: List[str], sources: List[str], scope: Scope) -> Tuple[List[List[Any]], List[str], bool]:
+        """Each question through the library's Stage 1 + Stage 2 at the same time. Returns each
+        question's items, the errors of those that failed or did not answer in time, and whether
+        every answer was graded by Stage 2."""
         timeout = self.budget(self.s.search_timeout_s)
         ex = ThreadPoolExecutor(max_workers=max(1, len(questions)), thread_name_prefix="prospecta-ask")
-        futs = [ex.submit(self.deps.search, q) for q in questions]
+        futs = [ex.submit(self.deps.search, q, scope) for q in questions]
         done, _ = wait(futs, timeout=timeout)
         ex.shutdown(wait=False, cancel_futures=True)
-        lists: List[List[Entry]] = []
+        lists: List[List[Any]] = []
         errors: List[str] = []
+        ranked = True
         for f in futs:
             if f in done and f.exception() is None:
-                items = [it for it in (f.result() or []) if allowed(it, sources)]
-                try:
-                    dates = self.deps.dates(items) if items else {}
-                except Exception:
-                    dates = {}
-                entries = [_entry(it, dates) for it in items]
-                lists.append([e for e in entries if not self.is_echo(e)])
+                found = f.result()
+                items = [it for it in (found.items or []) if allowed(it, sources)]
+                if not found.ranked:
+                    ranked = False
+                    items = items[:FALLBACK_PAGE]
+                lists.append(items)
             else:
                 errors.append(type(f.exception()).__name__ if f in done else "timeout")
-        return lists, errors
+        return lists, errors, ranked
 
-    def rank(self, questions: List[str], pool: List[Entry]) -> Optional[List[float]]:
-        t = self.deps.transport
-        timeout = self.budget(self.s.rank_timeout_s)
-        if t is None or timeout <= 0 or not pool:
-            return None
-        query = questions[0] if len(questions) == 1 else "\n".join(f"{i}. {q}" for i, q in enumerate(questions, 1))
-        try:
-            records = [("note", f"{e.source or 'note'} ({e.date or 'undated'})", e.text) for e in pool]
-            scores, cost = self.timed("rank", lambda: run_bounded(
-                lambda: jev_score(t, self.s.decision_model, query, records, timeout), timeout))
-            self.brief.cost_usd += cost
-            return scores
-        except Exception as exc:
-            logger.debug("prospecta prefetch: no ranking (%s: %s)", type(exc).__name__, exc)
-            return None
-
-    def block(self, questions: List[str], sources: List[str], notes: List[str]) -> str:
-        lists, errors = self.timed("ask", lambda: self.ask(questions, sources))
+    def block(self, questions: List[str], sources: List[str], notes: List[str], scope: Scope) -> str:
+        lists, errors, ranked = self.timed("ask", lambda: self.ask(questions, sources, scope))
+        window = (self.c.line("window", date_from=scope.date_from, date_to=scope.date_to)
+                  if scope.window else "")
+        self.brief.date_from, self.brief.date_to = scope.date_from, scope.date_to
         if not lists:
             self.brief.reason = "the search failed" if "timeout" not in errors else "the search did not answer in time"
             return self.c.line("not-consulted", reason=self.brief.reason)
         pool = merge_lists(lists)
         if not pool:
-            return self.c.line("nothing-answers", questions=" / ".join(questions))
-        ranked_pool = pool[:RANK_POOL]
-        scores = self.rank(questions, ranked_pool)
-        if scores is None:
-            shown = merge_lists([lst[:FALLBACK_PAGE] for lst in lists])
-            text, n = build_block(self.c, questions, shown, more=0,
-                                  notes=notes + [self.c.line("search-order")], max_tokens=self.s.max_tokens)
-            self.brief.injected = n
-            return text
-        for e, sc in zip(ranked_pool, scores):
-            e.score = sc
-        good = sorted((e for e in ranked_pool if (e.score or 0) >= RATE_THRESHOLD),
-                      key=lambda e: -(e.score or 0))   # stable: ties keep the search's order
-        more = len(pool) - len(good)
-        if not good:
-            self.brief.injected = 0
-            return self.c.line("nothing-answers", questions=" / ".join(questions))
-        text, n = build_block(self.c, questions, good, more=more, notes=notes, max_tokens=self.s.max_tokens)
+            nothing = self.c.line("nothing-answers", questions=" / ".join(questions))
+            return f"{nothing} {window}" if window else nothing
+        self.brief.ranked = ranked
+        extra = ([] if ranked else [self.c.line("search-order")]) + ([window] if window else [])
+        text, n = build_block(self.c, questions, pool, more=0, notes=notes + extra, max_tokens=self.s.max_tokens)
         self.brief.injected = n
         return text
 
 
 def run_contract(line: str, *, agent_last: str, turns: int, deps: Deps, settings: Settings,
                  contract: Contract, thread: str = "", ahead: Optional[AheadEntry] = None,
-                 started: Optional[float] = None, session_id: str = "",
-                 echoes: Sequence[str] = ()) -> Brief:
-    """One turn: gate, decide, questions, ask, rank, block. Never raises for a stage failing; the
-    caller still wraps it (``prefetch``)."""
-    run = _Run(deps, settings, contract, deps.clock() if started is None else started)
-    if settings.drop_echoes:
-        run.session_id = session_id or ""
-        # a short last answer ("Done.") would match any older turn that holds those words: below
-        # ECHO_MIN_ANSWER_CHARS only the two whole turns count
-        last = _norm(agent_last)
-        run.echoes = tuple(k for k in [*(_norm(x) for x in echoes), last if len(last) >= ECHO_MIN_ANSWER_CHARS else ""] if k)
+                 started: Optional[float] = None, excluded_sources: Sequence[str] = ()) -> Brief:
+    """One turn: gate, decide (needs memory? which period?), questions, ask, block. ``excluded_sources``
+    are the records of the thread's own last turns, which the search leaves out. Never raises for a
+    stage failing; the caller still wraps it (``prefetch``)."""
+    run = _Run(deps, settings, contract, deps.clock() if started is None else started, excluded_sources)
     b = run.brief
     verdict, line = gate(line)
     if verdict == "skip":
         b.reason = line
         return b
     d = run.decide(line, agent_last, turns, thread)
-    b.line_kind, b.needs_memory, b.sources = d.line_kind, d.needs_memory, d.sources()
+    b.line_kind, b.needs_memory, b.sources, b.time_scope = d.line_kind, d.needs_memory, d.sources(), d.time_scope
     b.decision = "fallback" if d.by == "rule" else "zero"
     if d.line_kind == "social" or d.needs_memory < NEEDS_THRESHOLD:
         b.reason = "no need" if d.by != "rule" else "a reply of a few words"
@@ -816,24 +955,26 @@ def run_contract(line: str, *, agent_last: str, turns: int, deps: Deps, settings
     if not questions:
         b.decision, b.reason, b.sources = "zero", "the writer found nothing outside the thread", []
         return b
+    questions = with_phrase_queries(line, questions)
     b.questions = questions
-    b.text = run.block(questions, b.sources, notes)
+    b.text = run.block(questions, b.sources, notes, run.scope(d))
     return b
 
 
 def run_ahead(agent_last: str, *, deps: Deps, settings: Settings, contract: Contract,
-              thread: str = "", started: Optional[float] = None) -> Optional[AheadEntry]:
+              thread: str = "", started: Optional[float] = None,
+              excluded_sources: Sequence[str] = ()) -> Optional[AheadEntry]:
     """Prepare the block the agent's own proposal will need, while the person answers. Only when
     the agent ended on a proposal; no decision (nobody has replied yet). None when there is nothing."""
     if not looks_like_proposal(agent_last) or len(agent_last) > MAX_LINE_CHARS:
         return None
-    run = _Run(deps, settings, contract, deps.clock() if started is None else started)
+    run = _Run(deps, settings, contract, deps.clock() if started is None else started, excluded_sources)
     d = Decision(line_kind="go_ahead", needs_memory=1.0, stands_alone=0.0, by="ahead")
     qs = run.questions_for(d, "(the person has not replied yet; prepare for the reply)", agent_last,
                            list(ALL_SOURCES), thread)
     if not qs:
         return None
-    text = run.block(qs, list(ALL_SOURCES), [])
+    text = run.block(qs, list(ALL_SOURCES), [], run.scope(d))
     if run.brief.reason or not run.brief.injected:   # not consulted, or nothing answers: nothing to keep
         return None
     return AheadEntry(key=ahead_key(agent_last), text=text, at=deps.clock())

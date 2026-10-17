@@ -1,4 +1,4 @@
-"""Prospecta sync_turn should not drop turns when no LLM is configured."""
+"""sync_turn writes the turn as chunks with no model call, so it keeps every turn with no LLM configured."""
 from __future__ import annotations
 
 import time
@@ -6,7 +6,7 @@ import time
 from tests.conftest import stub_embed
 
 
-def test_sync_turn_without_llm_uses_turn_text_as_index_text(
+def test_sync_turn_without_llm_keeps_the_turn_as_searchable_chunks(
     plugin_module, pg_url, hermes_home, monkeypatch
 ):
     monkeypatch.setenv("PROSPECTA_DATABASE_URL", pg_url)

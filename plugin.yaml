@@ -1,6 +1,6 @@
 name: prospecta
 version: 0.1.0
-description: "Bilateral prospective synthesis memory — questions-on-questions retrieval with three-channel RRF fusion."
+description: "Hybrid search and RAG memory on Postgres: notes written as chunks with no model call, Stage 1 hybrid retrieval + Stage 2 cross-encoder rerank, every hit cited."
 pip_dependencies:
   - "prospecta>=0.1.0"
 hooks:

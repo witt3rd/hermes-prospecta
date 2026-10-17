@@ -11,11 +11,14 @@ license = { text = "MIT" }
 authors = [{ name = "Forge ⚒️", email = "forge@witt3rd.com" }]
 requires-python = ">=3.11"
 dependencies = [
-    # Pinned to main@edefe3e (schema migration 0003, env-selectable embedder); the
-    # v0.1.0 tag predates both (the live bank DB is already at schema version 3).
+    # Pinned to main@c52a126: the hybrid search and RAG library (Stage 1 hybrid_chunk, Stage 2
+    # cross_encoder, cited evidence, excluded_sources / date_from / date_to on search, ask() with the
+    # Stage 3 gate, chunk-only retain() that stamps created_on). The pin that came before it was
+    # e863ac1 (schema migration 0003, env-selectable embedder). The live bank DB migrates on
+    # initialize (run_migrations).
     # [defaults] = LiteLLM (LLM + default embedder); [embed-sentence-transformers]
     # is declared here, not optional, so a venv rebuild cannot drop the local embedder.
-    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@e863ac1c7a8f291205564d24b1aa039d6c70df80",
+    "prospecta[defaults,embed-sentence-transformers] @ git+https://github.com/witt3rd/prospecta.git@c52a126e5fc08e495ac94e8a48e636bdbd24a8ef",
     "psycopg[binary]>=3.1",
 ]
 
@@ -29,7 +32,7 @@ hermes-prospecta-fill-note-dates = "fill_note_dates:main"
 test = ["pytest>=7", "testcontainers[postgres]>=4", "psycopg[binary]>=3.1"]
 
 [tool.setuptools]
-py-modules = ["__init__", "cli", "health", "importer", "backup", "fill_note_dates", "recall_fusion", "date_cue_gate", "prefetch_contract"]
+py-modules = ["__init__", "cli", "health", "importer", "backup", "fill_note_dates", "abstention", "date_cue_gate", "prefetch_contract"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

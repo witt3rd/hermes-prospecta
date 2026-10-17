@@ -47,10 +47,10 @@ def test_handle_search_returns_chunks(provider_with_stubs):
         {"query": "France", "mode": "hybrid", "limit": 5},
     )
     data = json.loads(result)
-    assert "France" in data["block"]   # one block of the note text
-    assert data["entries"] == len(data["sources"]) >= 1
-    for item in data["sources"]:
-        assert "source" in item and "date" in item
+    assert data["count"] == len(data["results"]) >= 1
+    assert any("France" in item["text"] for item in data["results"])     # the whole chunk
+    for item in data["results"]:                                         # every hit is cited
+        assert {"source", "created_on", "kind", "match_kind", "relevance_score", "exact_snippet"} <= set(item)
 
 
 def test_unknown_tool_returns_error(provider_with_stubs):

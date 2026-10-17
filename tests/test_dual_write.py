@@ -66,7 +66,7 @@ class FakeMemory:
 def _provider(plugin_module, tmp_path, *, dual=True, linked=False, second=None, main=None):
     p = plugin_module.ProspectaProvider()
     p._memory = main or FakeMemory()
-    p._llm = None  # no-LLM mode: sync_turn supplies its own index_text
+    p._llm = None  # no model: a turn is written as chunks with no model call either way
     p._hermes_home = tmp_path
     p._linked_writes = linked
     p.retry = tmp_path / "retry.jsonl"
