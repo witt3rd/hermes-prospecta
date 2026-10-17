@@ -37,8 +37,8 @@ def test_handle_recall_returns_synthesis(provider_with_stubs):
 
 
 def test_handle_search_returns_chunks(provider_with_stubs):
-    provider_with_stubs._memory.retain(
-        content="The capital of France is Paris.",
+    provider_with_stubs._retain(               # as the tool writes it: Stage 1 reads chunk items only
+        "The capital of France is Paris.",
         source="fact:france",
         index_text=["What is the capital of France?"],
     )

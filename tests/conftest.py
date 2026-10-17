@@ -265,6 +265,9 @@ def hybrid_bank(plugin_module, pg_url, hermes_home, monkeypatch):
         if hybrid:
             p._memory.set_channel_config([{"name": "hybrid_chunk", "weight": 1}])
             p._memory.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
+        else:   # a bank created fresh is hybrid since library PR 86 (bank_defaults): "without the channel" must be made legacy
+            p._memory.set_channel_config([])
+            p._memory.set_recall_config({})
         p.rerank = rerank if rerank is not None else FakeRerank()
         p._memory._rerank_transport = p.rerank
         made.append(p)
