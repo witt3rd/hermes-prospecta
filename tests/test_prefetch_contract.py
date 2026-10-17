@@ -150,6 +150,32 @@ def test_bundled_contract_loads_with_the_designs_words():
     assert c.questions["needs_memory"]["criteria"]["true"] == "Something it needs is outside what it has."
 
 
+def test_the_time_scope_is_the_memorys_period_not_the_requests():
+    """The question asks for a window ONLY when the line limits the MEMORY it asks about to a past period; a
+    relative period that only modifies the request ("this week's theme") is no window; doubt is no window. The
+    five choices and the set of questions are unchanged (the single owner of the wording is the contract file)."""
+    c = pc.load_contract()
+    q = c.questions["time_scope"]
+    assert q["type"] == "choice" and tuple(q["criteria"]) == pc.TIME_SCOPES == (
+        "none", "recent", "past_week", "past_month", "past_year", "named")
+    text = (q["instructions"] + " " + " ".join(q["criteria"].values())).lower()
+    assert "modifies the request" in text                  # the rule: a period of the request is not the memory's
+    assert "this week's" in text and "tonight" in text and "next week" in text     # what that looks like
+    assert "worthless" in text                             # a window only when older notes would be useless
+    assert "older notes could also answer" in text         # ... and none when they could still answer
+    assert "when in doubt: none" in text                   # the plain rule
+    assert "when in doubt: none" in q["criteria"]["none"].lower()   # ... also where the model picks its answer
+    for scope in ("recent", "past_week", "past_month", "past_year"):
+        assert "happened" in q["criteria"][scope].lower()  # a window states what the MEMORY is about
+    assert "limit what it asks about" not in q["instructions"]     # the old, misleading question
+
+
+def test_the_wording_of_the_time_scope_lives_in_the_contract_only():
+    """No second copy of the question's words in the code (the code only reads the answer)."""
+    code = (pc.DEFAULT_CONTRACT_PATH.parent.parent / "prefetch_contract.py").read_text()
+    assert "modifies the request" not in code and "when in doubt" not in code.lower()
+
+
 def test_the_contract_has_no_question_writer_prompt_any_more():
     """The library's writer owns the prompt for the searches (prospecta/prompts/expand-searches.md)."""
     assert not hasattr(pc.load_contract(), "writer_prompt")

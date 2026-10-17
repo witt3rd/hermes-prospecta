@@ -269,7 +269,12 @@ Per message, before the turn:
    **`time_scope`** gives every search a window of dates (the notes' dates, inclusive,
    counted back from today): `recent` (today and yesterday), `past_week` (7 days),
    `past_month` (31), `past_year` (366) or `none`. It is passed as `date_from` / `date_to`, so
-   every search that names no period of its own carries it. A period the line **names** ("in
+   every search that names no period of its own carries it. The window is the period of the
+   **memory** the line asks about (what happened, was said or was done then, so older notes would be
+   worthless); a relative period that only says when the **request** happens ("this week's theme",
+   tonight, next week) is `none`, and so is doubt. The wording is the contract's own; to measure how the
+   model answers it, run `tools/time_scope_panel.py` (see "Measuring the time scope" below).
+   A period the line **names** ("in
    July", "March 2025") is `named`: the decision model cannot turn it into dates, so no window
    is passed and the library's writer dates the search that names it (its own `date_from` /
    `date_to`; the other searches stay open). The block says when a window applied ("Only notes
@@ -382,6 +387,14 @@ the block lists the **searches** that ran (and the library's cite-`[n]` line) in
 are gone (the library says how many records its token valve left out). Everything else is code:
 the gate, the 0.5 threshold, the parallel searches (the library's), the deadline and every
 fallback.
+
+**Measuring the time scope.** `tests/data/time_scope_panel.json` is a panel of invented lines: half
+where a relative period only modifies the request (expected `none`), half where the line limits the
+memory to a past period (expected `recent`, `past_week`, `past_month`, `past_year` or `named`).
+`python tools/time_scope_panel.py CONTRACT [CONTRACT_AFTER] [--runs 3]` sends each line (3 times) through
+the real decision transport with `OPENROUTER_API_KEY` from the environment (never printed) and prints
+the answers per line and the agreement per class; with two contract files it prints before and after
+(`git show origin/main:contract/recall-contract-v1.md > /tmp/before.md`).
 
 ## Shadow reads
 
