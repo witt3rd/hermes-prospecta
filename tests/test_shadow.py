@@ -103,7 +103,7 @@ def test_off_by_default_changes_nothing(plugin_module, monkeypatch):
     assert p._shadow is None and p._resolve_shadow_bank_id() == ""
     p._memory, p._llm = OldMemory(), object()
     out = json.loads(p.handle_tool_call("prospecta_search", {"query": "x"}))
-    assert [r["source"] for r in out["sources"]] == ["a", "b"]
+    assert [r["source"] for r in out["results"]] == ["a", "b"]
     assert p._memory.events == []
     p._start_shadow(OLD)  # nothing configured -> still off
     assert p._shadow is None
@@ -200,7 +200,7 @@ def test_tracer_failure_is_contained(plugin_module, caplog):
     p._memory._tracer = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down"))
     got = p.handle_tool_call("prospecta_search", {"query": "x"})
     _drain(p)
-    assert json.loads(got)["sources"]
+    assert json.loads(got)["results"]
     assert "db down" in caplog.text
 
 
@@ -296,7 +296,7 @@ def test_pair_is_stored_in_recall_events(plugin_module, pg_url, hermes_home, mon
             "(SELECT id::text FROM documents WHERE bank_id = 'live')) WHERE bank_id = 'live_v2'")
 
     got = json.loads(p.handle_tool_call("prospecta_search", {"query": "quick brown fox"}))
-    assert got["sources"][0]["source"] == "fox.md"
+    assert got["results"][0]["source"] == "fox.md"
     p.shutdown()  # drains the shadow worker before closing
     new_mem.shutdown()
 

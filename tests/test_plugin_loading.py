@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SUBMODULES = ["health", "backup", "cli", "importer", "recall_fusion"]
+SUBMODULES = ["health", "backup", "cli", "importer", "abstention"]
 
 
 def _load_like_hermes(plugin_dir: Path, name: str):

@@ -8,6 +8,7 @@ collide with the tests package.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -67,6 +68,18 @@ def _load_plugin_module():
 @pytest.fixture(scope="session")
 def plugin_module():
     return _load_plugin_module()
+
+
+@pytest.fixture(autouse=True)
+def _restore_timezone_env():
+    """``initialize`` hands the profile's zone to the library as PROSPECTA_TIMEZONE (process-wide):
+    leave no test's value behind for the next."""
+    before = os.environ.get("PROSPECTA_TIMEZONE")
+    yield
+    if before is None:
+        os.environ.pop("PROSPECTA_TIMEZONE", None)
+    else:
+        os.environ["PROSPECTA_TIMEZONE"] = before
 
 
 # ---------------------------------------------------------------------------
@@ -187,3 +200,74 @@ def provider_with_stubs(plugin_module, mock_ctx, pg_url, hermes_home, monkeypatc
     provider.initialize(session_id="test-session", hermes_home=str(hermes_home))
     yield provider
     provider.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# A real bank on the library's hybrid search (Stage 1 + Stage 2), offline
+# ---------------------------------------------------------------------------
+
+class FakeRerank:
+    """OpenRouter's rerank endpoint, offline: the wire shape the library sends and reads
+    (``{model, query, documents, top_n}`` -> ``{results: [{index, relevance_score}], usage}``). A
+    document's score is the share of the query's words it holds (0..1)."""
+
+    def __init__(self, fail=None):
+        self.requests, self.fail = [], fail
+
+    def __call__(self, request, timeout):
+        self.requests.append(request)
+        if self.fail:
+            raise self.fail
+        query = set(re.findall(r"\w+", request["query"].split("Query:", 1)[-1].lower()))
+        results = []
+        for i, doc in enumerate(request["documents"]):
+            words = set(re.findall(r"\w+", doc.lower()))
+            results.append({"index": i, "relevance_score": round(len(query & words) / max(len(query), 1), 3)})
+        return {"model": request["model"], "results": results, "usage": {"total_tokens": 7, "cost": 0.0001}}
+
+
+class CountingLLM:
+    """A stub text model that counts its calls (retain must make none)."""
+
+    def __init__(self, queries=("q",)):
+        self.calls, self.queries = 0, queries
+
+    def __call__(self, messages, *, json_mode=False, **kw):
+        self.calls += 1
+        if json_mode:
+            return json.dumps({"queries": [{"text": q} for q in self.queries]})
+        return "A synthesised answer."
+
+
+@pytest.fixture
+def hybrid_bank(plugin_module, pg_url, hermes_home, monkeypatch):
+    """Factory: an initialised provider on a fresh Postgres whose bank has the ``hybrid_chunk`` channel
+    and the ``cross_encoder`` rerank over a FakeRerank (``p.rerank``). Shut down at the end."""
+    made = []
+
+    def build(*, config=None, rerank=None, hybrid=True, bank="hyb", llm=None):
+        for k in ("PROSPECTA_PREFETCH", "PROSPECTA_PREFETCH_MODE", "PROSPECTA_DECISION_MODEL",
+                  "PROSPECTA_RERANKER_MODEL", "PROSPECTA_QUERY_WRITER_MODEL", "PROSPECTA_RECALL_STAGE3",
+                  "PROSPECTA_TIMEZONE", "PROSPECTA_LINKED_WRITES", "PROSPECTA_DUAL_WRITE_BANK",
+                  "PROSPECTA_SHADOW_BANK"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("PROSPECTA_DATABASE_URL", pg_url)
+        monkeypatch.setenv("PROSPECTA_BANK_ID", bank)
+        cfg = {"embedding_dim": "32"}
+        cfg.update(config or {})
+        (hermes_home / "prospecta.json").write_text(json.dumps(cfg), encoding="utf-8")
+        p = plugin_module.ProspectaProvider()
+        monkeypatch.setattr(p, "_build_embedder", lambda: stub_embed)
+        monkeypatch.setattr(p, "_build_llm", lambda: llm)
+        p.initialize(session_id="s1", hermes_home=str(hermes_home))
+        if hybrid:
+            p._memory.set_channel_config([{"name": "hybrid_chunk", "weight": 1}])
+            p._memory.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
+        p.rerank = rerank if rerank is not None else FakeRerank()
+        p._memory._rerank_transport = p.rerank
+        made.append(p)
+        return p
+
+    yield build
+    for p in made:
+        p.shutdown()

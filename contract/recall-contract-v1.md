@@ -6,6 +6,15 @@ questions", "Who writes the questions, and in what words", "How the answers reac
 file at run time (`recall.prefetch.contract_path`, env `PROSPECTA_PREFETCH_CONTRACT`); to adopt a
 newer shared text, replace this file. Nothing here is code: the code only reads it.
 
+Changes since the design (hybrid architecture, Mode 1A; `docs/postgres-hybrid.md` of Prospecta):
+`jev-questions` has a ninth question, `time_scope`, which gives the search a window of dates;
+the block's entries are the library's cited evidence (`[n] source=... | date=... | kind=... |
+match=...`, an `Exact match snippet:` line, the whole chunk) and are no longer rated by a second
+Jev call, so the two `rated-*` lines are gone; `search-order` names the reranker, not Jev; a
+`window` line says when only some dates were searched. The question-writer prompt is unchanged:
+the plugin adds its two always-on rules (keep every "quoted phrase" verbatim; give the dates of a
+named period) after it, whatever file is loaded.
+
 File format: each `## name` heading starts a section. `jev-questions` is the JSON `questions`
 object of the decision request. `question-writer-prompt` is the prompt text (in the fenced block).
 `block-intro` is the first paragraph of the block. `lines` is `key: text` lines (`{x}` marks a
@@ -85,6 +94,18 @@ design abbreviates them with "...").
       "true": "Yes.",
       "false": "No."
     }
+  },
+  "time_scope": {
+    "type": "choice",
+    "instructions": "Does `new_lines` limit what it asks about to a period of time, counted back from `today`?",
+    "criteria": {
+      "none": "No period is named or meant.",
+      "recent": "Today or yesterday.",
+      "past_week": "The last few days or the last week.",
+      "past_month": "The last few weeks or the last month.",
+      "past_year": "The last few months or the last year.",
+      "named": "A particular period that `new_lines` names: a month, a season, a year, a date or a range."
+    }
   }
 }
 ```
@@ -107,9 +128,8 @@ Background from memory, gathered for this turn. It answers the question below; i
 asked: Asked: {question}
 nothing-answers: Memory was asked: {questions}. Nothing in it answers this.
 more: {n} more matched less well.
-search-order: Jev could not rank these; they are in the search's own order.
+search-order: The reranker could not rank these; they are in the search's own order.
+window: Only notes dated {date_from} to {date_to} were searched.
 no-decision: Questions formed without the decision model.
 not-consulted: (memory was not consulted: {reason})
-rated-3: holds the answer
-rated-2: partly answers
 ```

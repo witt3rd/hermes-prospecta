@@ -1,7 +1,9 @@
-"""prospecta_search: keyword leg + keyword-first union + one token-budget block.
+"""The explicit tools on the library's hybrid search: ``prospecta_search`` and ``prospecta_recall`` return
+cited hits (source, date, kind, how it matched, relevance, the matched words in context, the whole chunk).
 
-Offline (fake Memory, fake keyword leg, invented text) except the last tests,
-which use the Postgres test container with the stub embedder.
+Offline (a fake Memory, invented text) except the last tests, which use the Postgres test container with
+the stub embedder, the real library (Stage 1 ``hybrid_chunk`` + Stage 2 ``cross_encoder`` over a fake
+rerank transport) and the plugin's real provider.
 """
 from __future__ import annotations
 
@@ -9,316 +11,200 @@ import json
 import logging
 from types import SimpleNamespace
 
+import psycopg
 import pytest
 
-import recall_fusion as rf
-from tests.conftest import stub_embed, stub_llm
+from tests.conftest import CountingLLM, FakeRerank
+
+CITED = {"n", "source", "document_id", "created_on", "kind", "match_kind", "relevance_score", "exact_snippet", "text"}
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for k in ("PROSPECTA_RECALL_FUSION", "PROSPECTA_RECALL_BLOCK_TOKENS", "PROSPECTA_RECALL_KEYWORD",
-              "PROSPECTA_RECALL_KEYWORD_UNIT", "PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB",
-              "PROSPECTA_RECALL_KEYWORD_PAUSE_MS"):
+    for k in ("PROSPECTA_RECALL_STAGE3", "PROSPECTA_RERANKER_MODEL", "PROSPECTA_DECISION_MODEL"):
         monkeypatch.delenv(k, raising=False)
 
 
-def _store_item(name, text=None, date=None, doc=None):
-    meta = {"created_on": date} if date else {}
+def hit(name, text=None, *, day="2026-03-02", kind="note", match="semantic", snippet=None, score=0.83):
+    """A hit as the library's ``Memory.search`` returns it, with the cited-evidence fields."""
     return SimpleNamespace(
-        content=f"question about {name}", original_chunk=text or f"stored text of {name}", source=f"src-{name}",
-        score=0.5, scores={"semantic": 0.5, "lexical": 0.0, "lexical_body": 0.0, "rrf": 0.5},
-        metadata=meta, bank_id="b", document_id=doc or f"doc-{name}")
-
-
-def _kw_hit(name, text=None, date="2026-02-02"):
-    t = text or f"keyword text of {name}"
-    return rf.KeywordHit(content=t, original_chunk=t, source=f"src-{name}", score=3.0, scores={"bm25": 3.0},
-                         metadata={}, bank_id="b", document_id=f"doc-{name}", created_on=date)
+        content=f"content of {name}", original_chunk=text or f"stored text of {name}", source=f"note:{name}",
+        score=0.0164, scores={"rrf": 0.0164}, metadata={}, bank_id="b", document_id=f"doc-{name}",
+        created_on=day, kind=kind, match_kind=match, relevance_score=score, exact_snippet=snippet)
 
 
 class FakeMemory:
-    def __init__(self, items):
-        self.items = list(items)
-        self.calls = []
+    def __init__(self, items=(), ranked=True, lexical=0):
+        self.items, self.ranked, self.lexical = list(items), ranked, lexical
+        self.calls, self.asked = [], []
 
     def search(self, q, **kw):
         self.calls.append((q, kw))
+        if kw.get("mode") == "lexical":
+            return [object()] * self.lexical
+        if kw.get("_trace") is not None:
+            kw["_trace"].append({"rerank": {"fallback_reason": None} if self.ranked else None})
         return list(self.items[: kw.get("limit", 10)])
+
+    def recall_synth(self, q, **kw):
+        self.calls.append((q, {"synth": True, **kw}))
+        return SimpleNamespace(synthesis="The roof is to be replaced.", sources=self.items,
+                               queries=[SimpleNamespace(text=q)])
+
+    def ask(self, q, **kw):
+        self.asked.append((q, kw))
+        return SimpleNamespace(
+            answer="The roof is to be replaced in June [1].", rendered="The roof is to be replaced in June [1].\n\nSources:\n[1] ...",
+            citations=[{"n": 1, "known": True, "source": "note:roof", "created_on": "2026-03-02", "snippet": "s",
+                        "exact_snippet": None}], items=self.items, sufficient=True, retried=False,
+            gate={"score": 0.9, "threshold": 0.7, "model": "typesafe/jev-1.14"})
 
     def _tracer(self, *a, **k):
         pass
 
 
-class FakeLeg:
-    def __init__(self, hits=(), status="ok", unit="chunk", docs=None):
-        self.hits, self.status, self.calls = list(hits), status, []
-        self.unit, self.docs = unit, dict(docs or {})
-
-    def documents(self, ids):
-        return {i: self.docs[i] for i in ids if i in self.docs}
-
-    def search(self, q, limit):
-        self.calls.append((q, limit))
-        return self.status, list(self.hits)[:limit]
-
-    def stop(self):
-        pass
-
-
-def _p(plugin_module, store=(), kw=None, config=None):
+def _p(plugin_module, items=(), config=None, **kw):
     p = plugin_module.ProspectaProvider()
     p._config = dict(config or {})
-    p._memory = FakeMemory(store)
-    p._keyword = kw
+    p._memory = FakeMemory(items, **kw)
+    p._llm = object()
     return p
 
 
-def _search(p, **args):
-    return json.loads(p.handle_tool_call("prospecta_search", {"query": "q", **args}))
+def _call(p, tool="prospecta_search", **args):
+    return json.loads(p.handle_tool_call(tool, {"query": "q", **args}))
 
 
-# ---- settings ----
+# ---- prospecta_search: every hit is cited ----
 
-def test_defaults_are_union_1500_keyword_on(plugin_module):
+def test_every_hit_carries_its_citation_fields_and_the_matched_words(plugin_module):
+    p = _p(plugin_module, [
+        hit("a", day="2026-03-02", match="exact+semantic", snippet="the <<roof>> failed", score=0.91),
+        hit("b", day="2026-04-01", kind="conversation", match="semantic"),
+        hit("c", day="2026-05-09", match="lexical", snippet="a <<leak>> in the roof")])
+    out = _call(p)
+    assert out["count"] == 3 and out["reranked"] is True
+    assert all(set(r) == CITED for r in out["results"])
+    a, b, c = out["results"]
+    assert (a["n"], a["source"], a["created_on"], a["kind"], a["match_kind"], a["relevance_score"]) == (
+        1, "note:a", "2026-03-02", "note", "exact+semantic", 0.91)
+    assert a["exact_snippet"] == "the <<roof>> failed" and a["text"] == "stored text of a"
+    assert b["exact_snippet"] is None and b["kind"] == "conversation" and c["match_kind"] == "lexical"
+    assert [r["n"] for r in out["results"]] == [1, 2, 3]
+
+
+def test_a_hit_with_no_citation_fields_still_answers_with_nulls(plugin_module):
+    legacy = SimpleNamespace(content="old content", original_chunk="old chunk", source="note:old", score=0.4,
+                             scores={}, metadata={}, bank_id="b", document_id="doc-old")
+    (r,) = _call(_p(plugin_module, [legacy]))["results"]
+    assert set(r) == CITED and r["created_on"] is None and r["kind"] is None and r["match_kind"] is None
+    assert r["relevance_score"] is None and r["exact_snippet"] is None and r["text"] == "old chunk"
+
+
+def test_search_says_whether_stage_2_graded_the_hits(plugin_module):
+    assert _call(_p(plugin_module, [hit("a")], ranked=True))["reranked"] is True
+    assert _call(_p(plugin_module, [hit("a")], ranked=False))["reranked"] is False
+
+
+def test_search_passes_mode_limit_depth_and_a_validated_date_window(plugin_module):
+    p = _p(plugin_module, [hit("a")])
+    _call(p, mode="hybrid", limit=7, depth="deep", date_from="2026-07-01", date_to=" 2026-07-31 ")
+    (q, kw), = p._memory.calls
+    assert q == "q" and kw["mode"] == "hybrid" and kw["limit"] == 7 and kw["depth"] == "deep"
+    assert kw["date_from"] == "2026-07-01" and kw["date_to"] == "2026-07-31"
+    assert "excluded_sources" not in kw                         # the agent's own search leaves nothing out
+
+
+def test_search_sends_no_date_arguments_unless_given(plugin_module):
+    p = _p(plugin_module, [hit("a")])
+    _call(p)
+    _call(p, date_from="2026-07-01")
+    first, second = (kw for _, kw in p._memory.calls)
+    assert "date_from" not in first and "date_to" not in first
+    assert second["date_from"] == "2026-07-01" and "date_to" not in second
+
+
+@pytest.mark.parametrize("bad", ["July", "2026-13-01", "yesterday", "2026/07/01", 5])
+def test_a_bad_date_is_an_error_the_agent_can_read(plugin_module, bad):
+    p = _p(plugin_module, [hit("a")])
+    out = _call(p, date_to=bad)
+    assert out == {"error": "date_to must be a date, YYYY-MM-DD"} and not p._memory.calls
+
+
+def test_a_search_failure_is_an_error_not_a_crash(plugin_module):
+    p = _p(plugin_module, [hit("a")])
+    p._memory.search = lambda *a, **k: (_ for _ in ()).throw(ValueError("date_from, date_to and excluded_sources need the hybrid_chunk channel"))
+    assert "hybrid_chunk" in _call(p, date_from="2026-07-01")["error"]
+
+
+def test_the_search_schema_and_guide_name_the_citation_fields_and_the_window(plugin_module):
     p = plugin_module.ProspectaProvider()
-    assert p._recall_fusion() == "keyword_first_union"
-    assert p._recall_block_tokens() == 1500
-    assert p._recall_keyword_enabled() is True
+    schemas = {s["name"]: s for s in p.get_tool_schemas()}
+    props = schemas["prospecta_search"]["parameters"]["properties"]
+    assert {"query", "mode", "limit", "depth", "date_from", "date_to"} <= set(props)
+    assert "exact_snippet" in schemas["prospecta_search"]["description"]
+    assert "date_from" not in schemas["prospecta_recall"]["parameters"]["properties"]
+    assert "chunks, with no model call" in schemas["prospecta_retain"]["description"].replace("\n", " ")
+    guide = plugin_module._TOOL_GUIDE
+    assert "exact_snippet" in guide and "date_from / date_to" in guide and "keyword" not in guide.lower()
 
 
-def test_settings_from_nested_and_dotted_config_and_env(plugin_module, monkeypatch):
+# ---- prospecta_recall: the synthesis path, and ask() with Stage 3 only when the profile enables it ----
+
+def test_recall_defaults_to_the_synthesis_path_with_cited_sources(plugin_module):
+    p = _p(plugin_module, [hit("a", match="exact+semantic", snippet="the <<roof>> failed")])
+    out = _call(p, "prospecta_recall", limit=4, depth="deep")
+    assert out["synthesis"] == "The roof is to be replaced." and not p._memory.asked
+    (src,) = out["sources"]
+    assert src["source"] == "note:a" and src["created_on"] == "2026-03-02" and src["kind"] == "note"
+    assert src["match_kind"] == "exact+semantic" and src["exact_snippet"] == "the <<roof>> failed"
+    assert src["relevance_score"] == 0.83 and src["rank"] == 1 and src["rrf_score"] == 0.0164
+    assert "text" not in src                                       # the answer already read it
+    assert p._memory.calls[0][1]["limit"] == 4 and p._memory.calls[0][1]["depth"] == "deep"
+
+
+def test_stage_3_is_off_by_default_and_read_from_config_or_env(plugin_module, monkeypatch):
     p = plugin_module.ProspectaProvider()
-    p._config = {"recall": {"fusion": "store", "block_tokens": 800, "keyword": False}}
-    assert (p._recall_fusion(), p._recall_block_tokens(), p._recall_keyword_enabled()) == ("store", 800, False)
-    p._config = {"recall.fusion": "store", "recall.block_tokens": "0", "recall.keyword": "false"}
-    assert (p._recall_fusion(), p._recall_block_tokens(), p._recall_keyword_enabled()) == ("store", 0, False)
-    monkeypatch.setenv("PROSPECTA_RECALL_FUSION", "keyword_first_union")
-    monkeypatch.setenv("PROSPECTA_RECALL_BLOCK_TOKENS", "300")
-    monkeypatch.setenv("PROSPECTA_RECALL_KEYWORD", "on")
-    assert (p._recall_fusion(), p._recall_block_tokens(), p._recall_keyword_enabled()) == (
-        "keyword_first_union", 300, True)
+    assert p._recall_stage3() is False
+    p._config = {"recall.stage3": "true"}
+    assert p._recall_stage3() is True
+    p._config = {"recall": {"stage3": "on"}}
+    assert p._recall_stage3() is True
+    p._config = {"recall": {"stage3": "nonsense"}}
+    assert p._recall_stage3() is False
+    monkeypatch.setenv("PROSPECTA_RECALL_STAGE3", "1")
+    assert p._recall_stage3() is True
+    assert "recall.stage3" in {f["key"] for f in p.get_config_schema()}
 
 
-def test_bad_settings_fall_back_to_defaults_loudly(plugin_module, caplog):
+def test_recall_uses_ask_with_the_stage_3_gate_only_when_the_profile_enables_it(plugin_module):
+    p = _p(plugin_module, [hit("roof", "The roof is to be replaced in June.")], config={"recall": {"stage3": "true"}})
+    out = _call(p, "prospecta_recall", limit=6, depth="deep")
+    (q, kw), = p._memory.asked
+    assert q == "q" and kw == {"limit": 6, "sufficiency": True, "depth": "deep"}
+    assert not any(kw.get("synth") for _, kw in p._memory.calls)    # recall_synth did not run
+    assert out["answer"] == "The roof is to be replaced in June [1]." and out["synthesis"].endswith("[1] ...")
+    assert out["citations"][0]["source"] == "note:roof" and out["sufficient"] is True and out["retried"] is False
+    assert out["gate"]["threshold"] == 0.7
+    (src,) = out["sources"]
+    assert src["source"] == "note:roof" and src["relevance_score"] == 0.83 and "text" not in src
+
+
+def test_recall_still_needs_an_llm(plugin_module):
+    p = _p(plugin_module, [hit("a")])
+    p._llm = None
+    assert "PROSPECTA_LLM_MODEL" in _call(p, "prospecta_recall")["error"]
+
+
+def test_the_stage_2_and_3_arguments_the_provider_gives_memory(plugin_module, monkeypatch):
     p = plugin_module.ProspectaProvider()
-    p._config = {"recall": {"fusion": "rrf++", "block_tokens": "lots"}}
-    with caplog.at_level(logging.WARNING):
-        assert p._recall_fusion() == "keyword_first_union"
-        assert p._recall_block_tokens() == 1500
-    assert "rrf++" in caplog.text and "lots" in caplog.text
-    p._config = {"recall": {"block_tokens": -5}}
-    assert p._recall_block_tokens() == 1500
-
-
-def test_keyword_unit_and_index_options(plugin_module, monkeypatch, caplog):
-    p = plugin_module.ProspectaProvider()
-    assert p._recall_keyword_unit() == "documents"
-    assert p._recall_float("PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB", "keyword_index_warn_mb", 0.0) == 0.0
-    p._config = {"recall": {"keyword_unit": "chunks", "keyword_index_warn_mb": 300, "keyword_batch_pause_ms": 0}}
-    assert p._recall_keyword_unit() == "chunks"
-    assert p._recall_float("PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB", "keyword_index_warn_mb", 0.0) == 300.0
-    assert p._recall_float("PROSPECTA_RECALL_KEYWORD_PAUSE_MS", "keyword_batch_pause_ms", 50.0) == 0.0
-    monkeypatch.setenv("PROSPECTA_RECALL_KEYWORD_UNIT", "documents")
-    assert p._recall_keyword_unit() == "documents"
-    p._config = {"recall": {"keyword_unit": "paragraphs", "keyword_index_warn_mb": "lots"}}
-    monkeypatch.delenv("PROSPECTA_RECALL_KEYWORD_UNIT")
-    with caplog.at_level(logging.WARNING):
-        assert p._recall_keyword_unit() == "documents"
-        assert p._recall_float("PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB", "keyword_index_warn_mb", 0.0) == 0.0
-    assert "paragraphs" in caplog.text and "lots" in caplog.text
-
-
-def test_config_schema_lists_the_three_options(plugin_module):
-    schema = {f["key"]: f for f in plugin_module.ProspectaProvider().get_config_schema()}
-    assert schema["recall.fusion"]["default"] == "keyword_first_union"
-    assert schema["recall.fusion"]["choices"] == ["keyword_first_union", "store"]
-    assert schema["recall.block_tokens"]["default"] == "1500"
-    assert schema["recall.keyword"]["default"] == "true"
-    assert schema["recall.keyword_unit"]["default"] == "documents"
-    assert schema["recall.keyword_unit"]["choices"] == ["documents", "chunks"]
-    assert schema["recall.keyword_index_warn_mb"]["default"] == "0"
-    assert schema["recall.keyword_batch_pause_ms"]["default"] == "50"
-
-
-# ---- the block ----
-
-def test_search_returns_one_block_keyword_first_tagged_with_source_and_date(plugin_module):
-    store = [_store_item(n, date="2026-01-0%d" % i) for i, n in enumerate("abcde", 1)]
-    leg = FakeLeg([_kw_hit("k1"), _kw_hit("k2")])
-    out = _search(_p(plugin_module, store, leg))
-    block = out["block"]
-    assert isinstance(block, str)
-    order = [block.index(s) for s in ("src-k1", "src-k2", "src-a", "src-b", "src-c")]
-    assert order == sorted(order)
-    assert "[source: src-k1 | date: 2026-02-02]" in block
-    assert "[source: src-a | date: 2026-01-01]" in block
-    assert "keyword text of k1" in block and "stored text of a" in block   # raw text, not the question
-    assert "question about" not in block
-    assert out["keyword"] == "ok" and out["entries"] == len(out["sources"])
-    assert out["budget"] == 1500 and 0 < out["tokens"] <= 1500
-    assert "results" not in out
-
-
-def _doc_hit(doc, text, date="2026-04-04", source=None):
-    return rf.KeywordHit(content=text, original_chunk=text, source=source or f"src-{doc}", score=0.0, scores={},
-                         metadata={}, bank_id="b", document_id=f"doc-{doc}", created_on=date, origin="store")
-
-
-def test_document_mode_one_entry_per_note_with_the_notes_own_text(plugin_module):
-    # the store returns two question items of note a and one of note b; the leg also found note a
-    store = [_store_item("a", "part one of a"), _store_item("a", "part two of a"), _store_item("b", "part of b")]
-    docs = {"doc-a": _doc_hit("a", "the whole of note a"), "doc-b": _doc_hit("b", "the whole of note b")}
-    leg = FakeLeg([_kw_hit("a", "the whole of note a")], unit="document", docs=docs)
-    out = _search(_p(plugin_module, store, leg))
-    assert [s["source"] for s in out["sources"]] == ["src-a", "src-b"]
-    assert out["block"].count("the whole of note a") == 1 and "the whole of note b" in out["block"]
-    assert "part one" not in out["block"] and "part of b" not in out["block"]
-    assert "[source: src-b | date: 2026-04-04]" in out["block"]            # the note's own date
-
-
-def test_document_mode_note_found_only_by_the_store_reads_the_same_text(plugin_module):
-    store = [_store_item("a", "a chunk of a")]
-    leg = FakeLeg([], unit="document", docs={"doc-a": _doc_hit("a", "the whole of note a")})
-    out = _search(_p(plugin_module, store, leg))
-    assert "the whole of note a" in out["block"] and "a chunk of a" not in out["block"]
-
-
-def test_document_mode_keeps_the_stores_text_for_a_note_newer_than_the_index(plugin_module):
-    store = [_store_item("new", "text of a note written since the build")]
-    out = _search(_p(plugin_module, store, FakeLeg([], unit="document")))
-    assert "text of a note written since the build" in out["block"]
-
-
-def test_document_mode_dedupes_the_union_by_document_id_across_legs(plugin_module):
-    store = [_store_item(n) for n in "abc"]
-    docs = {f"doc-{n}": _doc_hit(n, f"note {n}") for n in "abcx"}
-    leg = FakeLeg([_kw_hit("x"), _kw_hit("b"), _kw_hit("a")], unit="document", docs=docs)
-    out = _search(_p(plugin_module, store, leg))
-    assert [s["source"] for s in out["sources"]] == ["src-x", "src-b", "src-a", "src-c"]
-    assert out["sources"][1]["origin"] == "keyword"
-
-
-def test_document_mode_old_note_list_uses_note_text_and_fusion_store_is_untouched(plugin_module):
-    store = [_store_item("a", "a chunk of a")]
-    docs = {"doc-a": _doc_hit("a", "the whole of note a")}
-    out = _search(_p(plugin_module, store, FakeLeg([], unit="document", docs=docs), {"recall": {"block_tokens": 0}}))
-    assert out["results"][0]["content"] == "the whole of note a"
-    out = _search(_p(plugin_module, store, FakeLeg([], unit="document", docs=docs), {"recall": {"fusion": "store"}}))
-    assert "a chunk of a" in out["block"]                                   # fusion=store: exactly as before
-
-
-def test_document_mode_warming_leg_answers_from_the_store_alone(plugin_module):
-    store = [_store_item("a", "a chunk of a")]
-    out = _search(_p(plugin_module, store, FakeLeg([], status="warming", unit="document")))
-    assert out["keyword"] == "warming" and "a chunk of a" in out["block"]
-
-
-def test_union_keeps_the_store_top_hits_too(plugin_module):
-    store = [_store_item(n) for n in "abcdef"]
-    leg = FakeLeg([_kw_hit(f"k{i}") for i in range(1, 6)])
-    out = _search(_p(plugin_module, store, leg))
-    names = [s["source"] for s in out["sources"]]
-    assert names[:6] == ["src-k1", "src-k2", "src-k3", "src-a", "src-b", "src-c"]
-    assert names[6:8] == ["src-d", "src-e"]
-
-
-def test_fusion_store_is_the_store_order_only(plugin_module):
-    store = [_store_item(n) for n in "abc"]
-    leg = FakeLeg([_kw_hit("k1")])
-    out = _search(_p(plugin_module, store, leg, {"recall": {"fusion": "store"}}))
-    assert [s["source"] for s in out["sources"]] == ["src-a", "src-b", "src-c"]
-
-
-def test_budget_skips_what_does_not_fit_and_never_cuts(plugin_module):
-    huge = " ".join(["word"] * 3000)
-    store = [_store_item("a", "short one"), _store_item("big", huge), _store_item("c", "short two")]
-    out = _search(_p(plugin_module, store, FakeLeg(), {"recall": {"block_tokens": 100}}))
-    assert [s["source"] for s in out["sources"]] == ["src-a", "src-c"]
-    assert [o["source"] for o in out["omitted"]] == ["src-big"]
-    assert huge not in out["block"] and "word word" not in out["block"]
-    assert out["tokens"] <= 100
-
-
-def test_nothing_fits_says_so_instead_of_cutting(plugin_module):
-    out = _search(_p(plugin_module, [_store_item("a", " ".join(["w"] * 500))], FakeLeg(),
-                     {"recall": {"block_tokens": 20}}))
-    assert out["block"] == "" and out["entries"] == 0 and len(out["omitted"]) == 1
-    assert "budget" in out["note"]
-
-
-def test_warming_or_unavailable_leg_falls_back_to_the_store(plugin_module):
-    store = [_store_item(n) for n in "ab"]
-    for status in ("warming", "unavailable"):
-        out = _search(_p(plugin_module, store, FakeLeg([_kw_hit("k1")], status=status)))
-        assert out["keyword"] == status
-        assert [s["source"] for s in out["sources"]] == ["src-a", "src-b"]
-
-
-def test_no_leg_at_all_is_the_store_alone(plugin_module):
-    out = _search(_p(plugin_module, [_store_item("a")], None))
-    assert out["keyword"] == "off" and [s["source"] for s in out["sources"]] == ["src-a"]
-
-
-def test_keyword_leg_only_joins_hybrid_mode(plugin_module):
-    leg = FakeLeg([_kw_hit("k1")])
-    p = _p(plugin_module, [_store_item("a")], leg)
-    out = _search(p, mode="semantic")
-    assert leg.calls == [] and out["keyword"] == "off"
-    assert [s["source"] for s in out["sources"]] == ["src-a"]
-
-
-def test_block_widens_the_candidate_pool_only_when_block_is_on(plugin_module):
-    p = _p(plugin_module, [_store_item("a")], None)
-    _search(p, limit=10)
-    assert p._memory.calls[-1][1]["limit"] == 50
-    p = _p(plugin_module, [_store_item("a")], None, {"recall": {"block_tokens": 0}})
-    _search(p, limit=10)
-    assert p._memory.calls[-1][1]["limit"] == 10
-
-
-def test_block_tokens_zero_and_store_is_the_old_note_list_exactly(plugin_module):
-    store = [_store_item("a", date="2026-01-01"), _store_item("b")]
-    p = _p(plugin_module, store, FakeLeg([_kw_hit("k1")]), {"recall": {"fusion": "store", "block_tokens": 0}})
-    out = _search(p)
-    assert set(out) == {"results"}
-    assert [r["source"] for r in out["results"]] == ["src-a", "src-b"]
-    assert set(out["results"][0]) == {"content", "source", "scores"}
-    assert out["results"][0]["content"] == "stored text of a"
-
-
-def test_block_tokens_zero_with_union_lists_fused_notes(plugin_module):
-    p = _p(plugin_module, [_store_item("a")], FakeLeg([_kw_hit("k1")]), {"recall": {"block_tokens": 0}})
-    out = _search(p, limit=2)
-    assert [r["source"] for r in out["results"]] == ["src-k1", "src-a"]
-
-
-def test_dates_come_from_item_metadata_else_the_database_else_undated(plugin_module):
-    p = _p(plugin_module, [_store_item("a", date="2026-05-06"), _store_item("b")], None)
-    out = _search(p)
-    assert "[source: src-a | date: 2026-05-06]" in out["block"]
-    assert "[source: src-b | date: undated]" in out["block"]   # fake memory has no database
-
-
-def test_library_floor_option_is_used_only_when_it_exists(plugin_module, monkeypatch):
-    assert plugin_module._library_floor_kw() == {}              # the pinned library has none on search()
-    import prospecta._index as idx
-
-    def with_floor(memory, text, *, mode="hybrid", limit=10, floor=False, depth=None):
-        raise AssertionError
-
-    monkeypatch.setattr(idx, "search", with_floor)
-    assert plugin_module._library_floor_kw() == {"floor": True}
-    p = _p(plugin_module, [_store_item("a")], None)
-    monkeypatch.setattr(plugin_module, "_library_floor_kw", lambda: {"floor": True})
-    _search(p)
-    assert p._memory.calls[-1][1]["floor"] is True
-
-
-def test_store_failure_is_an_error_not_a_crash(plugin_module):
-    p = _p(plugin_module, [], FakeLeg([_kw_hit("k1")]))
-    p._memory.search = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
-    assert "boom" in _search(p)["error"]
+    p._config = {"reranker_model": "x/reranker-cfg", "decision_model": "typesafe/jev-9"}
+    kw = p._recall_stage_kwargs()
+    assert kw["reranker_model"] == "x/reranker-cfg" and kw["decision_model"] == "typesafe/jev-9"
+    assert callable(kw["rerank_transport"]) and "jev" not in kw        # Stage 3 is off: no Jev built
+    p._config["recall"] = {"stage3": "true"}
+    kw = p._recall_stage_kwargs()
+    assert kw["jev"].model == "typesafe/jev-9" and callable(kw["jev"].transport)
 
 
 # ---- the shadow log: false-abstain rate beside every abstention figure ----
@@ -328,7 +214,8 @@ OLD, NEW = "old_bank", "new_bank"
 
 def _rm(source, bank):
     return SimpleNamespace(content=f"c {source}", original_chunk=f"chunk {source}", source=source, score=0.5,
-                           scores={}, metadata={}, bank_id=bank, document_id=f"{bank}-{source}")
+                           scores={}, metadata={}, bank_id=bank, document_id=f"{bank}-{source}",
+                           created_on=None, kind=None, match_kind=None, relevance_score=0.5, exact_snippet=None)
 
 
 class NewMemory:
@@ -349,14 +236,13 @@ def origin_ids(monkeypatch):
                         lambda memory, bank, results: [r.document_id.split("-", 1)[1] for r in results])
 
 
-def _shadow_provider(plugin_module, old, new, kw):
+def _shadow_provider(plugin_module, old, new, lexical):
     p = plugin_module.ProspectaProvider()
-    p._memory = FakeMemory([_rm(s, OLD) for s in old])
+    p._memory = FakeMemory([_rm(s, OLD) for s in old], lexical=lexical)
     p._memory.events = []
     p._memory._tracer = lambda kind, payload: p._memory.events.append(payload)
-    p._keyword = kw
     p._shadow = plugin_module._ShadowReader(
-        p._memory, NewMemory([_rm(s, NEW) for s in new]), bank_id=OLD, shadow_bank_id=NEW, keyword=kw)
+        p._memory, NewMemory([_rm(s, NEW) for s in new]), bank_id=OLD, shadow_bank_id=NEW)
     return p
 
 
@@ -366,7 +252,7 @@ def _drain(p):
 
 
 def test_shadow_pair_carries_counts_and_the_false_abstain_rate(plugin_module, origin_ids, caplog):
-    p = _shadow_provider(plugin_module, old=[], new=["a", "c"], kw=FakeLeg([_kw_hit("k1")]))
+    p = _shadow_provider(plugin_module, old=[], new=["a", "c"], lexical=1)
     with caplog.at_level(logging.INFO):
         p.handle_tool_call("prospecta_search", {"query": "secret words"})
         p.handle_tool_call("prospecta_search", {"query": "secret words"})
@@ -383,10 +269,20 @@ def test_shadow_pair_carries_counts_and_the_false_abstain_rate(plugin_module, or
     assert "abstain new 0/2 (0.0%) false-abstain new 0/2 (0.0%)" in line
     assert "old_n=0 new_n=2 kw_n=1" in line
     assert "secret" not in line and "chunk" not in line     # counts only, no content
+    # the evidence is the library's own lexical search of the old bank, asked in the worker
+    modes = [kw["mode"] for _, kw in p._memory.calls]
+    assert modes.count("hybrid") == 2 and modes.count("lexical") == 2
 
 
-def test_shadow_without_a_keyword_leg_still_prints_the_rate(plugin_module, origin_ids, caplog):
-    p = _shadow_provider(plugin_module, old=["a"], new=[], kw=None)
+def test_shadow_lexical_count_failure_is_n_a_and_still_prints_the_rate(plugin_module, origin_ids, caplog):
+    p = _shadow_provider(plugin_module, old=["a"], new=[], lexical=0)
+    real = p._memory.search
+
+    def search(q, **kw):
+        if kw.get("mode") == "lexical":
+            raise RuntimeError("lexical down")
+        return real(q, **kw)
+    p._memory.search = search
     with caplog.at_level(logging.INFO):
         p.handle_tool_call("prospecta_search", {"query": "q"})
         _drain(p)
@@ -395,15 +291,15 @@ def test_shadow_without_a_keyword_leg_still_prints_the_rate(plugin_module, origi
     assert p._memory.events[0]["trace"]["shadow"]["kw_n"] is None
 
 
-def test_shadow_compares_the_stores_list_not_the_fused_one(plugin_module, origin_ids):
-    p = _shadow_provider(plugin_module, old=["a", "b"], new=["a", "c"], kw=FakeLeg([_kw_hit("k1")]))
+def test_shadow_compares_the_same_cited_list_the_agent_got(plugin_module, origin_ids):
+    p = _shadow_provider(plugin_module, old=["a", "b"], new=["a", "c"], lexical=1)
     p.handle_tool_call("prospecta_search", {"query": "q", "limit": 5})
     _drain(p)
     assert p._memory.events[0]["trace"]["shadow"]["old_origin_document_ids"] == ["a", "b"]
 
 
-def test_shadow_recall_tools_count_keyword_evidence_in_the_worker(plugin_module, origin_ids):
-    p = _shadow_provider(plugin_module, old=["a"], new=[], kw=FakeLeg([_kw_hit("k1")]))
+def test_shadow_recall_tools_count_lexical_evidence_in_the_worker(plugin_module, origin_ids):
+    p = _shadow_provider(plugin_module, old=["a"], new=[], lexical=1)
     p._llm = object()
     p._memory.recall_synth = lambda q, **kw: SimpleNamespace(
         synthesis="old answer", sources=[], queries=[SimpleNamespace(text="q1")])
@@ -413,146 +309,86 @@ def test_shadow_recall_tools_count_keyword_evidence_in_the_worker(plugin_module,
     assert sh["kw_n"] == 1 and sh["old_n"] == 0 and sh["abstain"]["old_false_abstain"] == 1
 
 
-# ---- real Postgres: the leg reads the plugin's own pool ----
+# ---- real Postgres, the real library: Stage 1 + Stage 2 ----
 
-def _seed(p, name, text, date="2026-03-01", chunks=True):
-    p._memory.retain(content=text, source=name, index_text=[f"what about {name}?"], child_chunks=chunks,
-                     metadata={"created_on": date})
-
-
-def _settle(leg, query="alpha"):
-    """Let a due check run (background build), then wait for it."""
-    leg.wait_idle(10)
-    leg._checked_at = None
-    leg._min_rebuild_s = 0
-    leg.search(query, 1)
-    leg.wait_idle(10)
+def _rows(pg_url, sql, *args):
+    with psycopg.connect(pg_url) as c:
+        return c.execute(sql, args).fetchall()
 
 
-def test_real_bank_keyword_leg_finds_an_exact_identifier(provider_with_stubs):
-    p = provider_with_stubs
-    assert p._keyword is not None
-    _seed(p, "turn:1", "we shipped a release and wrote the changelog")
-    _seed(p, "turn:2", "the flag deploy-config_v2.yaml controls staging")
-    _seed(p, "turn:3", "unrelated chatter about lunch")
-    p._keyword.wait_idle(10)
-    p._keyword._checked_at = None                  # force a fingerprint look; rebuild allowed at once
-    p._keyword._min_rebuild_s = 0
-    status, hits = p._keyword.search("deploy-config_v2.yaml", 3)
-    p._keyword.wait_idle(10)
-    status, hits = p._keyword.search("deploy-config_v2.yaml", 3)
-    assert status == "ok" and hits[0].source == "turn:2" and hits[0].created_on == "2026-03-01"
-    out = json.loads(p.handle_tool_call("prospecta_search", {"query": "deploy-config_v2.yaml"}))
-    assert out["block"].startswith("[source: turn:2 | date: 2026-03-01]")   # keyword top hit first
-    assert out["sources"][0]["source"] == "turn:2"
+def test_real_search_returns_the_matched_words_and_citation_metadata_on_every_hit(hybrid_bank):
+    p = hybrid_bank()
+    p._retain("We watched Electric Dreams at the party and everyone cheered.", source="note:party",
+              metadata={"created_on": "2026-10-12", "source_kind": "conversation"})
+    p._retain("Dreams are electric when the lights go out on the hill.", source="note:scattered",
+              metadata={"created_on": "2026-10-11"})
+    out = _call(p, query='"electric dreams"')
+    assert out["reranked"] is True and out["count"] == 2
+    assert all(set(r) == CITED for r in out["results"])
+    party = next(r for r in out["results"] if r["source"] == "note:party")
+    assert party["exact_snippet"] and "<<Electric>> <<Dreams>>" in party["exact_snippet"]
+    assert party["match_kind"] in ("exact", "exact+semantic") and party["created_on"] == "2026-10-12"
+    assert party["kind"] == "conversation" and party["relevance_score"] == 1.0
+    assert party["text"] == "We watched Electric Dreams at the party and everyone cheered."
+    other = next(r for r in out["results"] if r["source"] == "note:scattered")
+    assert other["exact_snippet"] is None                          # the words are not side by side
+    assert p.rerank.requests and "Query: \"electric dreams\"" in p.rerank.requests[0]["query"]
 
 
-def test_real_bank_without_chunk_items_still_has_a_working_keyword_leg(provider_with_stubs):
-    """The live case: question items only, no chunk items. The leg indexes the notes."""
-    p = provider_with_stubs
-    _seed(p, "turn:1", "we shipped a release and wrote the changelog", chunks=False)
-    _seed(p, "turn:2", "the flag deploy-config_v2.yaml controls staging", chunks=False)
-    with p._memory._pool.connection() as conn:
-        assert conn.execute("SELECT count(*) FROM memory_items WHERE kind = 'chunk'").fetchone()[0] == 0
-    leg = p._keyword
-    assert leg.unit == "document"
-    _settle(leg, "deploy-config_v2.yaml")
-    status, hits = leg.search("deploy-config_v2.yaml", 3)
-    assert status == "ok" and hits[0].source == "turn:2" and hits[0].created_on == "2026-03-01"
-    assert hits[0].original_chunk == "the flag deploy-config_v2.yaml controls staging" and hits[0].item_id == ""
-    out = json.loads(p.handle_tool_call("prospecta_search", {"query": "deploy-config_v2.yaml"}))
-    assert out["block"].startswith("[source: turn:2 | date: 2026-03-01]")
-    chunk_leg = rf.KeywordLeg(rf.PgChunkSource(p._memory._pool, "test"), bank_id="test", background=False)
-    assert chunk_leg.search("deploy-config_v2.yaml", 3) == ("ok", [])      # the old unit finds nothing here
+def test_real_search_window_and_a_failing_reranker(hybrid_bank):
+    p = hybrid_bank(rerank=FakeRerank(fail=RuntimeError("HTTP 503")))
+    p._retain("The Henley branch roof will be replaced in June.", source="note:new", metadata={"created_on": "2026-10-12"})
+    p._retain("The Henley branch roof leaks in July.", source="note:old", metadata={"created_on": "2026-07-14"})
+    out = _call(p, query="Henley branch roof", date_from="2026-10-01", date_to="2026-10-31")
+    assert [r["source"] for r in out["results"]] == ["note:new"]
+    assert out["reranked"] is False                                # Stage 2 failed: Stage 1's own order, said so
+    assert out["results"][0]["relevance_score"] is not None
 
 
-def test_real_bank_leg_appends_new_notes_without_a_full_read(provider_with_stubs):
-    p = provider_with_stubs
-    _seed(p, "turn:1", "alpha one", chunks=False)
-    leg = p._keyword
-    _settle(leg)
-    assert leg.last_build["mode"] == "full" and leg.last_build["rows"] == 1
-    _seed(p, "turn:2", "alpha two with zebrafish", chunks=False)
-    _settle(leg, "zebrafish")
-    assert leg.last_build["mode"] == "append" and leg.last_build["added"] == 1 and leg.last_build["rows"] == 2
-    assert [h.source for h in leg.search("zebrafish", 3)[1]] == ["turn:2"]
-    assert len(leg.search("alpha", 10)[1]) == 2                       # no duplicate of the first note
-    with p._memory._pool.connection() as conn:                        # an in-place edit: full rebuild
-        conn.execute("UPDATE documents SET original_text = 'alpha edited', updated_at = now() "
-                     "WHERE source = 'turn:1'")
-        conn.commit()
-    _settle(leg, "edited")
-    assert leg.last_build["mode"] == "full" and [h.source for h in leg.search("edited", 3)[1]] == ["turn:1"]
+def test_real_recall_synth_returns_cited_sources(hybrid_bank):
+    p = hybrid_bank(llm=CountingLLM(queries=("Henley branch roof",)))
+    p._retain("The Henley branch roof will be replaced in June.", source="note:new", metadata={"created_on": "2026-10-12"})
+    out = _call(p, "prospecta_recall", query="Henley branch roof")
+    assert out["synthesis"] == "A synthesised answer."
+    (src,) = out["sources"]
+    assert src["source"] == "note:new" and src["created_on"] == "2026-10-12" and src["match_kind"]
+    assert src["relevance_score"] is not None and set(src) >= CITED - {"text"} and "text" not in src
 
 
-def test_real_bank_chunk_unit_is_still_selectable(plugin_module, pg_url, hermes_home, monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", pg_url)
-    (hermes_home / "prospecta.json").write_text(json.dumps(
-        {"bank_id": "t", "embedding_dim": "32", "recall": {"keyword_unit": "chunks"}}))
-    p = plugin_module.ProspectaProvider()
-    monkeypatch.setattr(p, "_build_embedder", lambda: stub_embed)
-    monkeypatch.setattr(p, "_build_llm", lambda: stub_llm)
-    p.initialize("s", hermes_home=str(hermes_home))
-    try:
-        assert p._keyword.unit == "chunk"
-        _seed(p, "turn:1", "the flag deploy-config_v2.yaml controls staging", chunks=True)
-        _settle(p._keyword, "deploy-config_v2.yaml")
-        status, hits = p._keyword.search("deploy-config_v2.yaml", 3)
-        assert status == "ok" and hits[0].item_id and hits[0].source == "turn:1"
-    finally:
-        p.shutdown()
+def test_real_recall_through_ask_with_the_stage_3_gate_on(hybrid_bank):
+    from prospecta.stages import JevScore
+
+    seen = []
+
+    def gate(request, timeout):
+        seen.append(request)
+        return {"answers": {"p0": {"type": "score", "score": 3}}, "usage": {"cost": 0.0}}
+
+    class Writer:
+        def __call__(self, messages=None, *, json_mode=False, **kw):
+            return "The roof will be replaced in June [1]."
+
+    p = hybrid_bank(config={"recall": {"stage3": "true"}}, llm=Writer())
+    p._memory._jev = JevScore(gate, model=p._decision_model())
+    p._retain("The Henley branch roof will be replaced in June.", source="note:new", metadata={"created_on": "2026-10-12"})
+    out = _call(p, "prospecta_recall", query="Henley branch roof")
+    assert out["answer"] == "The roof will be replaced in June [1]."
+    assert out["sufficient"] is True and out["retried"] is False and out["gate"]["model"] == "typesafe/jev-1.14"
+    assert len(seen) == 1 and seen[0]["model"] == "typesafe/jev-1.14"          # the gate ran, on the decision model
+    (cite,) = out["citations"]
+    assert cite["n"] == 1 and cite["known"] and cite["source"] == "note:new" and cite["created_on"] == "2026-10-12"
+    assert cite["snippet"] == "The Henley branch roof will be replaced in June."
+    assert out["synthesis"].startswith("The roof will be replaced in June [1].") and "Sources:" in out["synthesis"]
+    assert [s["source"] for s in out["sources"]] == ["note:new"]
 
 
-def test_real_bank_leg_uses_the_bounded_pool_and_stops_with_the_provider(provider_with_stubs):
-    p = provider_with_stubs
-    _seed(p, "turn:1", "alpha beta gamma")
-    p._keyword.wait_idle(10)
-    pool = p._memory._pool
-    p._keyword._checked_at = None
-    p._keyword._min_rebuild_s = 0
-    p._keyword.search("alpha", 1)
-    p._keyword.wait_idle(10)
-    assert len(pool._open) <= pool._max
-    leg = p._keyword
-    p.shutdown()
-    assert leg.search("alpha", 1) == ("unavailable", [])
-    assert p._keyword is None
-
-
-@pytest.mark.parametrize("cls,chunks", [("PgDocumentSource", False), ("PgChunkSource", True)])
-def test_real_bank_source_fingerprint_and_keyset_batches(provider_with_stubs, cls, chunks):
-    p = provider_with_stubs
-    pool = p._memory._pool
-    src = getattr(rf, cls)(pool, "test", batch=2)
-    assert src.fingerprint()["count"] == 0
-    for i in range(5):
-        _seed(p, f"turn:{i}", f"note number {i}", chunks=chunks)
-    fp = src.fingerprint()
-    assert fp["count"] == 5
-    pages = list(src.batches())
-    assert [len(b) for b in pages] == [2, 2, 1]                       # keyset pages, 2 at a time
-    rows = [r for b in pages for r in b]
-    assert [r["source"] for r in rows] == [f"turn:{i}" for i in range(5)]
-    cursor = pages[1][-1]["cursor"]
-    rest = [r for b in src.batches(after=cursor) for r in b]
-    assert [r["source"] for r in rest] == ["turn:4"]
-    fp2 = src.fingerprint(cursor)
-    assert fp2["prefix_count"] == 4 and fp2["prefix_max_updated"] == max(r["updated_at"] for r in rows[:4])
-    _seed(p, "turn:9", "later", chunks=chunks)
-    fp3 = src.fingerprint(cursor)
-    assert fp3["count"] == 6 and fp3["prefix_count"] == 4 and fp3["max_created"] > fp["max_created"]
-    assert len(pool._open) <= pool._max
-
-
-def test_recall_keyword_off_builds_no_leg(plugin_module, pg_url, hermes_home, monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", pg_url)
-    (hermes_home / "prospecta.json").write_text(json.dumps(
-        {"bank_id": "t", "embedding_dim": "32", "recall": {"keyword": False}}))
-    p = plugin_module.ProspectaProvider()
-    monkeypatch.setattr(p, "_build_embedder", lambda: stub_embed)
-    monkeypatch.setattr(p, "_build_llm", lambda: stub_llm)
-    p.initialize("s", hermes_home=str(hermes_home))
-    try:
-        assert p._keyword is None
-    finally:
-        p.shutdown()
+def test_a_note_retained_with_index_text_is_still_found_by_stage_1(hybrid_bank, pg_url):
+    p = hybrid_bank()
+    out = json.loads(p.handle_tool_call("prospecta_retain", {
+        "content": "Augur Prospecta live smoke: host-wide Roger PostgreSQL is active.",
+        "source": "smoke:index-text", "index_text": "What is Augur using as his Prospecta substrate?"}))
+    assert out["source"] == "smoke:index-text"
+    kinds = sorted(r[0] for r in _rows(pg_url, "SELECT kind FROM memory_items"))
+    assert kinds == ["chunk", "question"]                          # the question key and the chunks, both
+    hits = _call(p, query="Prospecta substrate PostgreSQL")["results"]
+    assert [h["source"] for h in hits] == ["smoke:index-text"] and hits[0]["text"].startswith("Augur Prospecta live smoke")

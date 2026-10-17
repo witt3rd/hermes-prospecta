@@ -4,11 +4,21 @@ Prospecta memory provider plugin for [Hermes Agent](https://github.com/NousResea
 Wraps [prospecta](https://github.com/witt3rd/prospecta) — bilateral
 prospective synthesis memory — as a Hermes `MemoryProvider`.
 
-Three-channel hybrid index (semantic + content-stem + body-stem) fused via
-RRF. Write-side LLM-anticipated `index_text`. Read-side LLM-generated
-multi-query expansion. LLM half of the spine reads `PROSPECTA_LLM_MODEL`
-(env) or `llm_model` (config) and calls `prospecta.defaults.make_default_llm`
-— same pattern as Hindsight. No `ctx.llm` dependency.
+Hybrid search and RAG over Postgres, the architecture of the library's
+[`docs/postgres-hybrid.md`](https://github.com/witt3rd/prospecta/blob/main/docs/postgres-hybrid.md):
+a note is written as chunks with **no model call**; a search is **Stage 1** (one
+SQL query: semantic, stemmed and exact-phrase retrievers with reserved slots,
+filtered in SQL by date and by the records to leave out) and **Stage 2** (a
+cross-encoder rerank), and every hit is **cited** (source, date, kind, how it
+matched, the matched words in context, the whole chunk). The plugin wires the
+library's search into the Hermes memory hooks and the agent's tools. The LLM
+half of the spine (recall synthesis, question expansion) reads
+`PROSPECTA_LLM_MODEL` (env) or `llm_model` (config) and calls
+`prospecta.defaults.make_default_llm` — same pattern as Hindsight. No `ctx.llm`
+dependency.
+
+The library is pinned in `pyproject.toml` (`prospecta` at `c52a126`). Stage 1 and
+Stage 2 run where the bank says so; see [Recall](#recall-stage-1--stage-2-cited).
 
 ## Install
 
@@ -79,94 +89,97 @@ Both paths run migrations and create the default bank idempotently.
 
 | Tool | Purpose |
 |---|---|
-| `prospecta_retain` | Store with optional `index_text` override |
-| `prospecta_recall` | Synthesized answer + source attribution |
-| `prospecta_search` | Raw note text, no synthesis: one token-budget block, keyword matches first (see [Recall](#recall-keyword-leg-union-and-block)) |
+| `prospecta_retain` | Store a note: chunked and searchable at once, no model call; optional `index_text` (anticipated questions) kept as extra keys next to the chunks |
+| `prospecta_recall` | Synthesized answer + cited sources (with `recall.stage3`: the library's `ask()` with the Stage 3 gate), see [Recall](#recall-stage-1--stage-2-cited) |
+| `prospecta_search` | Cited hits, no synthesis: source, date, kind, match, relevance, `exact_snippet`, the whole chunk; optional `date_from` / `date_to`, see [Recall](#recall-stage-1--stage-2-cited) |
+| `prospecta_recall_set` | The complete cited list for a set question about one entity (map-reduce) |
 
-## Recall: keyword leg, union and block
+## Recall: Stage 1 + Stage 2, cited
 
-`prospecta_search` (the tool that returns notes, no LLM) changed after the
-memory bake-off, which found that on real histories a plain keyword search
-found the evidence far more often than the store's fused recall, that rank
-fusion can demote the best channel's top hit, and that ten short notes lose to
-a block of raw text. Three parts, each with a config option (all under
-`recall`, in `prospecta.json` as `{"recall": {...}}` or as the flat keys
-`recall.fusion`, `recall.block_tokens`, `recall.keyword`, and the keyword leg's
-`recall.keyword_unit`, `recall.keyword_index_warn_mb`,
-`recall.keyword_batch_pause_ms`):
+Every recall path (`prospecta_search`, `prospecta_recall`, the contract prefetch)
+reads through the library, which does the work the plugin used to do itself.
 
-1. **Keyword leg** (`recall.keyword`, default `true`). A plain raw-text keyword
-   search over the bank's **notes**: the raw note text in the `documents` table
-   (`original_text`, with the note's id, source and date). Every bank has them,
-   whether or not it has chunk items (the banks written before chunking have
-   question items only, so an index over chunk items would be empty there).
-   Okapi BM25 (k1 1.5, b 0.75), stemming **off**, OR semantics, lowercase
-   tokens. Identifiers and file names are kept whole and also split:
-   `deploy-config_v2.yaml` is searchable as that, and as `deploy`, `config`,
-   `v2`, `yaml`. A hit is a note, so a note found by both the leg and the
-   store (or by several of its items) appears once, with the note's own text.
-   `recall.keyword_unit` selects the unit: `documents` (default) or `chunks`
-   (the old behaviour: chunk items, `kind='chunk'`, text in `original_chunk`).
-   The index lives in memory only (nothing on disk).
+**Stage 1** (the library's `hybrid_chunk` channel): one SQL query over the bank's
+`kind='chunk'` notes with three retrievers that each keep their own slots (semantic
+25, stemmed 20, exact or phrase 20), fused into at most 50 candidates. The question is
+read by `websearch_to_tsquery`: `"an exact phrase"` matches those words side by side,
+unstemmed; `OR` and `-exclude` work; identifiers such as `v1.14` match whole. The date
+window and the records to leave out are SQL filters, applied before each retriever cuts
+its slots. A hit whose words matched carries them in context (`exact_snippet`, the
+matched words marked `<<like this>>`).
 
-   *How it is built.* On first use, in a background thread; a search never
-   waits for it: while it is building (or if it failed, which is logged with
-   the full exception) the store's own recall is used alone and the answer says
-   `"keyword": "warming"` / `"unavailable"`. Rows are read through the plugin's
-   own bounded pool, one connection at a time, in keyset pages of 2,000 notes
-   (no connection of its own, so `max_connections` and `pool_idle_seconds`
-   apply as before; a connection is back in the pool before the page is
-   indexed). The build runs at a lower thread priority, indexes in small
-   slices and pauses after every page (`recall.keyword_batch_pause_ms`,
-   default 50), so it cannot starve the gateway. There is **no size cap**: a
-   bank of any size is indexed. Instead it logs the note count, the estimated
-   index size, the time and the process memory
-   (`prospecta keyword leg: indexed N documents ... index about X MB ...`), and
-   with `recall.keyword_index_warn_mb` set (default `0`, off) it logs a WARNING
-   when the estimate exceeds that many MB (the leg stays on). Memory is about
-   five times the note text (measured: 73,000 notes of 378 characters on
-   average, 27.6 MB of text, took about 160 MB and 5-7 s to build).
+**Stage 2** (the library's `cross_encoder` stage): a cross-encoder (default
+`qwen/qwen3-reranker-8b` through OpenRouter's rerank endpoint, the profile's
+`OPENROUTER_API_KEY`) scores each candidate against the question; notes under a floor
+are cut, near copies collapse, the best few stay. If it fails the library keeps Stage 1's
+order, and the plugin says so (`"reranked": false`; in the contract block a note and the
+first five hits of each question).
 
-   *How it stays fresh.* Checked every 30 s with one cheap aggregate (note
-   count, latest created / updated time). When only new notes were added (the
-   notes already indexed are unchanged: same count and latest update time up to
-   the last one read) just the new ones are read and appended, so a growing
-   bank is not re-read in full on every write. If an indexed note was edited or
-   deleted, or a note appears behind the last one read, the index is rebuilt in
-   full (at most every 5 minutes), the old index serving meanwhile (memory
-   briefly holds both). It is only built when something uses it: the union, or
-   the shadow log. Only `mode: hybrid` searches use it.
-2. **Keyword-first union** (`recall.fusion`, default `keyword_first_union`;
-   `store` is the old behaviour). The top 3 of the keyword leg first, then the
-   top 3 of the store, de-duplicated (by note when the leg indexes notes; the
-   same chunk of the same note counts once when it indexes chunks), then the remaining slots in the store's own order. The best keyword
-   hit is never demoted. If the library's `search` gets a floor-preserving
-   option (a `floor` parameter), the plugin passes it on (feature-detected,
-   never required); the pinned library has none there today (its
-   `rerank.blend.floor` is a per-bank rerank setting that does not touch
-   search), and the union gives the same guarantee either way.
-3. **Token-budget block** (`recall.block_tokens`, default `1500`; `0` = the old
-   list of notes). The search result is **one block** of raw note text in the
-   fused order, each entry headed `[source: ... | date: YYYY-MM-DD]` (`undated`
-   when the note has no date), until the budget is reached. With the default
-   note unit the text of an entry is the note's own text, whichever leg found
-   it (a note written since the index was built, or one too long to ever fit
-   the budget when the store holds a shorter part that fits, keeps the store's
-   text). An entry that does
-   not fit is skipped whole and the next one that fits is taken; stored text is
-   never cut. The block is built from up to 50 candidates (the store is asked
-   for 50, not `limit`, when the block is on). Tokens are estimated, since the
-   plugin has no tokenizer: whitespace words x 1.3, floored by characters / 4.
-   The JSON answer has `block`, `entries`, `tokens`, `budget`, `keyword`,
-   `sources` (source, date, `store` / `keyword`) and, when something was left
-   out for size, `omitted` (source and date only).
+**Where it is switched on: the bank.** Stage 1 and Stage 2 run when the bank's
+`channel_config` lists `hybrid_chunk` and its `recall_config.rerank` is
+`{"enabled": true, "stage": "cross_encoder"}`. The plugin does not write a bank's
+configuration; it is the operator's step (the plan's slice 5), for example:
 
-Rollback is by config, no code change: `{"recall": {"fusion": "store",
-"block_tokens": 0}}` returns the old `{"results": [...]}` list exactly (add
-`"keyword": false` to also drop the index). Env overrides:
-`PROSPECTA_RECALL_FUSION`, `PROSPECTA_RECALL_BLOCK_TOKENS`,
-`PROSPECTA_RECALL_KEYWORD`. `prospecta_recall` and prefetch (the LLM
-synthesis paths) are unchanged.
+```python
+mem.set_channel_config([{"name": "hybrid_chunk", "weight": 1}])
+mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder",
+                                  "top_n": 10, "min_score": 0.15, "timeout_s": 2.5}})
+```
+
+A bank without it keeps working for `prospecta_search` and `prospecta_recall` (the
+library's older three-channel recall: the same cited fields, with `match_kind` and
+`exact_snippet` empty and no rerank), but it cannot filter by date or by the records to
+leave out, so the contract prefetch needs it: with the contract prefetch on, `initialize`
+logs one warning for each of the two things the bank lacks. Banks that were written
+with questions only (no `chunk` notes) have nothing for Stage 1 to read; every note this
+plugin writes is chunked.
+
+**The tools.** `prospecta_search` returns
+
+```json
+{"results": [{"n": 1, "source": "...", "document_id": "...", "created_on": "2026-10-12",
+              "kind": "conversation", "match_kind": "exact+semantic", "relevance_score": 0.91,
+              "exact_snippet": "watched <<Electric>> <<Dreams>> at the party", "text": "the whole chunk"}],
+ "count": 1, "reranked": true}
+```
+
+`match_kind` is `exact+semantic`, `exact`, `lexical` or `semantic`; `relevance_score` is the
+cross-encoder's 0..1 score when Stage 2 graded the hit, else Stage 1's fused score.
+`date_from` / `date_to` (`YYYY-MM-DD`, inclusive) limit it to notes dated in that window
+(a note's date is the day it was saved, or the one it carries); they need the
+`hybrid_chunk` channel. `prospecta_recall` answers with the library's synthesis and lists
+its sources with the same fields (without the text).
+
+**`recall.stage3`** (default `false`; env `PROSPECTA_RECALL_STAGE3`): with it on,
+`prospecta_recall` answers through the library's `ask()` instead: Stage 1 + Stage 2, a
+grounded answer that cites `[n]` for each statement (`synthesis` is the answer followed by
+its sources, `citations` ties each `[n]` to its source, date and the verbatim sentence
+that supports it), and the **Stage 3** sufficiency gate: the decision model scores whether
+the evidence suffices, and under 0.70 one broadened search runs (a wider pool, the date
+window dropped). A gate that cannot run never blocks the answer (`sufficient` is `null`
+and `gate` says why).
+
+**The three models** are each configurable, in this order: the profile's
+`prospecta.json`, then the environment, then the default (the plan's order, and the one
+`llm_model` / `PROSPECTA_LLM_MODEL` already use; it differs from the `recall.*` options
+below, where the environment wins):
+
+| `prospecta.json` key | Env | Default | Used for |
+|---|---|---|---|
+| `decision_model` | `PROSPECTA_DECISION_MODEL` | `typesafe/jev-1.14` | Stage 0 of the contract prefetch (needs memory? which period?); the Stage 3 gate |
+| `query_writer_model` | `PROSPECTA_QUERY_WRITER_MODEL` | `openrouter/google/gemini-2.5-flash-lite` (a LiteLLM id) | the contract prefetch's question writer |
+| `reranker_model` | `PROSPECTA_RERANKER_MODEL` | `qwen/qwen3-reranker-8b` | Stage 2, on every search |
+
+**What was removed.** The plugin's own lanes are gone, because the library owns them now:
+the in-memory keyword leg (an Okapi BM25 index of the bank's notes, built in a background
+thread, with its fingerprint, rebuild and memory-warning machinery), the keyword-first
+union, and the token-budget block. So are their options: `recall.fusion`,
+`recall.block_tokens`, `recall.keyword`, `recall.keyword_unit`,
+`recall.keyword_index_warn_mb`, `recall.keyword_batch_pause_ms` and their env overrides.
+`prospecta_search` no longer returns `block` / `entries` / `tokens` / `keyword`: it returns
+the cited `results` above (`limit` bounds their number). The shadow log's false-abstain
+evidence, which used the keyword leg, now asks the library's own lexical search of the
+old bank, on the shadow worker thread (see [Shadow reads](#shadow-reads)).
 
 ## Prefetch
 
@@ -182,11 +195,13 @@ picks the path:
 
 ### Prefetch, mode `contract`
 
-One typed decision per chat message, questions written only when needed, the
-plugin's lanes asked, one rank call, a labelled block. No answer is
-synthesised. The design is the recall flow design's Hermes column; the words it
-fixes (the Jev question list, the question-writer prompt, the block's
-sentences) are in a file, not in code (see below).
+Mode 1A of the hybrid architecture: one typed decision per chat message (is memory
+needed, and for what period of time), questions written only when needed, each question
+asked of the library's Stage 1 + Stage 2 with the thread's last turns left out in SQL, a
+labelled block of cited evidence. No answer is synthesised. The design is the recall flow
+design's Hermes column; the words it fixes (the Jev question list, the question-writer
+prompt, the block's sentences) are in a file, not in code (see below). The bank needs the
+`hybrid_chunk` channel and the `cross_encoder` rerank ([Recall](#recall-stage-1--stage-2-cited)).
 
 Per message, before the turn:
 
@@ -195,57 +210,76 @@ Per message, before the turn:
    message too large for anything to read (over 1,000,000 characters). A long
    paste (over `paste_chars`, default 50,000) is not cut and not asked: it is
    marked as material by its size and goes whole to the question writer.
-2. **Decide.** One call to the decision model (`typesafe/jev-1.14` through
-   OpenRouter's System One door, typed answers, about $0.0001) with the state
-   (the agent's last answer, kept per session from `sync_turn`; the new line;
-   how many turns the session has had) and the contract's eight questions:
-   `line_kind`, `stands_alone`, `needs_memory`, `need_decisions`,
-   `need_library`, `need_conversations`, `need_work`, `need_person`.
-   `social` is always zero questions; `needs_memory` below 0.5 is zero
-   questions (nothing is searched, nothing is written, nothing is injected, and
-   the turn pays one decision call). The `need_*` at 0.5 or above are the
-   sources to ask; none at 0.5 means all. Prospecta banks tell conversations
-   (the turns the plugin retained) from everything else, so `need_conversations`
-   alone keeps only the turns and any other `need_*` alone leaves the turns out.
-   A go-ahead or an answer that still needs something outside the thread
-   (`needs_memory` at 0.5 or above) is asked, from the agent's last answer.
-3. **Questions.** A single standalone question is asked as written. Otherwise
-   Prospecta's own `formulate_queries` runs with the contract's question-writer
-   prompt and the agent's last answer as context, on the small text model
-   (`recall.prefetch.question_model`), and returns 0 to 3 questions. The writer
-   is told the kinds of knowledge only when some `need_*` reached 0.5 (it gets
-   those); otherwise it gets "any" (the search still uses all sources). The
-   agent's last answer is the only earlier turn it sees; at a session's first
-   turn with none kept (after a restart or with a new session id) it is read
-   once, whole, from the latest assistant message in `state.db` of
-   `HERMES_HOME` through a separate read-only connection (silently none on any
-   error).
-4. **Ask.** Each question goes, in parallel, through the plugin's lanes: the
-   dense chunk lane (with the library's floor when it has one), the raw keyword
-   lane and the date lane (the date-cue gate and its timeout apply as for
-   `prospecta_search`), fused by `recall.fusion` (`keyword_first_union`). One
-   Jev rank call scores the best 16 of the union (the request limit of the
-   venue's ranker). Entries scored 2 ("partly answers") or 3 ("holds the
-   answer") go in the block; the rest are counted ("N more matched less
-   well"). If Jev cannot rank, the first five of each question stand and the
-   block says the order is the search's own.
-5. **Block.** A markdown block: the contract's header paragraph, `Asked:`
-   lines, then each entry as `[source: ... | date: ... | rated: ...]` and its
-   whole text. It is sized by relevance: no count cap, no entry is ever cut.
-   `recall.prefetch.max_tokens` (default 0 = off) is a safety valve that leaves
-   out whole entries that would take the block past it. The tool path
-   (`prospecta_search`) keeps its own 1,500-token block. When memory could not
-   be searched the block is one line, `(memory was not consulted: <reason>)`;
-   when the search found nothing that answers, one line says so.
+2. **Decide (Stage 0).** One call to the decision model (`decision_model`, default
+   `typesafe/jev-1.14` through OpenRouter's System One door, typed answers, about $0.0001)
+   with the state (the agent's last answer, kept per session from `sync_turn`; the new
+   line; how many turns the session has had; today's date in the profile's `timezone`) and
+   the contract's nine questions: `line_kind`, `stands_alone`, `needs_memory`,
+   `need_decisions`, `need_library`, `need_conversations`, `need_work`, `need_person` and
+   `time_scope`. `social` is always zero questions; `needs_memory` below 0.5 is the **gate**:
+   zero questions (nothing is searched, nothing is written, nothing is injected, and the
+   turn pays one decision call). The `need_*` at 0.5 or above are the sources to ask; none
+   at 0.5 means all. Prospecta banks tell conversations (the turns the plugin retained)
+   from everything else, so `need_conversations` alone keeps only the turns and any other
+   `need_*` alone leaves the turns out. A go-ahead or an answer that still needs something
+   outside the thread (`needs_memory` at 0.5 or above) is asked, from the agent's last
+   answer.
+
+   **`time_scope`** gives the search a window of dates (the notes' dates, inclusive,
+   counted back from today): `recent` (today and yesterday), `past_week` (7 days),
+   `past_month` (31), `past_year` (366), `none` (no window), or `named`: the line names a
+   period ("in July", "March 2025", an ISO date), which the decision model cannot turn
+   into dates, so the question writer does (below). The window is a Stage 1 filter and the
+   block says when one applied ("Only notes dated 2026-10-10 to 2026-10-17 were
+   searched."). A missing, unknown or invalid answer is no window: a search with no date
+   filter loses nothing, a wrong window could.
+3. **Questions.** A single standalone question is asked as written (not when the time
+   scope is `named`, which needs the writer). Otherwise Prospecta's own `formulate_queries`
+   runs with the contract's question-writer prompt and the agent's last answer as context,
+   on the small text model (`query_writer_model`), and returns 0 to 3 questions: a
+   follow-up is resolved against the agent's last answer only, never the whole thread. The
+   writer is told the kinds of knowledge only when some `need_*` reached 0.5 (it gets
+   those); otherwise it gets "any" (the search still uses all sources). It is also told
+   today's date and the time scope. Two rules are appended to its prompt whatever contract
+   file is loaded: keep every `"quoted phrase"` of the person's lines verbatim, and, for a
+   `named` period, return `date_from` / `date_to` (checked: two real dates, in order, not
+   before 1990 nor more than a year ahead, else no window). **A quoted phrase is also
+   guaranteed in code:** one the model dropped is put back (quoted where its words stayed,
+   else appended to the first question), and each phrase (at most two) is also asked **on
+   its own**, in quotes: the library reads a question through `websearch_to_tsquery`, where
+   every word must be in the chunk, so a phrase inside a full question reaches the exact
+   retriever only for a chunk that also holds all the other words. The agent's last
+   answer is the only earlier turn the writer sees; at a session's first turn with none
+   kept (after a restart or with a new session id) it is read once, whole, from the latest
+   assistant message in `state.db` of `HERMES_HOME` through a separate read-only
+   connection (silently none on any error).
+4. **Ask (Stage 1 + Stage 2).** Each question goes, in parallel, to the library's
+   search for up to 50 candidates, with `excluded_sources` (the thread's last two turns,
+   below) and `date_from` / `date_to` filtered **in SQL** before the candidates are cut,
+   then reranked by the cross-encoder (`reranker_model`). A note that two questions both
+   found appears once, with its matched words if either found them. If the library's
+   Stage 2 fails, its own fallback is Stage 1's order: the first five hits of each question
+   stand and the block says "The reranker could not rank these; they are in the search's
+   own order." If the library call itself fails, the block is the one "not consulted" line.
+   There is no second rank call: Jev no longer scores the results.
+5. **Block.** A markdown block: the contract's header paragraph, `Asked:` lines, then the
+   library's own cited entries, each `[n] source=... | date=... | kind=... | match=...`,
+   an `Exact match snippet: "..."` line when a lexical retriever matched, and the whole
+   chunk (`kind` is left out for a note with none). It is sized by Stage 2's relevance
+   floor: no count cap, no entry is ever cut. `recall.prefetch.max_tokens` (default 0 =
+   off) is a safety valve that leaves out whole entries that would take the block past it.
+   When memory could not be searched the block is one line, `(memory was not consulted:
+   <reason>)`; when the search found nothing that answers, one line says so.
 
 **Never fails a turn.** The whole function is wrapped, and it has a deadline of
 5 s from the call (core waits 8 s; `deadline_seconds`, at most 7). Each stage
 has a fallback: no decision in 1 s (or a refusal, or no key) means a rule
-(three words or fewer: nothing; anything else is asked as written, and the block
-says "Questions formed without the decision model."); no questions in 1.5 s
-(or bad JSON, or no model) means the sentence Jev rates most relevant from the
-agent's last answer, or the line itself, whole (never a paste, never a bare
-reply); a search that fails gives the one "not consulted" line. Past the
+(three words or fewer: nothing; anything else is asked as written, with no
+window, and the block says "Questions formed without the decision model."); no
+questions in 1.5 s (or bad JSON, or no model) means the sentence Jev rates most
+relevant from the agent's last answer, or the line itself, whole (never a paste,
+never a bare reply); a search that fails (or a bank that cannot run it) gives the one
+"not consulted" line. Past the
 deadline the turn runs without memory and a late answer is dropped.
 
 **Logging.** Nothing is logged per turn. The only line is one warning (no text)
@@ -258,7 +292,7 @@ go-ahead will need on its own thread, keyed on that answer. The next turn uses
 it, once, if the decision is `answer` or `go_ahead` for the same answer. (A bare
 "yes" never reaches the plugin: core's filter skips it; "ok do it" does.)
 
-**No echoes.** The brief never hands the agent back what it already has in view: records of the current session's own retained turns (`turn:<session>:...`) whose text is, or holds, the agent's last answer or one of its last two turns are dropped before ranking (older turns of the same session, other sessions and notes stay). `recall.prefetch.drop_echoes` (default `true`) turns it off.
+**No echoes.** The brief never hands the agent back what it already has in view: the current session's last two retained turns (`turn:<session>:<ms>`) are passed to the library as `excluded_sources` and left out **in SQL**, so Stage 1 never returns them and the freed slots go to the next candidates (older turns of the same session, other sessions and notes stay). `sync_turn` names each turn's record when the turn ends; after a restart the last two are read once from the bank. `recall.prefetch.drop_echoes` (default `true`) turns it off. This replaces the old after-the-fact text comparison, including its rule that the agent's last answer counts only from 60 characters: a record is now excluded because it *is* one of the last two turns (every chunk of it, however long the turn), not because its text holds the agent's words, so a short last answer ("Done.") can no longer match an older turn by accident and a note that merely quotes the agent is never dropped.
 
 **Switches and files** (all read when a session starts, so the next session
 picks up a change with no gateway restart; env wins over config):
@@ -266,8 +300,6 @@ picks up a change with no gateway restart; env wins over config):
 | Key (`{"recall": {"prefetch": {...}}}` or flat `recall.prefetch.*`) | Default | Env |
 |---|---|---|
 | `mode` | `off` (`off` or `contract`) | `PROSPECTA_PREFETCH_MODE` |
-| `decision_model` | `typesafe/jev-1.14` | `PROSPECTA_PREFETCH_DECISION_MODEL` |
-| `question_model` | `openrouter/qwen/qwen3.8-flash` (a LiteLLM id) | `PROSPECTA_PREFETCH_QUESTION_MODEL` |
 | `contract_path` | bundled `contract/recall-contract-v1.md` | `PROSPECTA_PREFETCH_CONTRACT` |
 | `max_tokens` | `0` (off) | `PROSPECTA_PREFETCH_MAX_TOKENS` |
 | `deadline_seconds` | `5` | `PROSPECTA_PREFETCH_DEADLINE` |
@@ -276,29 +308,43 @@ picks up a change with no gateway restart; env wins over config):
 | `decision_timeout_seconds` | `1.0` | `PROSPECTA_PREFETCH_DECISION_TIMEOUT` |
 | `writer_timeout_seconds` | `1.5` | `PROSPECTA_PREFETCH_WRITER_TIMEOUT` |
 | `search_timeout_seconds` | `4.5` | `PROSPECTA_PREFETCH_SEARCH_TIMEOUT` |
-| `rank_timeout_seconds` | `1.0` | `PROSPECTA_PREFETCH_RANK_TIMEOUT` |
 
-The four `*_timeout_seconds` limits are per stage and must be above 0 (a bad
+The models are `decision_model`, `query_writer_model` and `reranker_model`, set in
+`prospecta.json` (top level) or the environment, see [Recall](#recall-stage-1--stage-2-cited).
+The old `recall.prefetch.decision_model` / `question_model` keys and their
+`PROSPECTA_PREFETCH_DECISION_MODEL` / `PROSPECTA_PREFETCH_QUESTION_MODEL` env vars no
+longer apply (renamed, with a new default for the writer); a session that still has one
+logs a warning naming the new key. `PROSPECTA_PREFETCH_RANK_TIMEOUT` and
+`rank_timeout_seconds` are gone with the rank call.
+
+The three `*_timeout_seconds` limits are per stage and must be above 0 (a bad
 value logs one warning and the default is used). They are not added up: each
 stage is also capped by what is left of `deadline_seconds`, so the deadline
-always wins. The search default is 4.5 s because a cold search of one question
-(embedding plus the dense, keyword and graph lanes) can take 1.2 to 2.5 s; a
-search that has not answered by its limit gives the "not consulted" line.
+always wins. The search default is 4.5 s: it covers the question's embedding, the one SQL
+query and the reranker's own 2.5 s limit; a search that has not answered by its limit
+gives the "not consulted" line.
 
-Both models are called with the profile's own keys (`OPENROUTER_API_KEY`), and
+The models are called with the profile's own keys (`OPENROUTER_API_KEY`), and
 see only what the agent sees: the person's line and the agent's last answer.
 
 **The contract file.** `contract/recall-contract-v1.md` holds, word for word
 from the design: the Jev question list (`jev-questions`, JSON), the
 question-writer prompt (`question-writer-prompt`), the block's first paragraph
 (`block-intro`) and the fixed sentences (`lines`: the `Asked:` line, "Nothing in
-it answers this", "N more matched less well", the search-order line, "Questions
-formed without the decision model", the "not consulted" line and the two
-ratings). Swapping the file (`contract_path`) is enough to change any of them;
-the file must keep the section names and the eight question ids. Everything
-else is code: the gate, the 0.5 and 2-of-3 thresholds, the source mapping,
-the parallel asking, the rank pool of 16, the deadline and every fallback, the
-block's `[source | date | rated]` entry label, and the timings.
+it answers this", "N more matched less well", the search-order line, the window
+line, "Questions formed without the decision model" and the "not consulted"
+line). Swapping the file (`contract_path`) is enough to change any of them; the
+file must keep the section names and the eight original question ids (`time_scope`
+is optional: without it no window is ever asked for). What changed since the design,
+and why: the ninth question `time_scope` (Stage 0 now also finds the period); the
+entries are the library's cited evidence instead of `[source | date | rated]` labels,
+and Jev no longer rates them (Stage 2 does), so the two `rated-*` lines are gone;
+"N more matched less well" now counts only entries left out by `max_tokens` (Stage 2's
+own cuts are final); the search-order line names the reranker, not Jev; the window line
+is new. The opening paragraph and the "Memory was asked: ... Nothing in it answers this."
+line are unchanged. Everything else is code: the gate, the 0.5 threshold, the source
+mapping, the parallel asking, the deadline and every fallback, the quoted-phrase and
+named-period rules of the writer, and the timings.
 
 ## Shadow reads
 
@@ -325,8 +371,9 @@ the same shape as the library's own shadow of `Memory.recall()`.
 - The shadow bank must already exist, with `shadow_embedding_dim` matching it.
 - **Abstention is always read with the false-abstain rate.** A side *abstains*
   on a question when it returns nothing; a question is *answerable* when the old
-  side, the new side or the keyword leg found something; a *false abstain* is an
-  abstention on an answerable question. Every pair's two rows carry counts only
+  side, the new side or a plain lexical search of the old bank (the library's own
+  `mode="lexical"`, Postgres full text, asked on the shadow worker thread) found
+  something; a *false abstain* is an abstention on an answerable question. Every pair's two rows carry counts only
   in `trace.shadow` (`old_n`, `new_n`, `kw_n`, and `abstain`: running totals
   `pairs`, `answerable`, `old_abstain`, `old_false_abstain`, `new_pairs`,
   `new_abstain`, `new_false_abstain`), and the worker logs one INFO line per
@@ -334,8 +381,9 @@ the same shape as the library's own shadow of `Memory.recall()`.
   kw_n=7 jaccard=0.43 | abstain old 0/40 (0.0%) false-abstain old 0/38 (0.0%);
   abstain new 2/40 (5.0%) false-abstain new 2/38 (5.3%)`. No question or note
   text is in it. A shadow side that errored is left out of its own counts. The
-  pair itself is unchanged: it still compares the store's lists (the old bank's
-  `recall` list against the new bank's), not the fused block.
+  pair itself is unchanged: it still compares the lists the agent got (the old bank's
+  search against the new bank's). `kw_n` is the lexical count; it is `n/a` when that
+  search fails.
 
 ## Linked and dual writes
 
@@ -369,31 +417,33 @@ extra thread). They prepare a switch to a newer bank.
 - Timestamps: the library's `retain` takes no creation time, so the second
   bank stamps `documents.created_at` when the second write runs (seconds after
   the main one, or at replay time for a retried note). `created_on` is derived
-  from the note's own content/metadata in both banks, identically. If the second
-  bank asks the LLM for `index_text` it gets its own questions.
+  from the note's own content/metadata in both banks, identically. A note
+  retained with `index_text` is written to the second bank with it, as in the main one.
 
 ## Note dates
 
-The library can read a date from a question ("in July", an ISO date, a year)
-and filter on the stored note date (`documents.created_on`). The plugin saves
-that date with every new note: `sync_turn` and `prospecta_retain` pass
-`metadata={"created_on": "YYYY-MM-DD"}` to `retain` (the key the library reads;
-`prospecta/_filters.py`). The same metadata goes to the dual-write bank and into
-its retry file, so both banks get the same date.
+The library can filter on the stored note date (`documents.created_on`) and cites it on
+every hit. **The library stamps it**: `retain()` always sets `created_on`, to the note's own
+date (frontmatter or `metadata`: `created_on`, `created` or `date`) or else today's date
+in `PROSPECTA_TIMEZONE` (UTC when unset). The plugin used to pass `metadata={"created_on":
+...}` itself; it no longer does, and the `note_date` setting is **removed** (the library
+cannot be told not to stamp, so there is nothing left to switch; `PROSPECTA_NOTE_DATE` is
+ignored). A note whose metadata carries a date keeps it.
 
-- **One helper**, `local_date_iso(tz_name, now)`: the calendar day *now* in the
-  `timezone` config key (an IANA name; default `America/Los_Angeles`). For a
-  turn the day is fixed when the turn ends. It never raises: an unknown zone
-  falls back to the default (logged), no zone data at all falls back to UTC, and
-  any failure saves the note without a date. A note whose metadata already has a
-  `created_on`, `created` or `date` keeps it; other metadata is never touched.
-- **Default**: on, unless `linked_writes` is on. The library also uses the date
-  to order the linker's temporal links, so with linked writes the change is an
-  explicit choice (`note_date: true`). Otherwise the only effect is two extra
-  keys in `documents.document_metadata` (`created`, `created_on`), one in the
-  note's item metadata, and the date shown in recall headers. Content, tags,
-  source, index text and embeddings are unchanged. `note_date: false` (or
-  `PROSPECTA_NOTE_DATE=off`) turns it off.
+- **`timezone`** (config key; an IANA name; default `America/Los_Angeles`) is kept: at
+  `initialize` the plugin sets `PROSPECTA_TIMEZONE` to it (the profile's value, else an
+  already-set `PROSPECTA_TIMEZONE`, else the default; an unknown name falls back to the
+  default, logged), so the library stamps the profile's calendar day instead of UTC's. It is
+  also the zone of "today" for the contract prefetch's time scopes. It is process-wide for
+  the gateway (one profile per gateway process).
+- **One helper**, `local_date_iso(tz_name, now)`: the calendar day *now* in a zone. It never
+  raises: an unknown zone falls back to the default (logged), no zone data at all falls back
+  to UTC.
+- One edge changes: the day is now taken when the library writes the note, not when the turn
+  ends, so a turn that ends within moments of local midnight may be stamped with the next day.
+- Dual write: the second bank is stamped by the library when the second write runs
+  (seconds later, or at replay time for a retried note), in the same zone; the retry file no
+  longer carries a `created_on`.
 
 ### Filling the date on existing notes
 
@@ -436,7 +486,7 @@ something else since is left alone.
 
 ## Configuration
 
-`get_config_schema()` exposes thirty-seven fields (`hermes memory setup` walks them):
+`get_config_schema()` exposes thirty-two fields (`hermes memory setup` walks them):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -459,21 +509,16 @@ something else since is left alone.
 | `dual_write_bank_id` | empty (OFF) | second bank every note is also written to; `PROSPECTA_DUAL_WRITE_BANK` env overrides (set it empty to force OFF) |
 | `dual_write_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the dual-write bank |
 | `dual_write_embedding_dim` | `1536` | dimensionality of the dual-write bank |
-| `timezone` | `America/Los_Angeles` | IANA zone whose calendar day is saved as each new note's date, see [Note dates](#note-dates) |
-| `note_date` | empty (on, except with `linked_writes`) | save each new note's date; `PROSPECTA_NOTE_DATE` env overrides |
-| `hash_precheck` | empty (on) | before saving, look for the same text already in the bank and skip the write (no LLM call); `PROSPECTA_HASH_PRECHECK` env overrides. Same text under another source is logged and skipped |
+| `timezone` | `America/Los_Angeles` | IANA zone whose calendar day the library saves as each new note's date (handed to it as `PROSPECTA_TIMEZONE`), see [Note dates](#note-dates) |
+| `hash_precheck` | empty (on) | before saving, look for the same text already in the bank and skip the write (no embedding calls); `PROSPECTA_HASH_PRECHECK` env overrides. Same text under another source is logged and skipped |
 | `tool_guide` | empty (on) | add a short guide to the memory tools (search vs recall, depth, dates, retain) to the system prompt block; `false` or `PROSPECTA_TOOL_GUIDE=off` turns it off |
-| `recall.fusion` | `keyword_first_union` | how `prospecta_search` joins the keyword leg with the store's recall; `store` = the old behaviour; `PROSPECTA_RECALL_FUSION` env overrides. See [Recall](#recall-keyword-leg-union-and-block) |
-| `recall.block_tokens` | `1500` | `prospecta_search` returns one block of at most this many estimated tokens (whole entries only); `0` = the old list of notes; `PROSPECTA_RECALL_BLOCK_TOKENS` env overrides |
-| `recall.keyword` | `true` | build the in-memory keyword leg (BM25, stemming off) over the bank's notes; `PROSPECTA_RECALL_KEYWORD` env overrides |
+| `decision_model` | `typesafe/jev-1.14` | the Stage 0 decision model (contract prefetch) and the Stage 3 gate model; the profile value wins over `PROSPECTA_DECISION_MODEL`. See [Recall](#recall-stage-1--stage-2-cited) |
+| `query_writer_model` | `openrouter/google/gemini-2.5-flash-lite` | the small text model that writes the contract prefetch's questions (a LiteLLM id); the profile value wins over `PROSPECTA_QUERY_WRITER_MODEL` |
+| `reranker_model` | `qwen/qwen3-reranker-8b` | the Stage 2 cross-encoder (OpenRouter rerank); the profile value wins over `PROSPECTA_RERANKER_MODEL` |
+| `recall.stage3` | `false` | `prospecta_recall` answers through the library's `ask()` with the Stage 3 sufficiency gate; `PROSPECTA_RECALL_STAGE3` env overrides |
 | `recall.date_cue_gate` | `true` | call the filter-extraction model only when the question has a date cue (month, weekday, `ago`, `last week`, a year, an ISO date, ...); otherwise search with no date filter and no model call (people matching still runs). `false` restores the library behaviour; `PROSPECTA_DATE_CUE_GATE` env overrides |
 | `recall.date_timeout_seconds` | `6` | hard wall-clock cap on the date-extraction model call; on timeout or error the search continues with the library's regex date filter and one warning is logged. Stalled calls are abandoned (at most 8 at once; beyond that the model is skipped). `0` disables; `PROSPECTA_DATE_TIMEOUT` env overrides |
-| `recall.keyword_unit` | `documents` | what the leg indexes: `documents` (the bank's raw notes, present in every bank) or `chunks` (the old behaviour: chunk items); `PROSPECTA_RECALL_KEYWORD_UNIT` env overrides |
-| `recall.keyword_index_warn_mb` | `0` (off) | log a WARNING when the keyword index's estimated size exceeds this many MB (soft threshold, nothing is turned off); `PROSPECTA_RECALL_KEYWORD_INDEX_WARN_MB` env overrides |
-| `recall.keyword_batch_pause_ms` | `50` | pause after each database page while the index is built or extended; `PROSPECTA_RECALL_KEYWORD_PAUSE_MS` env overrides |
 | `recall.prefetch.mode` | `off` | `off` (the old prefetch) or `contract` (the written recall contract), see [Prefetch](#prefetch); `PROSPECTA_PREFETCH_MODE` env overrides |
-| `recall.prefetch.decision_model` | `typesafe/jev-1.14` | the decision model of the contract prefetch; `PROSPECTA_PREFETCH_DECISION_MODEL` env overrides |
-| `recall.prefetch.question_model` | `openrouter/qwen/qwen3.8-flash` | the small text model that writes the questions; `PROSPECTA_PREFETCH_QUESTION_MODEL` env overrides |
 | `recall.prefetch.contract_path` | empty (the bundled file) | the recall contract file; `PROSPECTA_PREFETCH_CONTRACT` env overrides |
 | `recall.prefetch.max_tokens` | `0` (off) | safety valve on the contract block; `PROSPECTA_PREFETCH_MAX_TOKENS` env overrides |
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
