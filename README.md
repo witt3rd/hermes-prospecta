@@ -11,15 +11,16 @@ SQL query: semantic, stemmed and exact-phrase retrievers with reserved slots,
 filtered in SQL by date and by the records to leave out) and **Stage 2** (a
 cross-encoder rerank), and every hit is **cited** (source, date, kind, how it
 matched, the matched words in context, the whole chunk). The plugin wires the
-library's search into the Hermes memory hooks and the agent's tools. The LLM
-half of the spine (recall synthesis, the query writer of the contract prefetch) reads
-`PROSPECTA_LLM_MODEL` (env) or `llm_model` (config) and calls
-`prospecta.defaults.make_default_llm` — same pattern as Hindsight. No `ctx.llm`
-dependency.
+library's search into the Hermes memory hooks and the agent's tools. The text
+model (the answer `prospecta_recall` writes, and the callable the contract prefetch's
+query writer uses) reads `PROSPECTA_LLM_MODEL` (env) or `llm_model` (config) and calls
+`prospecta.defaults.make_default_llm` — same pattern as Hindsight. The plugin refuses to
+start with no model set. No `ctx.llm` dependency.
 
-The library is pinned in `pyproject.toml` (`prospecta` at `736bd28`, which has the
-query-expansion entry point `Memory.expand_and_recall`). Stage 1 and
-Stage 2 run where the bank says so; see [Recall](#recall-stage-1--stage-2-cited).
+The library is pinned in `pyproject.toml` (`prospecta` at `fe68efd`, the library after
+its removal of all legacy: one read path, one write path; it has `Memory.ask` and
+`Memory.expand_and_recall`). Stage 1 and Stage 2 run where the bank says so; see
+[Recall](#recall-stage-1--stage-2-cited).
 
 ## Install
 
@@ -90,9 +91,9 @@ Both paths run migrations and create the default bank idempotently.
 
 | Tool | Purpose |
 |---|---|
-| `prospecta_retain` | Store a note: chunked and searchable at once, no model call; optional `index_text` (anticipated questions) kept as extra keys next to the chunks |
-| `prospecta_recall` | Synthesized answer + cited sources (with `recall.stage3`: the library's `ask()` with the Stage 3 gate), see [Recall](#recall-stage-1--stage-2-cited) |
-| `prospecta_search` | Cited hits, no synthesis: source, date, kind, match, relevance, `exact_snippet`, the whole chunk; optional `date_from` / `date_to`, see [Recall](#recall-stage-1--stage-2-cited) |
+| `prospecta_retain` | Store a note (`content`, `source`, optional `tags`): chunked and searchable at once, no model call |
+| `prospecta_recall` | A grounded answer with `[n]` citations and the cited sources (`source`, date, kind, match, relevance, `exact_snippet`): the library's `ask()`, Stage 1 + Stage 2 then one answer from the best notes alone; optional `limit` and `depth`; with `recall.stage3` also the Stage 3 gate. See [Recall](#recall-stage-1--stage-2-cited) |
+| `prospecta_search` | Cited hits, no answer-writing model: source, date, kind, match, relevance, `exact_snippet`, the whole chunk; optional `limit`, `depth`, `date_from` / `date_to`. See [Recall](#recall-stage-1--stage-2-cited) |
 
 ## Recall: Stage 1 + Stage 2, cited
 
@@ -125,14 +126,15 @@ mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder",
                                   "top_n": 10, "min_score": 0.15, "timeout_s": 2.5}})
 ```
 
-A bank without it keeps working for `prospecta_search` and `prospecta_recall` (the
-library's older three-channel recall: the same cited fields, with `match_kind` and
-`exact_snippet` empty and no rerank), but it cannot filter by date or by the records to
-leave out, and the library's query expansion runs on Stage 1, so the contract prefetch needs
-it: with the contract prefetch on, `initialize` logs one warning for each of the two things
-the bank lacks (and one if the installed library has no `Memory.expand_and_recall`). Banks that were written
-with questions only (no `chunk` notes) have nothing for Stage 1 to read; every note this
-plugin writes is chunked.
+An **empty or unset `channel_config` is the `hybrid_chunk` default** (an old bank such as
+`augur` or `forge` stores `[]`, and a stored config that names only channels the library no
+longer has runs the default too). A bank with no `recall_config.rerank` keeps Stage 1's own
+order. The one switch the library respects is `hybrid_chunk` with `"enabled": false`: nothing is
+retrieved then, and the contract prefetch needs Stage 1. With the contract prefetch on,
+`initialize` logs one warning for each thing the bank lacks: a switched-off `hybrid_chunk`, no
+`cross_encoder` rerank (and one if the installed library has no `Memory.expand_and_recall`).
+Banks that were written with questions only (no `chunk` notes) have nothing for Stage 1 to read;
+every note this plugin writes is chunked, and nothing reads the question items an old bank holds.
 
 **The tools.** `prospecta_search` returns
 
@@ -147,25 +149,46 @@ plugin writes is chunked.
 cross-encoder's 0..1 score when Stage 2 graded the hit, else Stage 1's fused score.
 `date_from` / `date_to` (`YYYY-MM-DD`, inclusive) limit it to notes dated in that window
 (a note's date is the day it was saved, or the one it carries); they need the
-`hybrid_chunk` channel. `prospecta_recall` answers with the library's synthesis and lists
-its sources with the same fields (without the text).
+`hybrid_chunk` channel.
+
+**`prospecta_recall`** is the library's `ask()` (Mode 2B): Stage 1 + Stage 2 over the bank, then
+one model call (`PROSPECTA_LLM_MODEL`) that answers from the best `limit` notes alone and cites
+`[n]` for each statement. With nothing in memory the answer is `not in memory` and no model is
+called. It returns
+
+```json
+{"answer": "The roof will be replaced in June [1].",
+ "synthesis": "The roof will be replaced in June [1].\n\nSources:\n[1] [note:roof | 2026-10-12] \"...\"",
+ "citations": [{"n": 1, "known": true, "source": "note:roof", "created_on": "2026-10-12",
+                "snippet": "the verbatim sentence that supports it", "exact_snippet": null}],
+ "sources": [{"n": 1, "source": "note:roof", "document_id": "...", "created_on": "2026-10-12", "kind": "note",
+              "match_kind": "exact+semantic", "relevance_score": 0.91, "exact_snippet": "the <<roof>> ..."}]}
+```
+
+`answer` has the `[n]` markers; `synthesis` is the answer followed by its numbered sources;
+`citations` ties each `[n]` to its source, date and the verbatim sentence of the chunk that
+supports it; `sources` lists every note the answer may cite, with the same fields as a search hit
+(without the text). `limit` (default 10) is the number of notes the answer may cite. `depth`
+(`standard`, the default, or `deep`) is the library's: how wide a pool of candidates the
+cross-encoder reads, so `deep` suits "everything about X" questions; it is passed to the library
+unchanged (the plugin's own `depth` used to mean something else, `recall_synth`'s: it is gone).
 
 **`recall.stage3`** (default `false`; env `PROSPECTA_RECALL_STAGE3`): with it on,
-`prospecta_recall` answers through the library's `ask()` instead: Stage 1 + Stage 2, a
-grounded answer that cites `[n]` for each statement (`synthesis` is the answer followed by
-its sources, `citations` ties each `[n]` to its source, date and the verbatim sentence
-that supports it), and the **Stage 3** sufficiency gate: the decision model scores whether
+`prospecta_recall` also runs the **Stage 3** sufficiency gate: the decision model scores whether
 the evidence suffices, and under 0.70 one broadened search runs (a wider pool, the date
-window dropped). A gate that cannot run never blocks the answer (`sufficient` is `null`
-and `gate` says why).
+window dropped) before the answer is written. The result then also carries `sufficient`,
+`retried` and `gate`. A gate that cannot run never blocks the answer (`sufficient` is `null`
+and `gate` says why). It is passed explicitly either way: off means no gate, even when the bank's
+own `recall_config` enables Stage 3.
 
-**The three models** are each configurable. The plugin holds only the **profile's** value
+**The models** are each configurable. The plugin holds only the **profile's** value
 (`prospecta.json`); when the profile sets none, the library resolves the model, in its own
 order (the bank's `recall_config`, then the environment variable, then its default), so the
 order and the defaults live in one place:
 
 | `prospecta.json` key | Env (read by the library) | Library default | Used for |
 |---|---|---|---|
+| `llm_model` (the plugin's own; no library default) | `PROSPECTA_LLM_MODEL` | none: the plugin refuses to start without one | the answer `prospecta_recall` writes (the library's `ask()` uses the Memory's text model); the callable the query writer is called through |
 | `decision_model` | `PROSPECTA_DECISION_MODEL` | `typesafe/jev-1.14` | Stage 0 of the contract prefetch (needs memory? which period?); the Stage 3 gate |
 | `query_writer_model` (also `recall.prefetch.query_writer_model`, which wins) | `PROSPECTA_QUERY_WRITER_MODEL` | `openrouter/google/gemini-2.5-flash-lite` (a LiteLLM id) | the library's query writer: the contract prefetch's searches |
 | `reranker_model` | `PROSPECTA_RERANKER_MODEL` | `qwen/qwen3-reranker-8b` | Stage 2, on every search |
@@ -182,21 +205,31 @@ union, and the token-budget block. So are their options: `recall.fusion`,
 `recall.block_tokens`, `recall.keyword`, `recall.keyword_unit`,
 `recall.keyword_index_warn_mb`, `recall.keyword_batch_pause_ms` and their env overrides.
 `prospecta_search` no longer returns `block` / `entries` / `tokens` / `keyword`: it returns
-the cited `results` above (`limit` bounds their number). The shadow log's false-abstain
-evidence, which used the keyword leg, now asks the library's own lexical search of the
-old bank, on the shadow worker thread (see [Shadow reads](#shadow-reads)).
+the cited `results` above (`limit` bounds their number).
+
+**Removed with the library's legacy** (witt3rd/prospecta PR 90): `recall_synth` and its
+query-formulation step (`prospecta_recall` is `ask()` now, above); the `mode` of a search
+(`hybrid` / `semantic` / `lexical`: the library has one retrieval path, so `prospecta_search`
+has no `mode`: a model that still sends one gets the same search); `prospecta_retain`'s
+`index_text` argument (the write path is chunk-only; a stale `index_text` argument is ignored);
+the date-cue gate (`recall.date_cue_gate`, `recall.date_timeout_seconds`: it wrapped the library's
+date-extraction model call, which no longer exists); `linked_writes` (below); and the old
+synthesised-answer prefetch (below). A profile that still carries one of these keys, or
+`PROSPECTA_LINKED_WRITES` / `PROSPECTA_LINKER` / `PROSPECTA_JEV` / `PROSPECTA_DATE_CUE_GATE` in its
+environment, loads without a warning: they are read by nothing.
 
 ## Prefetch
 
 **OFF by default.** Enable via `prefetch_enabled: true` in
 `$HERMES_HOME/prospecta.json` or env `PROSPECTA_PREFETCH=1`. That is the master
-switch: with it off nothing below runs. With it on, `recall.prefetch.mode`
-picks the path:
+switch: with it off nothing below runs. With it on, `recall.prefetch.mode` is:
 
-- `off` (the default): the old prefetch, unchanged. Two LLM calls per recall
-  (formulate + synthesize); the injected text is one model-written answer.
-  Kept for rollback.
-- `contract`: the written recall contract, below.
+- `contract` (the default): the written recall contract, below. It is the only prefetch there is.
+- `off`: no prefetch at all: no decision call, no search, nothing injected. (`off` used to mean
+  the old synthesised-answer prefetch, which went with the library's `recall_synth`; a profile that
+  still says `off` now gets no prefetch.)
+
+Any other value logs one warning and uses `contract`.
 
 ### Prefetch, mode `contract`
 
@@ -208,9 +241,9 @@ searches (a `query`, verbatim `terms`, a period), every search runs the library'
 Stage 2 in parallel with the same filters, and the records merge into one cited block. No
 answer is synthesised. The design is the recall flow design's Hermes column; the words it
 fixes (the Jev question list, the block's sentences) are in a file, not in code (see below).
-The bank needs the `hybrid_chunk` channel and the `cross_encoder` rerank
-([Recall](#recall-stage-1--stage-2-cited)). The library is pinned at `main@736bd28` (PR 85
-merged); bump the pin only with a test run against the new commit.
+The bank needs the `hybrid_chunk` channel (an empty `channel_config` is its default) and the
+`cross_encoder` rerank ([Recall](#recall-stage-1--stage-2-cited)). The library is pinned at
+`main@fe68efd`; bump the pin only with a test run against the new commit.
 
 Per message, before the turn:
 
@@ -303,7 +336,7 @@ picks up a change with no gateway restart; env wins over config):
 
 | Key (`{"recall": {"prefetch": {...}}}` or flat `recall.prefetch.*`) | Default | Env |
 |---|---|---|
-| `mode` | `off` (`off` or `contract`) | `PROSPECTA_PREFETCH_MODE` |
+| `mode` | `contract` (`contract` or `off`) | `PROSPECTA_PREFETCH_MODE` |
 | `contract_path` | bundled `contract/recall-contract-v1.md` | `PROSPECTA_PREFETCH_CONTRACT` |
 | `max_tokens` | `0` (off) | `PROSPECTA_PREFETCH_MAX_TOKENS` |
 | `deadline_seconds` | `5` (at most `7`) | `PROSPECTA_PREFETCH_DEADLINE` |
@@ -353,8 +386,8 @@ fallback.
 ## Shadow reads
 
 **OFF by default.** For an embedding migration: with `shadow_bank_id` set
-(config or `PROSPECTA_SHADOW_BANK`), each `prospecta_search`, `prospecta_recall`
-and prefetch is also run against that bank, and the old/new pair is stored in
+(config or `PROSPECTA_SHADOW_BANK`), each `prospecta_search` and `prospecta_recall`
+is also run against that bank, and the old/new pair is stored in
 `recall_events` (two rows sharing `trace.shadow.id`, `role` old/new,
 `jaccard` over original document ids, `old_ms`/`new_ms`, and the `tool`),
 the same shape as the library's own shadow of `Memory.recall()`.
@@ -366,63 +399,69 @@ the same shape as the library's own shadow of `Memory.recall()`.
   with the full exception and recorded in the new row's `trace.shadow.error`.
 - The shadow `Memory` is built once at `initialize` and closed in `shutdown`
   (pending pairs are drained first, up to 30 s).
-- `shadow_mode: search` (default) only searches the shadow bank (embedding cost,
-  no LLM) with the same queries the old side used. `full` re-runs `recall_synth`
-  on the shadow bank for `prospecta_recall` and prefetch (roughly 0.2-0.4 USD
-  each); `prospecta_search` is always retrieval-only.
-- `recall_synth` already stores its own old-bank event, so for `prospecta_recall`
-  and prefetch the pair's old row is a second row; filter on `trace -> 'shadow'`.
+- The shadow side is retrieval only (embedding cost, no LLM): it searches the shadow
+  bank with the same question the old side used, and compares the notes. For
+  `prospecta_recall` the old side's notes are the ones `ask()` cited and its answer is
+  stored on the old row. (There is no `shadow_mode`: `full` re-ran `recall_synth` on the
+  shadow bank, which the library no longer has; a profile that still says `full` logs one
+  warning and gets the retrieval shadow. The contract prefetch is not shadowed.)
+- The old bank's `ask()` stores its own events too, so for `prospecta_recall` the pair's
+  old row is a second row; filter on `trace -> 'shadow'`.
 - The shadow bank must already exist, with `shadow_embedding_dim` matching it.
 - **Abstention is always read with the false-abstain rate.** A side *abstains*
   on a question when it returns nothing; a question is *answerable* when the old
-  side, the new side or a plain lexical search of the old bank (the library's own
-  `mode="lexical"`, Postgres full text, asked on the shadow worker thread) found
-  something; a *false abstain* is an abstention on an answerable question. Every pair's two rows carry counts only
-  in `trace.shadow` (`old_n`, `new_n`, `kw_n`, and `abstain`: running totals
+  side or the new side found something; a *false abstain* is an abstention on an
+  answerable question. (The library's lexical-only search, which used to be a third
+  leg of this evidence, is gone with its `mode`: `kw_n` is no longer recorded.)
+  Every pair's two rows carry counts only
+  in `trace.shadow` (`old_n`, `new_n`, and `abstain`: running totals
   `pairs`, `answerable`, `old_abstain`, `old_false_abstain`, `new_pairs`,
   `new_abstain`, `new_false_abstain`), and the worker logs one INFO line per
   pair, e.g. `prospecta shadow pair tool=prospecta_search old_n=10 new_n=10
-  kw_n=7 jaccard=0.43 | abstain old 0/40 (0.0%) false-abstain old 0/38 (0.0%);
+  jaccard=0.43 | abstain old 0/40 (0.0%) false-abstain old 0/38 (0.0%);
   abstain new 2/40 (5.0%) false-abstain new 2/38 (5.3%)`. No question or note
   text is in it. A shadow side that errored is left out of its own counts. The
-  pair itself is unchanged: it still compares the lists the agent got (the old bank's
-  search against the new bank's). `kw_n` is the lexical count; it is `n/a` when that
-  search fails.
+  pair itself compares the lists the agent got (the old bank's search, or the
+  notes its `ask()` cited, against the new bank's search).
 
-## Linked and dual writes
+## Dual writes
 
-**Both OFF by default**; with both off nothing changes (no extra `Memory`, no
-extra thread). They prepare a switch to a newer bank.
+**OFF by default**; with it off nothing changes (no extra `Memory`, no extra thread). It
+prepares a switch to a newer bank. The write path is **chunk-only**: `sync_turn` and
+`prospecta_retain` call the library's `retain(content, source, tags, metadata)` and nothing
+else, no model call, and the library has no linker, so no entities or links are written.
 
-- `linked_writes` builds the main `Memory` with the stages the library CLI
-  builds (`prospecta.cli._common._stage_kwargs()`: synth and rerank LLMs and
-  Jev, built when `OPENROUTER_API_KEY` is set; `PROSPECTA_JEV=off` opts out),
-  and retains notes with `child_chunks=True`. The library no longer has a
-  linker, so no entities or links are written and `PROSPECTA_LINKER` is
-  ignored (an old `PROSPECTA_LINKER=off` is harmless). Note that the same
-  stages also apply to recall on that `Memory`. A stage build failure is logged
-  with the full exception and never fails the turn.
+**`linked_writes` is removed.** It built the main `Memory` with the library CLI's stages and wrote
+`child_chunks`; with the write path chunk-only it had no effect left (the stages it built are
+read-side stages: the plugin builds the ones it needs itself, from the profile's models). A profile
+that still carries `linked_writes: true`, `PROSPECTA_LINKED_WRITES`, `PROSPECTA_LINKER=off` or
+`PROSPECTA_JEV=off` loads with no warning (a test loads the live profiles' exact key sets against the
+real library). One consequence: the main `Memory` no longer gets the CLI's `synth_llm` (a hard-coded
+answer model, built when `OPENROUTER_API_KEY` is set), so the library's `ask()` answers with the
+Memory's own text model, `PROSPECTA_LLM_MODEL`. (That call is recorded without token and cost
+figures, as the library does for a callable that returns plain text.)
+
 - `dual_write_bank_id` queues every note the main bank accepted (`sync_turn`
   and `prospecta_retain`) for one background daemon thread (bounded queue, 16
   pending, same worker as the shadow reads) that retains it into that bank with
-  its own embedder and chunk children. The agent's turn never
+  its own embedder, as chunks. The agent's turn never
   waits for it and it can never fail it.
 - The second write is idempotent: a note whose content hash is already in the
   second bank is skipped, so a catch-up copy and the dual write cannot
   duplicate.
 - A failed second write (or a note that does not fit the queue, or is still
   pending after the 30 s shutdown drain) is logged in full and appended to the
-  retry file (JSONL: content, source, tags, index_text, error, failed_at). The
+  retry file (JSONL: content, source, tags, error, failed_at). The
   worker replays that file right after each `initialize`; notes that fail
-  again stay in a fresh file.
+  again stay in a fresh file. (A retry line an older version saved with an
+  `index_text` replays without it.)
 - The second `Memory` is built once at `initialize` and closed in `shutdown`
   after the queue drains. The bank must already exist; otherwise dual write
   stays OFF with an ERROR log (the catch-up copy covers the gap).
 - Timestamps: the library's `retain` takes no creation time, so the second
   bank stamps `documents.created_at` when the second write runs (seconds after
   the main one, or at replay time for a retried note). `created_on` is derived
-  from the note's own content/metadata in both banks, identically. A note
-  retained with `index_text` is written to the second bank with it, as in the main one.
+  from the note's own content/metadata in both banks, identically.
 
 ## Note dates
 
@@ -490,7 +529,7 @@ something else since is left alone.
 
 ## Configuration
 
-`get_config_schema()` exposes thirty-two fields (`hermes memory setup` walks them):
+`get_config_schema()` exposes twenty-eight fields (`hermes memory setup` walks them):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -498,19 +537,17 @@ something else since is left alone.
 | `bank_id` | `default` | multi-tenant key; `PROSPECTA_BANK_ID` env overrides |
 | `embedder_kind` | `litellm` | one of `litellm`, `sentence_transformers`, `openai` |
 | `embedder_model` | empty | provider-specific default if empty |
-| `llm_model` | empty | LiteLLM model id for recall/formulation (e.g. `anthropic/claude-haiku-4-5`); `PROSPECTA_LLM_MODEL` env overrides |
+| `llm_model` | empty | LiteLLM model id of the text model: the answer `prospecta_recall` writes, and the callable the library's query writer is called through (e.g. `anthropic/claude-haiku-4-5`); `PROSPECTA_LLM_MODEL` env overrides; the plugin refuses to start with neither |
 | `embedding_dim` | `1536` | must match the embedder |
 | `max_connections` | `4` | most database connections each Memory (main, shadow, dual write) keeps open; threads take turns on them. Raise it only if tool calls wait for a free connection |
 | `pool_idle_seconds` | `300` | a pooled database connection unused for this long is closed; the next use opens a new one. `PROSPECTA_POOL_IDLE_SECONDS` env overrides |
 | `connection_watch` | `true` | warn loudly when the database nears its connection limit, see [Connections](#configuration); `PROSPECTA_CONNECTION_WATCH` env overrides |
 | `connection_watch_percent` | `70` | share of the database's `max_connections` in use (1-100) at which the watch warns |
-| `prefetch_enabled` | `false` | opt-in spine cost |
+| `prefetch_enabled` | `false` | the master switch of the pre-turn recall (see `recall.prefetch.mode`); opt-in spine cost |
 | `shadow_bank_id` | empty (OFF) | shadow-read bank, see [Shadow reads](#shadow-reads); `PROSPECTA_SHADOW_BANK` env overrides (set it empty to force OFF) |
 | `shadow_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the shadow bank |
 | `shadow_embedding_dim` | `1536` | dimensionality of the shadow bank |
-| `shadow_mode` | `search` | `search` = retrieval only; `full` = also shadow `recall_synth` (LLM cost) |
-| `linked_writes` | `false` | chunk children and library stages, see [Linked and dual writes](#linked-and-dual-writes); `PROSPECTA_LINKED_WRITES` env overrides |
-| `dual_write_bank_id` | empty (OFF) | second bank every note is also written to; `PROSPECTA_DUAL_WRITE_BANK` env overrides (set it empty to force OFF) |
+| `dual_write_bank_id` | empty (OFF) | second bank every note is also written to (chunks), see [Dual writes](#dual-writes); `PROSPECTA_DUAL_WRITE_BANK` env overrides (set it empty to force OFF) |
 | `dual_write_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the dual-write bank |
 | `dual_write_embedding_dim` | `1536` | dimensionality of the dual-write bank |
 | `timezone` | `America/Los_Angeles` | IANA zone whose calendar day the library saves as each new note's date (handed to it as `PROSPECTA_TIMEZONE`), see [Note dates](#note-dates) |
@@ -519,10 +556,8 @@ something else since is left alone.
 | `decision_model` | unset (the library: `typesafe/jev-1.14`) | the Stage 0 decision model (contract prefetch) and the Stage 3 gate model; the profile value wins over `PROSPECTA_DECISION_MODEL`. See [Recall](#recall-stage-1--stage-2-cited) |
 | `query_writer_model` | unset (the library: `openrouter/google/gemini-2.5-flash-lite`) | the small text model that expands the contract prefetch's message into searches (a LiteLLM id); also read as `recall.prefetch.query_writer_model` (which wins); the profile value wins over `PROSPECTA_QUERY_WRITER_MODEL` |
 | `reranker_model` | unset (the library: `qwen/qwen3-reranker-8b`) | the Stage 2 cross-encoder (OpenRouter rerank); the profile value wins over `PROSPECTA_RERANKER_MODEL` |
-| `recall.stage3` | `false` | `prospecta_recall` answers through the library's `ask()` with the Stage 3 sufficiency gate; `PROSPECTA_RECALL_STAGE3` env overrides |
-| `recall.date_cue_gate` | `true` | call the filter-extraction model only when the question has a date cue (month, weekday, `ago`, `last week`, a year, an ISO date, ...); otherwise search with no date filter and no model call (people matching still runs). `false` restores the library behaviour; `PROSPECTA_DATE_CUE_GATE` env overrides |
-| `recall.date_timeout_seconds` | `6` | hard wall-clock cap on the date-extraction model call; on timeout or error the search continues with the library's regex date filter and one warning is logged. Stalled calls are abandoned (at most 8 at once; beyond that the model is skipped). `0` disables; `PROSPECTA_DATE_TIMEOUT` env overrides |
-| `recall.prefetch.mode` | `off` | `off` (the old prefetch) or `contract` (the written recall contract: one decision, then the library's query expansion), see [Prefetch](#prefetch); `PROSPECTA_PREFETCH_MODE` env overrides |
+| `recall.stage3` | `false` | add the Stage 3 sufficiency gate to `prospecta_recall` (the library's `ask()`); `PROSPECTA_RECALL_STAGE3` env overrides |
+| `recall.prefetch.mode` | `contract` | `contract` (the written recall contract: one decision, then the library's query expansion) or `off` (no prefetch), see [Prefetch](#prefetch); `PROSPECTA_PREFETCH_MODE` env overrides |
 | `recall.prefetch.contract_path` | empty (the bundled file) | the recall contract file; `PROSPECTA_PREFETCH_CONTRACT` env overrides |
 | `recall.prefetch.max_tokens` | `0` (off) | safety valve on the contract block (the library's); `PROSPECTA_PREFETCH_MAX_TOKENS` env overrides |
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
@@ -569,12 +604,13 @@ See the docstring of `importer.py` for the exact mapping. Prospecta has no
 entity/link tables, so entities become documents and links, provenance, event
 timestamps, and unrecognised fields ride in `documents.document_metadata.hindsight`
 (links on both endpoints). `created_at` of each document/item is the original
-timestamp. No LLM is needed: the fact text is its own `index_text` (a question item),
-and the library also writes its `chunk` items (`child_chunks=True`), which are what hybrid
-recall (Stage 1) reads, so an imported note can be found by the contract prefetch and
-`prospecta_search`; only the embedder is called. A bank imported before this was written
-holds question items only: re-import it after deleting those documents (a re-run leaves an
-unchanged document alone, so it does not add the chunks).
+timestamp. No LLM is needed: each fact is written as `chunk` items, as every note is (the
+library's write path is chunk-only), which is what hybrid recall (Stage 1) reads, so an
+imported note can be found by the contract prefetch and `prospecta_search`; only the embedder
+is called. A bank imported by an older version holds question items beside the chunks (or
+question items only): nothing reads the question items; a bank with no chunks is re-imported
+after deleting those documents (a re-run leaves an unchanged document alone, so it does not
+add the chunks).
 
 - **Idempotent**: re-running leaves unchanged documents alone (no re-embed);
   changed ones are replaced under the same source (`hindsight://<bank>/<kind>/<id>`).

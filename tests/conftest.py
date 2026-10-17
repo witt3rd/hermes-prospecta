@@ -228,6 +228,21 @@ class FakeRerank:
         return {"model": request["model"], "results": results, "usage": {"total_tokens": 7, "cost": 0.0001}}
 
 
+def check_call(method: str, *args, **kw) -> None:
+    """Raise TypeError when the real library's ``Memory.<method>`` would not accept this call.
+
+    A fake Memory runs this first, so the plugin can never pass an argument the pinned library has
+    removed (``mode``, ``index_text``, ``child_chunks``) or call a method it no longer has: the fake
+    rejects exactly what the real one would."""
+    import inspect
+
+    from prospecta import _index, _retain
+    from prospecta.memory import Memory
+
+    target = {"retain": _retain.retain, "search": _index._search}.get(method) or getattr(Memory, method)
+    inspect.signature(target).bind(None, *args, **kw)
+
+
 class CountingLLM:
     """A stub text model that counts its calls (retain must make none)."""
 
@@ -250,7 +265,7 @@ def hybrid_bank(plugin_module, pg_url, hermes_home, monkeypatch):
     def build(*, config=None, rerank=None, hybrid=True, bank="hyb", llm=None):
         for k in ("PROSPECTA_PREFETCH", "PROSPECTA_PREFETCH_MODE", "PROSPECTA_DECISION_MODEL",
                   "PROSPECTA_RERANKER_MODEL", "PROSPECTA_QUERY_WRITER_MODEL", "PROSPECTA_RECALL_STAGE3",
-                  "PROSPECTA_TIMEZONE", "PROSPECTA_LINKED_WRITES", "PROSPECTA_DUAL_WRITE_BANK",
+                  "PROSPECTA_TIMEZONE", "PROSPECTA_DUAL_WRITE_BANK",
                   "PROSPECTA_SHADOW_BANK"):
             monkeypatch.delenv(k, raising=False)
         monkeypatch.setenv("PROSPECTA_DATABASE_URL", pg_url)
@@ -265,7 +280,8 @@ def hybrid_bank(plugin_module, pg_url, hermes_home, monkeypatch):
         if hybrid:
             p._memory.set_channel_config([{"name": "hybrid_chunk", "weight": 1}])
             p._memory.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder"}})
-        else:   # a bank created fresh is hybrid since library PR 86 (bank_defaults): "without the channel" must be made legacy
+        else:   # the shape of an old bank (augur, forge): an empty channel_config and no recall_config. The library
+                # reads an empty channel_config as its default, hybrid_chunk; with no recall_config there is no Stage 2
             p._memory.set_channel_config([])
             p._memory.set_recall_config({})
         p.rerank = rerank if rerank is not None else FakeRerank()

@@ -94,9 +94,9 @@ def _items(memory):
         return cur.fetchall()
 
 
-def test_import_writes_chunk_items_next_to_the_question_item(memory):
-    """Stage 1 reads kind='chunk' items only: an imported note with no chunk item cannot be found by
-    hybrid recall. The question item (the unit's own text, as before) stays; the chunk is added."""
+def test_import_writes_chunk_items_only(memory):
+    """Stage 1 reads kind='chunk' items: an imported note is written as chunks, which is how the library
+    writes every note now (no question item, no ``index_text``)."""
     importer.import_dump(memory, copy.deepcopy(DUMP))
     by_source: dict = {}
     for source, kind, content, created in _items(memory):
@@ -104,17 +104,32 @@ def test_import_writes_chunk_items_next_to_the_question_item(memory):
     assert sorted(by_source) == ["hindsight://janus/entity/e1", "hindsight://janus/unit/u1",
                                  "hindsight://janus/unit/u2", "hindsight://janus/unit/u3"]
     for source, rows in by_source.items():
-        assert sorted(k for k, _, _ in rows) == ["chunk", "question"], source
-    u1 = {k: (c, t) for k, c, t in by_source["hindsight://janus/unit/u1"]}
-    assert u1["chunk"][0] == u1["question"][0] == "Dave prefers uv over pip."
-    # the original timestamp is on the chunk item too (not only on the question item and the document)
-    assert u1["chunk"][1].isoformat().startswith("2025-03-01T10:00")
+        assert {k for k, _, _ in rows} == {"chunk"}, source
+    (kind, content, created), = by_source["hindsight://janus/unit/u1"]
+    assert content == "Dave prefers uv over pip."
+    # the original timestamp is on the chunk item too (not only on the document)
+    assert created.isoformat().startswith("2025-03-01T10:00")
+
+
+def test_the_import_calls_retain_with_the_chunk_only_arguments(memory, monkeypatch):
+    """Exactly what the library's retain takes: content, source, tags, metadata (no index_text, no child_chunks)."""
+    from tests.conftest import check_call
+    seen = []
+    real = memory.retain
+
+    def retain(content, **kw):
+        check_call("retain", content, **kw)
+        seen.append(set(kw))
+        return real(content, **kw)
+
+    monkeypatch.setattr(memory, "retain", retain)
+    importer.import_dump(memory, copy.deepcopy(DUMP))
+    assert seen and all(kw == {"source", "tags", "metadata"} for kw in seen)
 
 
 def test_imported_notes_are_found_by_the_librarys_stage_1(memory):
     importer.import_dump(memory, copy.deepcopy(DUMP))
-    memory.set_channel_config([{"name": "hybrid_chunk", "weight": 1}])
-    hits = memory.search("Dave moving Seattle", mode="hybrid", limit=5)
+    hits = memory.search("Dave moving Seattle", limit=5)       # an empty channel_config is the hybrid_chunk default
     assert "hindsight://janus/unit/u2" in [h.source for h in hits]
 
 

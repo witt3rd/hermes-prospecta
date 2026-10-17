@@ -130,7 +130,7 @@ def _build_embedder(cfg: dict):
 
 
 def _build_memory():
-    """Memory handle for offline writes (no LLM: imports pass index_text)."""
+    """Memory handle for offline writes (no LLM: a note is written as chunks, with no model call)."""
     from prospecta.db.migrate import run_migrations
     from prospecta.memory import Memory
 

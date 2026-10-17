@@ -33,8 +33,11 @@ logger = logging.getLogger(__name__)
 
 # ---- defaults (each one is a setting or the contract's own number) ----
 
-MODES = ("off", "contract")
-DEFAULT_MODE = "off"
+# ``contract`` is the only prefetch there is; ``off`` is no prefetch at all (the old synthesised-answer prefetch is
+# gone with the library's recall_synth). ``prefetch_enabled`` is the master switch (default off), so the default
+# mode costs nothing until a profile turns the prefetch on.
+MODES = ("contract", "off")
+DEFAULT_MODE = "contract"
 # No model id has a default here: the profile's value, when it sets one, is handed to the library; the library
 # resolves the rest (its bank's recall_config, then PROSPECTA_QUERY_WRITER_MODEL / PROSPECTA_DECISION_MODEL /
 # PROSPECTA_RERANKER_MODEL, then its own default).

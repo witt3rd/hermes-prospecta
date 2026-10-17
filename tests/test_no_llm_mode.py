@@ -6,7 +6,7 @@ import json
 from tests.conftest import stub_embed
 
 
-def test_initialize_without_llm_supports_retain_with_index_text_and_search(
+def test_initialize_without_llm_supports_retain_and_search(
     plugin_module, pg_url, hermes_home, monkeypatch
 ):
     monkeypatch.setenv("PROSPECTA_DATABASE_URL", pg_url)
@@ -25,7 +25,6 @@ def test_initialize_without_llm_supports_retain_with_index_text_and_search(
             {
                 "content": "Augur Prospecta live smoke: host-wide Roger PostgreSQL is active.",
                 "source": "smoke:no-llm",
-                "index_text": "What is Augur using as his Prospecta substrate?",
             },
         ))
         assert retain["source"] == "smoke:no-llm"
