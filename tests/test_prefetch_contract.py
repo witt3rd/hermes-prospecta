@@ -1,5 +1,7 @@
-"""The pre-turn recall contract (recall.prefetch.mode: contract). Offline: a fake Jev transport, a fake
-question model, a fake store. Invented text only."""
+"""The pre-turn recall contract (recall.prefetch.mode: contract), offline. The plugin gates and decides (a fake
+Jev transport), then hands the message to the library's query expansion (``Memory.expand_and_recall``, replaced
+here by a fake that records its arguments and returns the library's own result types, block and all). Invented
+text only. The real library behind it is in ``test_mode1a_hybrid.py``."""
 from __future__ import annotations
 
 import json
@@ -7,24 +9,24 @@ import logging
 import threading
 import time
 from datetime import date
-from types import SimpleNamespace
 
 import pytest
+from prospecta._types import ExpandedRecall, RecalledMemory, SearchRun, SearchSpec
+from prospecta.cited import CITE_LINE, HEADING, format_cited_rag_block
 
 import prefetch_contract as pc
 
 OPENER_AGENT_LAST = ("I can draft the one-page explainer on the village library now. "
                      "Shall I write it in our explainer house style?")
+ROOF_Q = "What did we decide about the Henley branch roof?"
+TODAY = date(2026, 10, 17)
 
 
 # ---------------------------------------------------------------------------- fakes
 
-TODAY = date(2026, 10, 17)
-
-
 def jev_decision(kind, needs, *, stands=0.9, scope="none", **need):
-    """A System One answer in the real shape; ``need`` names the need_* at or above 0.5; ``scope`` is
-    the time_scope choice."""
+    """A System One answer in the real shape (every question of the contract answered); ``need`` names the
+    need_* at or above 0.5; ``scope`` is the time_scope choice."""
     def noul(v):
         return {"type": "noul", "noul": v}
     answers = {
@@ -33,120 +35,103 @@ def jev_decision(kind, needs, *, stands=0.9, scope="none", **need):
         "needs_memory": noul(needs),
         "time_scope": {"type": "choice", "choice": scope, "probabilities": {scope: 0.9}, "confidence": 0.9},
     }
-    for k in pc.NEED_SOURCES:
+    for k in ("need_decisions", "need_library", "need_conversations", "need_work", "need_person"):
         answers[k] = noul(0.9 if need.get(k) else 0.1)
     return {"model": "typesafe/jev-1.14-20261014", "answers": answers,
             "usage": {"input_tokens": 900, "output_tokens": 12, "cost": 0.00004}}
 
 
 class FakeJev:
-    """The decision and the scoring, told apart by the questions asked."""
+    """The decision (System One) transport: the plugin's only Jev call."""
 
-    def __init__(self, decision=None, score=3.0, fail_decision=None, fail_rank=None, delay=0.0):
-        self.decision, self.score = decision, score
-        self.fail_decision, self.fail_rank = fail_decision, fail_rank
-        self.delay = delay
+    def __init__(self, decision=None, fail_decision=None, delay=0.0):
+        self.decision, self.fail_decision, self.delay = decision, fail_decision, delay
         self.requests = []
         self.lock = threading.Lock()
 
     def decisions(self):
         return [r for r in self.requests if "line_kind" in r["questions"]]
 
-    def rankings(self):
-        """The writer's fallback asks Jev to rate sentences; nothing else is ever ranked by Jev."""
-        return [r for r in self.requests if "p0" in r["questions"]]
-
     def __call__(self, request, timeout):
         with self.lock:
             self.requests.append(request)
-        qs = request["questions"]
-        if "line_kind" in qs:
-            if self.delay:
-                time.sleep(self.delay)
-            if self.fail_decision:
-                raise self.fail_decision
-            return self.decision
-        if self.fail_rank:
-            raise self.fail_rank
-        n = len(qs)
-        scores = self.score(request) if callable(self.score) else [self.score] * n
-        return {"answers": {f"p{i}": {"type": "score", "score": scores[i]} for i in range(n)},
-                "usage": {"cost": 0.0001}}
-
-
-class FakeWriter:
-    """The small text model: returns a fixed reply (or raises, or is slow)."""
-
-    def __init__(self, reply='{"questions": []}', fail=None, delay=0.0):
-        self.reply, self.fail, self.delay = reply, fail, delay
-        self.prompts = []
-
-    def __call__(self, messages, *, json_mode=False):
-        self.prompts.append(messages[0]["content"])
         if self.delay:
             time.sleep(self.delay)
-        if self.fail:
-            raise self.fail
-        return self.reply
-
-
-def questions_reply(*qs):
-    return json.dumps({"questions": list(qs)})
+        if self.fail_decision:
+            raise self.fail_decision
+        return self.decision
 
 
 def item(name, text=None, *, date="2026-03-02", source=None, doc=None, kind="note", match="semantic",
-         snippet=None, score=0.8):
-    """A hit as the library's ``Memory.search`` returns it, with the cited-evidence fields."""
-    return SimpleNamespace(
+         snippet=None, score=0.8, found_by=(1,)):
+    """A recalled record as the library's expansion hands it back (its own type)."""
+    return RecalledMemory(
         content=f"stored text of {name}", original_chunk=text or f"stored text of {name}",
-        source=source or f"note:{name}", score=0.5, scores={"rrf": 0.5}, metadata={"created_on": date},
-        bank_id="b", document_id=doc or f"doc-{name}", created_on=date, kind=kind, match_kind=match,
-        exact_snippet=snippet, relevance_score=score)
+        source=source or f"note:{name}", score=0.5, scores={"rrf": 0.5}, metadata={}, bank_id="b",
+        document_id=doc or f"doc-{name}", created_on=date, kind=kind, match_kind=match,
+        exact_snippet=snippet, relevance_score=score, found_by=found_by)
 
 
-class FakeStore:
-    """The library's search: one callable as the contract's ``Deps.search`` (question, scope) -> Found,
-    and ``.search`` as ``Memory.search`` (what the provider calls), which also fills the trace the way
-    the library does: a ``rerank`` record without a fallback reason when Stage 2 graded the hits."""
+def expanded(searches, items=(), *, status=None, reranked=True, deadline_hit=False, error=None, cost=0.0003,
+             fallbacks=()):
+    """What ``expand_and_recall`` returns, built with the library's own types and its own block formatter.
+    ``searches`` are queries (or SearchSpecs); ``status`` maps a search number to ok | late | error."""
+    specs = [s if isinstance(s, SearchSpec) else SearchSpec(query=s) for s in searches]
+    runs = [SearchRun(index=i, spec=sp, status=(status or {}).get(i, "ok"), n_candidates=len(items),
+                      n_kept=len(items), reranked=reranked,
+                      fallback_reason=None if reranked else "stage 2: HTTP 503")
+            for i, sp in enumerate(specs, start=1)]
+    ok = [r for r in runs if r.status == "ok"]
+    block = format_cited_rag_block(list(items), heading=HEADING, searches=[(r.index, r.spec) for r in ok],
+                                   cite=True)
+    return ExpandedRecall(kind="chat", block=block, items=list(items), searches=specs, runs=runs,
+                          fallbacks=list(fallbacks), timings_ms={"writer": 11, "stage1": 7, "total": 40},
+                          accounting={"n_llm_calls": 1, "cost_usd": cost}, deadline_hit=deadline_hit, error=error)
 
-    def __init__(self, by_question=None, default=None, fail=None, delay=0.0, ranked=True):
-        self.by_question, self.default, self.fail, self.delay = by_question or {}, default or [], fail, delay
-        self.ranked = ranked
-        self.calls, self.scopes, self.kwargs = [], [], []
 
-    def _items(self, q):
-        self.calls.append(q)
+class FakeExpansion:
+    """``Memory.expand_and_recall``, replaced: it records every call (prompt, kind, keyword arguments) and
+    returns ``result`` (a result, or a function of the call's prompt and keyword arguments)."""
+
+    def __init__(self, result=None, *, fail=None, delay=0.0, gate=None):
+        self.result, self.fail, self.delay, self.gate = result, fail, delay, gate
+        self.calls = []
+
+    @property
+    def kwargs(self):
+        return [c[2] for c in self.calls]
+
+    def __call__(self, prompt, kind="chat", **kw):
+        self.calls.append((prompt, kind, kw))
+        if self.gate is not None:
+            self.gate.wait()
         if self.delay:
             time.sleep(self.delay)
         if self.fail:
             raise self.fail
-        return list(self.by_question.get(q, self.default))
-
-    def __call__(self, q, scope=None):
-        self.scopes.append(scope)
-        return pc.Found(items=self._items(q), ranked=self.ranked)
-
-    def search(self, q, **kw):
-        self.kwargs.append(kw)
-        items = self._items(q)
-        trace = kw.get("_trace")
-        if trace is not None:
-            trace.append({"rerank": {"fallback_reason": None} if self.ranked
-                          else {"fallback_reason": "fused order stands: RuntimeError: 503"}})
-        return items
+        result = self.result
+        if callable(result):
+            result = result(prompt, kw)
+        return result if result is not None else expanded(["Henley branch roof decision"], [item("roof")])
 
 
-def make_deps(store, jev=None, writer=None):
-    return pc.Deps(search=store, transport=jev, writer_llm=writer, today=lambda: TODAY)
+def make_deps(expansion, jev=None):
+    return pc.Deps(expand=expansion, transport=jev, today=lambda: TODAY)
 
 
-SETTINGS = pc.Settings(mode="contract", decision_timeout_s=0.5, writer_timeout_s=0.5, search_timeout_s=1.0,
-                       deadline_s=3.0)
+SETTINGS = pc.Settings(mode="contract", decision_timeout_s=0.5, deadline_s=3.0)
 
 
 def run(line, deps, *, agent_last=OPENER_AGENT_LAST, settings=SETTINGS, **kw):
     return pc.run_contract(line, agent_last=agent_last, turns=4, deps=deps, settings=settings,
                            contract=pc.load_contract(), **kw)
+
+
+def ask(line="What did we decide about the Henley branch roof?", *, decision=None, expansion=None, **kw):
+    """One turn on a decision that asks (new_ask, 0.9) unless another is given: (brief, expansion, jev)."""
+    jev = FakeJev(decision=decision or jev_decision("new_ask", 0.9, stands=0.95))
+    expansion = expansion or FakeExpansion()
+    return run(line, make_deps(expansion, jev), **kw), expansion, jev
 
 
 # ---------------------------------------------------------------------------- the contract file
@@ -160,43 +145,46 @@ def test_bundled_contract_loads_with_the_designs_words():
     assert list(kinds) == ["answer", "go_ahead", "follow_up", "new_ask", "material", "social"]
     assert kinds["social"] == "Thanks, a greeting or an acknowledgement; nothing to do."
     assert c.questions["line_kind"]["instructions"] == "What is `new_lines`, read as a reply to `agent_last`?"
-    assert c.questions["stands_alone"]["criteria"]["false"] == (
-        "It leans on `agent_last` or the thread (yes, it, that, the second one).")
     assert c.questions["needs_memory"]["instructions"].startswith(
         "To do what `new_lines` asks (or what it agrees to), does the agent need something that is NOT in")
-    assert c.questions["need_library"]["instructions"].endswith(": what a document in the Library says?")
-    assert c.questions["need_work"]["criteria"] == {"true": "Yes.", "false": "No."}
-    assert c.writer_prompt.startswith("Write the questions a memory search is asked before an agent's turn.")
-    assert c.writer_prompt.endswith('Return `{"questions": ["…"]}`.')
-    assert "never \"it\", \"this\", \"yes\" or \"the second one\"" in c.writer_prompt
+    assert c.questions["needs_memory"]["criteria"]["true"] == "Something it needs is outside what it has."
 
 
-def test_decision_request_has_the_designs_shape():
-    jev = FakeJev(decision=jev_decision("new_ask", 0.1))
-    run("What did we decide about the Henley branch?", make_deps(FakeStore(), jev, FakeWriter()))
-    (req,) = jev.decisions()
-    assert req["model"] == "typesafe/jev-1.14"
-    assert list(req["state"]) == ["agent", "turn", "thread", "agent_last", "new_lines", "in_view", "today"]
-    assert req["state"]["today"] == "2026-10-17"
-    assert req["state"]["agent_last"] == OPENER_AGENT_LAST
-    assert req["state"]["new_lines"] == ["The person (to you): What did we decide about the Henley branch?"]
-    assert list(req["questions"]) == list(pc.load_contract().questions)
+def test_the_contract_has_no_question_writer_prompt_any_more():
+    """The library's writer owns the prompt for the searches (prospecta/prompts/expand-searches.md)."""
+    assert not hasattr(pc.load_contract(), "writer_prompt")
+    assert "## question-writer-prompt" not in pc.DEFAULT_CONTRACT_PATH.read_text()
 
 
-def test_swapping_the_contract_file_is_enough(plugin_module, tmp_path):
+def test_the_fixed_sentences_speak_of_searches_not_questions():
+    c = pc.load_contract()
+    assert c.line("nothing-answers", searches="a / b") == "Memory was asked: a / b. Nothing in it answers this."
+    assert c.line("not-consulted", reason="x") == "(memory was not consulted: x)"
+    assert c.line("no-decision") == "Searches were made without the decision model."
+    assert c.line("window", date_from="2026-10-10", date_to="2026-10-17") == (
+        "Only notes dated 2026-10-10 to 2026-10-17 were searched.")
+    assert c.line("search-order") == "The reranker could not rank these; they are in the search's own order."
+    assert "question" not in c.intro.lower().replace("short question", "")
+    assert "prospecta_search" in c.intro and "stale" in c.intro
+    assert "asked" not in c.lines and "more" not in c.lines            # the library writes those parts of the block
+
+
+def test_swapping_the_contract_file_is_enough(tmp_path):
     text = pc.DEFAULT_CONTRACT_PATH.read_text()
-    swapped = text.replace("Write the questions a memory search is asked before an agent's turn.",
-                           "WRITE THE QUESTIONS (swapped file).").replace("Background from memory,", "Swapped intro,")
     path = tmp_path / "other.md"
-    path.write_text(swapped)
-    contract = pc.load_contract(path)
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.1, need_decisions=1))
-    writer = FakeWriter(questions_reply("What happened to the Henley branch?"))
-    store = FakeStore(default=[item("henley")])
-    b = pc.run_contract("and that branch?", agent_last="", turns=1, deps=make_deps(store, jev, writer),
-                        settings=SETTINGS, contract=contract)
-    assert "WRITE THE QUESTIONS (swapped file)." in writer.prompts[0]
+    path.write_text(text.replace("Background from memory,", "Swapped intro,"))
+    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.1))
+    b = pc.run_contract("and that branch?", agent_last="", turns=1, deps=make_deps(FakeExpansion(), jev),
+                        settings=SETTINGS, contract=pc.load_contract(path))
     assert b.text.startswith("Swapped intro,")
+
+
+def test_a_contract_file_that_still_has_the_old_writer_prompt_loads(tmp_path):
+    text = pc.DEFAULT_CONTRACT_PATH.read_text()
+    old = text + '\n## question-writer-prompt\n\n```text\nWrite the questions.\n```\n'
+    path = tmp_path / "old.md"
+    path.write_text(old)
+    assert pc.load_contract(path).intro == pc.load_contract().intro      # the extra section is not read
 
 
 def test_bad_contract_files_are_refused(tmp_path):
@@ -208,409 +196,487 @@ def test_bad_contract_files_are_refused(tmp_path):
         pc.load_contract(bad)
 
 
-# ---------------------------------------------------------------------------- gate
+def test_the_decision_request_has_the_designs_shape():
+    _, _, jev = ask()
+    (req,) = jev.decisions()
+    assert list(req["state"]) == ["agent", "turn", "thread", "agent_last", "new_lines", "in_view", "today"]
+    assert req["state"]["today"] == "2026-10-17"
+    assert req["state"]["agent_last"] == OPENER_AGENT_LAST
+    assert req["state"]["new_lines"] == [f"The person (to you): {ROOF_Q}"]
+    assert list(req["questions"]) == list(pc.load_contract().questions)
+
+
+def test_the_decision_model_is_the_profiles_else_the_librarys_never_a_default_of_the_plugins():
+    from prospecta import stages
+    _, _, jev = ask()
+    assert jev.decisions()[0]["model"] == stages.JEV_MODEL               # env PROSPECTA_DECISION_MODEL, else its default
+    jev = FakeJev(decision=jev_decision("new_ask", 0.9))
+    run(ROOF_Q, make_deps(FakeExpansion(), jev), settings=pc.Settings(mode="contract", decision_model="typesafe/jev-9"))
+    assert jev.decisions()[0]["model"] == "typesafe/jev-9"
+    assert not hasattr(pc, "DEFAULT_DECISION_MODEL") and not hasattr(pc, "DEFAULT_QUERY_WRITER_MODEL")
+    assert not hasattr(pc, "DEFAULT_RERANKER_MODEL")
+
+
+# ---------------------------------------------------------------------------- the gate stays in the plugin
 
 @pytest.mark.parametrize("text", ["", "   \n ", "<memory-context>\n</memory-context>", "/new", "  /status now",
                                   "yes", "OK!", "thanks :)", "do it", None])
 def test_gate_skips_without_any_call(text):
-    jev, writer, store = FakeJev(decision=jev_decision("new_ask", 0.9)), FakeWriter(), FakeStore()
-    b = run(text, make_deps(store, jev, writer))
+    jev, expansion = FakeJev(decision=jev_decision("new_ask", 0.9)), FakeExpansion()
+    b = run(text, make_deps(expansion, jev))
     assert b.text == "" and b.decision == "zero"
-    assert not jev.requests and not writer.prompts and not store.calls
+    assert not jev.requests and not expansion.calls
 
 
-# ---------------------------------------------------------------------------- the design's six examples
-
-def test_panama_deal_is_a_question_for_memory():
-    line = "yeah, but no like that Panama deal we closed last year"
-    jev = FakeJev(decision=jev_decision("follow_up", 0.92, stands=0.2, need_decisions=1))
-    writer = FakeWriter(questions_reply("What was the Panama deal we closed last year?"))
-    store = FakeStore(default=[item("panama", "The Panama deal closed in March 2025 for the harbour lease.")])
-    b = run(line, make_deps(store, jev, writer))
-    assert b.decision == "ask" and b.questions == ["What was the Panama deal we closed last year?"]
-    assert store.calls == ["What was the Panama deal we closed last year?"]  # the line itself is never asked
-    assert "The Panama deal closed in March 2025" in b.text
-    assert b.sources == ["decisions"]
-    assert OPENER_AGENT_LAST in writer.prompts[0] and line in writer.prompts[0]
+@pytest.mark.parametrize("kind,needs", [("social", 0.95), ("answer", 0.04), ("go_ahead", 0.1), ("new_ask", 0.49),
+                                        ("follow_up", 0.0)])
+def test_a_closed_gate_makes_no_expansion_call_and_injects_nothing(kind, needs):
+    b, expansion, jev = ask("Thanks, that was helpful to know about it",
+                            decision=jev_decision(kind, needs, need_decisions=1))
+    assert b.text == "" and b.decision == "zero" and b.injected == 0
+    assert expansion.calls == []                                        # not called at all
+    assert len(jev.requests) == 1                                       # the turn pays the decision only
+    assert b.cost_usd == pytest.approx(0.00004)
 
 
-def test_fine_with_me_asks_nothing():
-    jev = FakeJev(decision=jev_decision("answer", 0.04))
-    writer, store = FakeWriter(), FakeStore()
-    b = run("fine with me", make_deps(store, jev, writer), agent_last="I'll use the shorter title. OK?")
-    assert b.text == "" and b.decision == "zero" and b.reason == "no need"
-    assert not writer.prompts and not store.calls and not jev.rankings()
+def test_the_threshold_is_one_half_and_the_gate_is_the_plugins_not_the_librarys():
+    b, expansion, _ = ask(decision=jev_decision("new_ask", 0.5))
+    assert b.decision == "ask" and len(expansion.calls) == 1
+    assert expansion.kwargs[0]["gate"] is False                         # decided here: the library does not decide again
 
 
-def test_lets_keep_going_with_the_draft_in_the_chat_asks_nothing():
-    jev = FakeJev(decision=jev_decision("go_ahead", 0.1, stands=0.3))
-    writer, store = FakeWriter(), FakeStore()
-    b = run("let's keep going, but this time add more color to the motivation", make_deps(store, jev, writer))
-    assert b.text == "" and not writer.prompts and not store.calls
+def test_social_is_zero_whatever_needs_memory_says():
+    b, expansion, _ = ask("Thanks, that was helpful", decision=jev_decision("social", 0.95))
+    assert b.text == "" and not expansion.calls
 
 
-def test_yes_to_a_proposal_is_filtered_and_ok_do_it_decides_zero():
+def test_ok_do_it_is_decided_by_jev_while_yes_is_core_filtered():
     jev = FakeJev(decision=jev_decision("go_ahead", 0.08, stands=0.1))
-    writer, store = FakeWriter(), FakeStore()
-    deps = make_deps(store, jev, writer)
-    assert run("yes", deps).text == "" and not jev.requests          # core's filter, held here too
-    b = run("ok do it", deps)                                         # not a trivial word: Jev decides
-    assert len(jev.decisions()) == 1 and b.text == "" and b.line_kind == "go_ahead"
-    assert not writer.prompts and not store.calls
+    expansion = FakeExpansion()
+    deps = make_deps(expansion, jev)
+    assert run("yes", deps).text == "" and not jev.requests
+    b = run("ok do it", deps)
+    assert len(jev.decisions()) == 1 and b.text == "" and b.line_kind == "go_ahead" and not expansion.calls
 
 
-def test_go_ahead_that_needs_memory_is_asked_from_the_agents_last_line():
-    jev = FakeJev(decision=jev_decision("go_ahead", 0.85, stands=0.1, need_library=1))
-    writer = FakeWriter(questions_reply("What happened to the village library, and when did it close?",
-                                        "What is our house style for explainers?"))
-    store = FakeStore(default=[item("closure", "The library closed on 4 June after the roof failed.")])
-    b = run("ok do it", make_deps(store, jev, writer))
-    assert b.decision == "ask" and len(b.questions) == 2
-    assert sorted(store.calls) == sorted(b.questions)         # both asked
-    assert OPENER_AGENT_LAST in writer.prompts[0]              # the questions come from the agent's own line
-    assert b.sources == ["library"]
+def test_a_go_ahead_that_needs_memory_is_expanded_with_the_agents_last_line():
+    b, expansion, _ = ask("ok do it", decision=jev_decision("go_ahead", 0.85, stands=0.1, need_library=1))
+    assert b.decision == "ask" and len(expansion.calls) == 1
+    prompt, kind, kw = expansion.calls[0]
+    assert (prompt, kind) == ("ok do it", "chat") and kw["agent_last"] == OPENER_AGENT_LAST
 
 
-def test_pasted_file_is_read_whole_by_the_writer_and_never_asked():
-    paste = "Minutes of the branch review. " * 2500            # 75,000 characters
+# ---------------------------------------------------------------------------- what reaches the library
+
+def test_the_expansion_is_called_with_the_line_as_a_chat_and_the_arguments_the_plugin_owns():
+    b, expansion, _ = ask(ROOF_Q)
+    ((prompt, kind, kw),) = expansion.calls
+    assert prompt == ROOF_Q and kind == "chat"
+    assert kw["agent_last"] == OPENER_AGENT_LAST
+    assert kw["gate"] is False and kw["record"] is False                # no second gate, no recall logging
+    assert kw["now"] == TODAY                                           # the profile's calendar day
+    assert kw["max_tokens"] is None and kw["query_writer_model"] is None   # not set: the library resolves both
+    assert kw["date_from"] is None and kw["date_to"] is None and kw["excluded_sources"] is None
+    assert 0 < kw["deadline"] <= SETTINGS.deadline_s
+    assert set(kw) == {"agent_last", "date_from", "date_to", "excluded_sources", "deadline", "max_tokens",
+                       "query_writer_model", "gate", "record", "now"}
+    assert not any(k in kw for k in ("project", "metadata_filter", "max_searches", "reranker_model", "decision"))
+
+
+def test_a_follow_up_carries_the_agents_last_line_and_the_first_message_carries_none():
+    _, expansion, _ = ask("do you remember who i saw it with?", decision=jev_decision("follow_up", 0.9, stands=0.1),
+                          agent_last="We met Ana at the cafe on Tuesday.")
+    assert expansion.kwargs[0]["agent_last"] == "We met Ana at the cafe on Tuesday."
+    assert expansion.calls[0][0] == "do you remember who i saw it with?"        # the line, whole: never rewritten here
+    _, first, _ = ask(agent_last="")
+    assert first.kwargs[0]["agent_last"] is None
+
+
+def test_the_writer_model_the_valve_and_the_echo_exclusion_are_passed_on():
+    s = pc.Settings(mode="contract", decision_timeout_s=0.5, deadline_s=3.0, query_writer_model="openrouter/x/writer",
+                    max_tokens=900)
+    _, expansion, _ = ask(settings=s, excluded_sources=("turn:s1:11", "turn:s1:12"))
+    kw = expansion.kwargs[0]
+    assert kw["query_writer_model"] == "openrouter/x/writer" and kw["max_tokens"] == 900
+    assert kw["excluded_sources"] == ["turn:s1:11", "turn:s1:12"]
+    _, off, _ = ask(settings=pc.Settings(mode="contract", drop_echoes=False), excluded_sources=("turn:s1:11",))
+    assert off.kwargs[0]["excluded_sources"] is None
+
+
+@pytest.mark.parametrize("scope,window", [
+    ("recent", ("2026-10-16", "2026-10-17")),
+    ("past_week", ("2026-10-10", "2026-10-17")),
+    ("past_month", ("2026-09-16", "2026-10-17")),
+    ("past_year", ("2025-10-16", "2026-10-17")),
+])
+def test_a_relative_time_scope_is_the_window_every_search_carries(scope, window):
+    b, expansion, jev = ask(decision=jev_decision("new_ask", 0.9, stands=0.95, scope=scope))
+    kw = expansion.kwargs[0]
+    assert (kw["date_from"], kw["date_to"]) == window and (b.date_from, b.date_to) == window
+    assert b.time_scope == scope
+    assert f"Only notes dated {window[0]} to {window[1]} were searched." in b.text
+    assert jev.decisions()[0]["questions"]["time_scope"]["type"] == "choice"
+
+
+@pytest.mark.parametrize("scope", ["none", "named"])
+def test_no_window_is_passed_for_none_and_for_a_named_period(scope):
+    """A named period ("in July") is dated by the library's writer, search by search; the plugin passes none."""
+    b, expansion, _ = ask(decision=jev_decision("new_ask", 0.9, stands=0.95, scope=scope))
+    kw = expansion.kwargs[0]
+    assert kw["date_from"] is None and kw["date_to"] is None and b.time_scope == scope
+    assert "were searched" not in b.text
+
+
+def test_an_unknown_or_missing_time_scope_answer_is_no_window_never_no_decision():
+    for mutate in (lambda a: a.pop("time_scope"), lambda a: a["time_scope"].update(choice="next_century"),
+                   lambda a: a.update(time_scope="garbage")):
+        decision = jev_decision("new_ask", 0.9, stands=0.95, scope="past_week")
+        mutate(decision["answers"])
+        b, expansion, _ = ask(decision=decision)
+        assert b.decision == "ask" and expansion.kwargs[0]["date_from"] is None
+
+
+def test_a_contract_without_the_time_scope_question_still_works(tmp_path):
+    import re
+    text = pc.DEFAULT_CONTRACT_PATH.read_text()
+    body = re.search(r"## jev-questions.*?```json\n(.*?)\n```", text, re.S).group(1)
+    questions = json.loads(body)
+    del questions["time_scope"]
+    path = tmp_path / "old.md"
+    path.write_text(text.replace(body, json.dumps(questions)))
+    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95, scope="past_week"))
+    expansion = FakeExpansion()
+    b = pc.run_contract(ROOF_Q, agent_last="", turns=1, deps=make_deps(expansion, jev), settings=SETTINGS,
+                        contract=pc.load_contract(path))
+    assert "time_scope" not in jev.decisions()[0]["questions"] and expansion.kwargs[0]["date_from"] is None
+    assert b.injected == 1
+
+
+def test_the_plugin_reads_only_what_it_uses_of_the_decision():
+    """stands_alone and the need_* are still asked (the contract's words) but nothing reads them any more."""
+    partial = jev_decision("new_ask", 0.9)
+    for gone in ("stands_alone", "need_decisions", "need_library", "need_conversations", "need_work", "need_person"):
+        del partial["answers"][gone]
+    b, expansion, _ = ask(decision=partial)
+    assert b.decision == "ask" and len(expansion.calls) == 1
+    fields = pc.Decision.__dataclass_fields__
+    assert "stands_alone" not in fields and "needs" not in fields and not hasattr(pc.Decision, "sources")
+
+
+@pytest.mark.parametrize("broken", [
+    lambda a: a.pop("needs_memory"), lambda a: a.pop("line_kind"),
+    lambda a: a["needs_memory"].update(noul=1.5), lambda a: a["needs_memory"].update(noul="high"),
+    lambda a: a["line_kind"].update(choice="whatever"),
+])
+def test_an_unreadable_decision_is_no_decision(broken):
+    decision = jev_decision("new_ask", 0.9)
+    broken(decision["answers"])
+    b, expansion, _ = ask(decision=decision)
+    assert b.decision == "fallback" and len(expansion.calls) == 1        # the rule: asked, with the note
+    assert "Searches were made without the decision model." in b.text
+
+
+def test_the_window_math_is_pure():
+    for scope in ("recent", "past_week", "past_month", "past_year", "named", "none"):
+        w = pc.relative_window(scope, date(2026, 3, 1))
+        assert (w is None) == (scope in ("none", "named"))
+        if w:
+            assert w[1] == "2026-03-01" and w[0] < w[1]
+
+
+# ---------------------------------------------------------------------------- a paste
+
+def test_a_paste_is_marked_as_material_by_its_size_and_goes_whole_to_the_library():
+    paste = "Minutes of the branch review. " * 2500                      # 75,000 characters
     line = paste + "\nCompare this with what we decided in March."
     jev = FakeJev(decision=jev_decision("material", 0.9))
-    writer = FakeWriter(questions_reply("What did we decide in March about the branch review?"))
-    store = FakeStore(default=[item("march", "March: keep the Henley branch open until the roof is fixed.")])
-    b = run(line, make_deps(store, jev, writer))
-    assert not jev.decisions()                                  # too long for Jev: marked as material by size
-    assert line in writer.prompts[0]                            # whole, never sliced
-    assert store.calls == ["What did we decide in March about the branch review?"]
-    assert b.line_kind == "material" and "March: keep the Henley branch open" in b.text
+    expansion = FakeExpansion()
+    b = run(line, make_deps(expansion, jev))
+    assert not jev.decisions()                                          # too long for Jev to read
+    assert b.line_kind == "material" and b.decision == "ask"
+    assert expansion.calls[0][0] == line                                # whole, never sliced
+    assert b.injected == 1
 
 
-def test_pasted_file_with_no_working_writer_asks_nothing_and_says_why():
-    line = "Minutes of the branch review. " * 2500 + "Compare with March."
-    store = FakeStore(default=[item("x")])
-    b = run(line, make_deps(store, FakeJev(), FakeWriter(fail=RuntimeError("no key"))), agent_last="")
-    assert not store.calls                                      # a pasted text is never asked as it is
-    assert b.text == "(memory was not consulted: no question could be written from this message)"
-
-
-def test_a_smaller_paste_goes_to_jev_as_material_then_to_the_writer():
+def test_a_smaller_paste_goes_to_jev_first():
     line = "Notes from the call: the roof, the budget, the opening hours.\n" * 40 + "What did we decide in March?"
-    jev = FakeJev(decision=jev_decision("material", 0.9, stands=0.4, need_decisions=1))
-    writer = FakeWriter(questions_reply("What did we decide in March about the Henley branch?"))
-    store = FakeStore(default=[item("march")])
-    b = run(line, make_deps(store, jev, writer))
-    assert len(jev.decisions()) == 1 and writer.prompts and b.questions == [
-        "What did we decide in March about the Henley branch?"]
-    assert line not in store.calls
+    b, expansion, jev = ask(line, decision=jev_decision("material", 0.9, stands=0.4))
+    assert len(jev.decisions()) == 1 and expansion.calls[0][0] == line
 
 
-def test_a_plain_standalone_question_is_asked_as_it_is_with_no_writer():
-    line = "What happened to the village library?"
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95, need_library=1))
-    writer, store = FakeWriter(), FakeStore(default=[item("closure")])
-    b = run(line, make_deps(store, jev, writer), agent_last="")
-    assert store.calls == [line] and not writer.prompts and b.questions == [line]
+def test_a_line_over_the_reading_limit_is_skipped():
+    expansion = FakeExpansion()
+    b = run("x " * (pc.MAX_LINE_CHARS // 2 + 10), make_deps(expansion, FakeJev(decision=jev_decision("new_ask", 0.9))))
+    assert b.text == "" and b.reason == "too large to read" and not expansion.calls
 
 
-def test_commission_style_line_gets_one_question_without_the_answer_form():
-    line = ("Quick question for the recall acceptance: what did we decide about the explainer's house "
-            "style? One sentence.")
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.8, need_decisions=1))
-    writer = FakeWriter(questions_reply("What did we decide about the explainer house style?"))
-    store = FakeStore(default=[item("style", "Explainer house style: one idea per page, plain words.")])
-    b = run(line, make_deps(store, jev, writer))
-    assert b.questions == ["What did we decide about the explainer house style?"]
-    assert store.calls == b.questions and "One sentence" not in "".join(store.calls)
-
-
-# ---------------------------------------------------------------------------- reading the answers
-
-def test_social_is_always_zero_and_needs_memory_below_half_is_zero():
-    for kind, needs in (("social", 0.95), ("new_ask", 0.49), ("follow_up", 0.0)):
-        jev = FakeJev(decision=jev_decision(kind, needs, need_decisions=1))
-        writer, store = FakeWriter(), FakeStore()
-        b = run("Thanks, that was helpful to know about it", make_deps(store, jev, writer))
-        assert b.text == "" and b.decision == "zero" and not store.calls and not writer.prompts
-
-
-@pytest.mark.parametrize("need,keep,drop", [
-    ({"need_conversations": 1}, "turn:s1:1", "note:a"),
-    ({"need_decisions": 1}, "note:a", "turn:s1:1"),
-    ({}, "note:a", None),                                      # none at 0.5: every source
-    ({"need_decisions": 1, "need_conversations": 1}, "note:a", None),
-])
-def test_need_answers_become_the_sources_asked(need, keep, drop):
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.9, **need))
-    store = FakeStore(default=[item("a", source="note:a"), item("t", source="turn:s1:1")])
-    b = run("What did we decide about the Henley branch last spring?", make_deps(store, jev, FakeWriter()))
-    assert f"source={keep} |" in b.text
-    if drop:
-        assert f"source={drop} |" not in b.text
-    else:
-        assert "source=turn:s1:1 |" in b.text and "source=note:a |" in b.text
-
-
-# ---------------------------------------------------------------------------- fallbacks
+# ---------------------------------------------------------------------------- fallbacks of the decision
 
 def test_jev_refusal_decides_by_rule_and_the_block_says_so():
-    err = RuntimeError("HTTP 400")
-    store = FakeStore(default=[item("a", "Henley branch: opening hours are 9 to 5.")])
-    deps = make_deps(store, FakeJev(fail_decision=err), FakeWriter())
+    expansion = FakeExpansion()
+    deps = make_deps(expansion, FakeJev(fail_decision=RuntimeError("HTTP 400")))
     b = run("What are the Henley branch opening hours these days?", deps)
-    assert b.decision == "fallback" and store.calls == ["What are the Henley branch opening hours these days?"]
-    assert "Questions formed without the decision model." in b.text
+    assert b.decision == "fallback" and len(expansion.calls) == 1
+    assert "Searches were made without the decision model." in b.text
+    assert expansion.kwargs[0]["date_from"] is None                     # no decision: no window
     short = run("sounds good", deps)
-    assert short.text == "" and short.decision == "fallback"      # three words or fewer, or a social line: zero
+    assert short.text == "" and short.decision == "fallback" and len(expansion.calls) == 1   # three words or fewer
 
 
 def test_slow_jev_falls_back_inside_its_budget():
     jev = FakeJev(decision=jev_decision("new_ask", 0.9), delay=2.0)
-    store = FakeStore(default=[item("a")])
     t0 = time.monotonic()
-    b = run("What did we decide about the Henley branch roof?", make_deps(store, jev, FakeWriter()))
-    assert time.monotonic() - t0 < 1.5 and b.decision == "fallback" and b.questions
-
-
-def test_jev_answering_only_some_questions_is_no_decision():
-    partial = jev_decision("new_ask", 0.9)
-    del partial["answers"]["need_work"]
-    b = run("What did we decide about the Henley branch roof?",
-            make_deps(FakeStore(default=[item("a")]), FakeJev(decision=partial), FakeWriter()))
-    assert b.decision == "fallback"
+    b = run(ROOF_Q, make_deps(FakeExpansion(), jev))
+    assert time.monotonic() - t0 < 1.5 and b.decision == "fallback" and b.injected == 1
 
 
 def test_jev_without_a_transport_or_key_still_gives_an_answer():
-    b = run("What did we decide about the Henley branch roof?", make_deps(FakeStore(default=[item("a")])))
-    assert b.decision == "fallback" and b.questions and b.text
-
-
-@pytest.mark.parametrize("writer", [
-    FakeWriter("not json at all"),
-    FakeWriter('{"queries": "nope"}'),
-    FakeWriter(fail=RuntimeError("provider down")),
-    FakeWriter(questions_reply("What is our house style?"), delay=2.0),
-])
-def test_writer_failure_asks_the_sentence_jev_rates_most_relevant(writer):
-    def pick(request):  # the "house style" sentence is the best one
-        return [3.0 if "house style" in r["instructions"]["text"] else 0.0 for r in request["questions"].values()]
-    jev = FakeJev(decision=jev_decision("go_ahead", 0.9, stands=0.1), score=pick)
-    store = FakeStore(default=[item("a")])
-    t0 = time.monotonic()
-    b = run("ok do it", make_deps(store, jev, writer))
-    assert time.monotonic() - t0 < 1.5
-    assert b.questions == ["Shall I write it in our explainer house style?"]
-    assert store.calls == b.questions
-
-
-def test_writer_failure_with_a_standalone_line_asks_the_line_whole():
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.9))
-    store = FakeStore(default=[item("a")])
-    line = "Before we start: what did we decide about the Henley roof? And who paid for it."
-    b = run(line, make_deps(store, jev, FakeWriter("garbage")))
-    assert b.questions == [line] and store.calls == [line]
-
-
-def test_writer_failure_and_a_bare_reply_asks_nothing_and_says_so():
-    jev = FakeJev(decision=jev_decision("go_ahead", 0.9, stands=0.1), fail_rank=RuntimeError("x"))
-    store = FakeStore()
-    b = run("ok go", make_deps(store, jev, FakeWriter(fail=RuntimeError("down"))), agent_last="")
-    assert not store.calls
-    assert b.text == "(memory was not consulted: no question could be written from this message)"
-
-
-def test_writer_with_zero_questions_is_zero_and_logs_nothing(caplog):
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    store = FakeStore()
-    with caplog.at_level(logging.DEBUG):
-        b = run("and the second one?", make_deps(store, jev, FakeWriter(questions_reply())))
-    assert b.text == "" and b.decision == "zero" and not store.calls
-    assert not [r for r in caplog.records if r.levelno >= logging.INFO]
-
-
-def test_writer_gets_at_most_three_questions():
-    qs = [f"What about thing number {i} on the roof?" for i in range(5)]
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.1))
-    store = FakeStore(default=[item("a")])
-    b = run("tell me about all of it", make_deps(store, jev, FakeWriter(questions_reply(*qs))))
-    assert b.questions == qs[:3]
-
-
-def test_search_error_says_memory_was_not_consulted():
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    b = run("What did we decide about the Henley branch roof?",
-            make_deps(FakeStore(fail=RuntimeError("db down")), jev, FakeWriter()))
-    assert b.text == "(memory was not consulted: the search failed)" and b.injected == 0
-
-
-def test_search_that_does_not_answer_in_time_is_dropped():
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    s = pc.Settings(mode="contract", search_timeout_s=0.2, deadline_s=3.0)
-    t0 = time.monotonic()
-    b = run("What did we decide about the Henley branch roof?",
-            make_deps(FakeStore(delay=2.0), jev, FakeWriter()), settings=s)
-    assert time.monotonic() - t0 < 1.0
-    assert b.text == "(memory was not consulted: the search did not answer in time)"
-
-
-def test_one_failed_question_does_not_drop_the_others():
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("Question one about the roof?", "Question two about the budget?"))
-
-    def search(q, scope):
-        if "one" in q:
-            raise RuntimeError("boom")
-        return pc.Found([item("budget", "The budget was 40 thousand.")])
-    b = run("and that?", pc.Deps(search=search, transport=jev, writer_llm=writer))
-    assert "The budget was 40 thousand." in b.text
-
-
-def test_an_unranked_search_keeps_the_first_page_per_question_and_says_so():
-    """Stage 2 failed in the library (it fell back to Stage 1's order): five of each question, a note."""
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("Question A about the roof?", "Question B about the budget?"))
-    store = FakeStore(by_question={
-        "Question A about the roof?": [item(f"a{i}") for i in range(8)],
-        "Question B about the budget?": [item(f"b{i}") for i in range(8)]}, ranked=False)
-    b = run("and that?", make_deps(store, jev, writer))
-    assert "The reranker could not rank these; they are in the search's own order." in b.text
-    assert b.injected == 10 and "stored text of a4" in b.text and "stored text of a5" not in b.text
-    assert b.ranked is False
-
-
-def test_a_ranked_search_is_shown_as_the_library_cut_it_without_a_note():
-    items = [item(f"n{i}") for i in range(14)]
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    b = run("What did we decide about the Henley branch roof?", make_deps(FakeStore(default=items), jev, FakeWriter()))
-    assert b.injected == 14 and b.ranked is True and "own order" not in b.text   # no first-page cap on a graded list
-
-
-def test_jev_is_never_asked_to_rank_the_results():
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    run("What did we decide about the Henley branch roof?",
-        make_deps(FakeStore(default=[item("a"), item("b")]), jev, FakeWriter()))
-    assert len(jev.requests) == 1 and not jev.rankings()      # the decision only: Stage 2 is the library's
-
-
-# ---------------------------------------------------------------------------- zero costs nothing
-
-def test_zero_path_makes_one_decision_call_and_nothing_else():
-    jev = FakeJev(decision=jev_decision("answer", 0.02))
-    writer, store = FakeWriter(), FakeStore()
-    b = run("no, the second option please", make_deps(store, jev, writer))
-    assert len(jev.requests) == 1 and not writer.prompts and not store.calls
-    assert b.cost_usd == pytest.approx(0.00004)
+    b = run(ROOF_Q, make_deps(FakeExpansion()))
+    assert b.decision == "fallback" and b.text and b.injected == 1
 
 
 # ---------------------------------------------------------------------------- the block
 
-def test_block_is_the_librarys_cited_evidence():
-    store = FakeStore(default=[item("a", date="2026-03-02", match="exact+semantic", snippet="the <<roof>> failed"),
-                               item("b", date="2026-04-01", kind="conversation", match="lexical"),
-                               item("c", date="2026-05-09", match="semantic")])
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    b = run("What did we decide about the Henley branch roof?", make_deps(store, jev, FakeWriter()))
-    lines = b.text.split("\n")
-    assert lines[0].startswith("Background from memory, gathered for this turn.")
-    assert "Asked: What did we decide about the Henley branch roof?" in b.text
-    assert ('[1] source=note:a | date=2026-03-02 | kind=note | match=exact+semantic\n'
+def test_the_block_is_the_contracts_intro_then_the_librarys_searches_cite_line_and_entries():
+    items = [item("a", date="2026-03-02", match="exact+semantic", snippet="the <<roof>> failed", found_by=(1, 2)),
+             item("b", date="2026-04-01", kind="conversation", match="lexical", found_by=(2,)),
+             item("c", date="2026-05-09", match="semantic", found_by=(1,))]
+    result = expanded([SearchSpec(query="Henley branch roof decision", terms=("Henley",)),
+                       SearchSpec(query="branch roof budget", date_from="2026-03-01", date_to="2026-05-31")], items)
+    b, _, _ = ask(expansion=FakeExpansion(result))
+    c = pc.load_contract()
+    assert b.text.startswith(c.intro) and HEADING not in b.text          # the contract's paragraph, not the library's
+    assert "Searches run (an item's header names the searches that found it):" in b.text
+    assert "(1) Henley branch roof decision | terms: Henley" in b.text
+    assert "(2) branch roof budget | dates: 2026-03-01 to 2026-05-31" in b.text
+    assert CITE_LINE in b.text                                           # the agent is told to cite [n]
+    assert ('[1] source=note:a | date=2026-03-02 | kind=note | match=exact+semantic | found_by=1,2\n'
             '    Exact match snippet: "the <<roof>> failed"\n    stored text of a') in b.text
-    assert "[2] source=note:b | date=2026-04-01 | kind=conversation | match=lexical\n    stored text of b" in b.text
-    assert "[3] source=note:c | date=2026-05-09 | kind=note | match=semantic\n    stored text of c" in b.text
-    assert b.text.count("Exact match snippet:") == 1          # only where a lexical retriever fired
-    assert "rated:" not in b.text and "more matched" not in b.text and b.injected == 3
-    # the entries are exactly what the library's own formatter writes
-    from prospecta.cited import format_cited_rag_block
-    assert b.text.endswith(format_cited_rag_block(store.default, heading=None))
+    assert "[2] source=note:b | date=2026-04-01 | kind=conversation | match=lexical | found_by=2\n    stored text of b" in b.text
+    assert b.text.count("Exact match snippet:") == 1 and "Asked:" not in b.text and "question" not in b.text.lower().replace(
+        "short question", "")
+    assert b.injected == 3 and b.searches == ["Henley branch roof decision", "branch roof budget"]
+    # everything after the intro is the library's own block, entry for entry
+    assert result.block[len(HEADING):].lstrip("\n") in b.text
 
 
-def test_no_count_cap_and_whole_entries_never_cut():
-    long_text = "A long note about the roof. " * 2000                    # 56,000 characters
-    items = [item(f"n{i}", f"note {i}: " + (long_text if i == 3 else "short text")) for i in range(14)]
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    b = run("What did we decide about the Henley branch roof?", make_deps(FakeStore(default=items), jev, FakeWriter()))
-    assert b.injected == 14 and "more matched" not in b.text
-    assert f"note 3: {long_text}" in b.text                                 # the long entry, whole
+def test_the_intro_replaces_the_librarys_heading_and_a_changed_heading_is_not_a_problem():
+    result = expanded(["roof"], [item("a")])
+    result = ExpandedRecall(**{**result.__dict__, "block": result.block.replace(HEADING, "A NEW LIBRARY HEADING:")})
+    b, _, _ = ask(expansion=FakeExpansion(result))
+    assert b.text.startswith(pc.load_contract().intro) and "A NEW LIBRARY HEADING:" in b.text and "[1] source=note:a" in b.text
 
 
-def test_parallel_questions_are_each_asked_once_and_merged_one_note_once():
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("Question A about the roof?", "Question B about the budget?",
-                                        "Question C about the opening hours?"))
-    gate_ = threading.Barrier(3, timeout=2)
-    seen = []
-
-    def search(q, scope):
-        gate_.wait()                      # all three must be in flight at once, or this times out
-        seen.append(q)
-        return pc.Found([item("shared", "one note both found"), item(q[:10], f"text for {q}")])
-    b = run("and that?", pc.Deps(search=search, transport=jev, writer_llm=writer))
-    assert len(seen) == 3 and b.injected == 4 and b.text.count("one note both found") == 1
-    assert len(jev.requests) == 1          # the decision only
+def test_nothing_answers_lists_the_searches_that_ran():
+    result = expanded(["Henley branch roof decision", "roof repair budget"], [])
+    b, _, _ = ask(expansion=FakeExpansion(result))
+    assert b.text == ("Memory was asked: Henley branch roof decision / roof repair budget. "
+                      "Nothing in it answers this.")
+    assert b.injected == 0 and b.reason == ""
 
 
-def test_a_note_two_questions_found_keeps_its_place_and_the_matched_words():
-    plain = item("party", "We watched Electric Dreams at the party.", match="semantic")
-    snip = item("party", "We watched Electric Dreams at the party.", match="exact+semantic",
-                snippet="watched <<Electric>> <<Dreams>> at")
-    other = item("other", "something else")
-    merged = pc.merge_lists([[plain, other], [snip]])
-    assert merged == [snip, other]                                  # one note once, first place, with its snippet
-    assert pc.merge_lists([[snip], [plain]]) == [snip]              # the one with words in context stays either way
-    assert pc.merge_lists([[plain], [item("party", match="lexical")]]) == [plain]   # no snippet either: the first stays
+def test_nothing_answers_inside_a_window_says_which_window():
+    b, _, _ = ask(decision=jev_decision("new_ask", 0.9, stands=0.95, scope="past_week"),
+                  expansion=FakeExpansion(expanded(["roof"], [])))
+    assert b.text == "Memory was asked: roof. Nothing in it answers this. Only notes dated 2026-10-10 to 2026-10-17 were searched."
 
 
-def test_nothing_answers_is_one_line():
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    empty = run("What did we decide about the Henley branch roof?", make_deps(FakeStore(), jev, FakeWriter()))
-    assert empty.text == "Memory was asked: What did we decide about the Henley branch roof?. Nothing in it answers this."
-    assert empty.injected == 0
+def test_only_the_searches_that_ran_are_listed_in_nothing_answers():
+    result = expanded(["first", "second", "third"], [], status={2: "error", 3: "late"})
+    b, _, _ = ask(expansion=FakeExpansion(result))
+    assert b.text == "Memory was asked: first. Nothing in it answers this."
 
 
-def test_max_tokens_valve_skips_whole_entries_and_is_off_by_default():
-    items = [item("a", "x" * 400), item("b", "y" * 4000), item("c", "z" * 400)]
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    off = run("What did we decide about the Henley branch roof?", make_deps(FakeStore(default=items), jev, FakeWriter()))
-    assert off.injected == 3
-    on = run("What did we decide about the Henley branch roof?", make_deps(FakeStore(default=items), jev, FakeWriter()),
-             settings=pc.Settings(mode="contract", max_tokens=450))
-    assert on.injected == 2 and "y" * 4000 not in on.text and "x" * 400 in on.text and "z" * 400 in on.text
-    assert "1 more matched less well." in on.text
-    assert not any(len(set(p.strip())) == 1 and 0 < len(p.strip()) < 400 for p in on.text.split("\n"))   # nothing cut mid-text
+def test_a_window_note_and_the_search_order_note_and_the_no_decision_note():
+    result = expanded(["roof"], [item("a")], reranked=False)
+    jev = FakeJev(fail_decision=RuntimeError("down"))
+    b = run(ROOF_Q, make_deps(FakeExpansion(result), jev))
+    assert "The reranker could not rank these; they are in the search's own order." in b.text
+    assert "Searches were made without the decision model." in b.text and b.ranked is False
+    b2, _, _ = ask(decision=jev_decision("new_ask", 0.9, stands=0.95, scope="recent"),
+                   expansion=FakeExpansion(expanded(["roof"], [item("a")])))
+    assert "Only notes dated 2026-10-16 to 2026-10-17 were searched." in b2.text and b2.ranked is True
+    assert "own order" not in b2.text
 
 
-# ---------------------------------------------------------------------------- provider: switch, never fails, deadline
+def test_a_graded_block_has_no_search_order_note_and_no_count_cap():
+    items = [item(f"n{i}", found_by=(1,)) for i in range(40)]
+    b, _, _ = ask(expansion=FakeExpansion(expanded(["roof"], items)))
+    assert b.injected == 40 and b.ranked is True and "own order" not in b.text and "more records" not in b.text
+
+
+def test_the_librarys_token_valve_line_comes_through():
+    result = expanded(["roof"], [item("a")])
+    block = result.block + "\n\n(3 more records matched less well and not shown.)"
+    result = ExpandedRecall(**{**result.__dict__, "block": block})
+    b, _, _ = ask(expansion=FakeExpansion(result))
+    assert b.text.endswith("(3 more records matched less well and not shown.)")
+
+
+# ---------------------------------------------------------------------------- failure: the not-consulted line
+
+def test_a_library_that_raises_gives_the_not_consulted_line(caplog):
+    with caplog.at_level(logging.DEBUG):
+        b, expansion, _ = ask(expansion=FakeExpansion(fail=RuntimeError("secret words: the Panama deal")))
+    assert b.text == "(memory was not consulted: the search failed)" and b.injected == 0 and len(expansion.calls) == 1
+    assert [r for r in caplog.records if r.levelno >= logging.INFO] == [] and "Panama" not in caplog.text
+
+
+@pytest.mark.parametrize("err", [RuntimeError("x"), KeyError("k"), ValueError(), OSError(5, "io"), AttributeError("no such")])
+def test_whatever_the_library_raises_is_the_not_consulted_line(err):
+    b, _, _ = ask(expansion=FakeExpansion(fail=err))
+    assert b.text == "(memory was not consulted: the search failed)"
+
+
+def test_an_error_result_is_the_not_consulted_line():
+    err = expanded([], [], error="the bank's channel_config has no hybrid_chunk channel")
+    b, _, _ = ask(expansion=FakeExpansion(err))
+    assert b.text == "(memory was not consulted: the search failed)" and "hybrid_chunk" not in b.text
+
+
+def test_every_search_failing_is_the_not_consulted_line():
+    b, _, _ = ask(expansion=FakeExpansion(expanded(["a", "b"], [], status={1: "error", 2: "error"})))
+    assert b.text == "(memory was not consulted: the search failed)"
+
+
+def test_every_search_late_is_the_not_consulted_line_in_time():
+    b, _, _ = ask(expansion=FakeExpansion(expanded(["a", "b"], [], status={1: "late", 2: "late"}, deadline_hit=True)))
+    assert b.text == "(memory was not consulted: the search did not answer in time)"
+
+
+def test_a_late_search_is_dropped_the_others_stand():
+    result = expanded(["a", "b"], [item("a")], status={2: "late"}, deadline_hit=True)
+    b, _, _ = ask(expansion=FakeExpansion(result))
+    assert "(1) a" in b.text and "(2) b" not in b.text and b.injected == 1
+
+
+def test_a_result_the_plugin_cannot_read_is_the_not_consulted_line():
+    b, _, _ = ask(expansion=FakeExpansion(lambda prompt, kw: object()))
+    assert b.text == "(memory was not consulted: the search failed)"
+
+
+# ---------------------------------------------------------------------------- the deadline
+
+def test_the_library_is_given_what_is_left_of_the_deadline():
+    jev = FakeJev(decision=jev_decision("new_ask", 0.9), delay=0.3)
+    expansion = FakeExpansion()
+    run(ROOF_Q, make_deps(expansion, jev), settings=pc.Settings(mode="contract", decision_timeout_s=1.0, deadline_s=2.0))
+    assert 1.4 < expansion.kwargs[0]["deadline"] < 1.8                 # 2.0 s minus the decision's 0.3 s
+
+
+def test_a_library_slower_than_the_deadline_is_the_not_consulted_line_in_time_and_its_late_answer_dropped():
+    expansion = FakeExpansion(delay=1.5)
+    s = pc.Settings(mode="contract", decision_timeout_s=0.5, deadline_s=0.4)
+    t0 = time.monotonic()
+    b, _, _ = ask(expansion=expansion, settings=s)
+    assert time.monotonic() - t0 < 1.0
+    assert b.text == "(memory was not consulted: the search did not answer in time)"
+    time.sleep(1.3)                                                      # the late call finishes: nothing changes
+    assert b.text == "(memory was not consulted: the search did not answer in time)" and b.injected == 0
+
+
+def test_no_time_left_after_the_decision_means_no_library_call():
+    jev = FakeJev(decision=jev_decision("new_ask", 0.9), delay=1.0)
+    expansion = FakeExpansion()
+    s = pc.Settings(mode="contract", decision_timeout_s=1.0, deadline_s=0.3)
+    t0 = time.monotonic()
+    b = run(ROOF_Q, make_deps(expansion, jev), settings=s)
+    assert time.monotonic() - t0 < 0.8 and not expansion.calls
+    assert b.text == "(memory was not consulted: the search did not answer in time)"
+
+
+def test_the_stage_budget_is_capped_by_what_is_left_of_the_deadline():
+    now = [0.0]
+    deps = pc.Deps(expand=FakeExpansion(), clock=lambda: now[0])
+    r = pc._Run(deps, pc.Settings(deadline_s=7.0), pc.load_contract(), started=0.0)
+    assert r.budget(1.0) == 1.0
+    now[0] = 6.5
+    assert r.budget(1.0) == 0.5
+    now[0] = 8.0
+    assert r.budget(1.0) == 0.0
+
+
+# ---------------------------------------------------------------------------- calls run in parallel in the library: the plugin adds none
+
+def test_one_decision_and_one_expansion_per_asked_turn_and_nothing_else():
+    _, expansion, jev = ask()
+    assert len(jev.requests) == 1 and len(expansion.calls) == 1
+
+
+def test_cost_adds_the_decision_and_the_librarys_accounting():
+    b, _, _ = ask(expansion=FakeExpansion(expanded(["roof"], [item("a")], cost=0.0007)))
+    assert b.cost_usd == pytest.approx(0.00004 + 0.0007)
+    assert b.stages_ms["expand"] >= 0 and "decide" in b.stages_ms and b.stages_ms["lib_writer"] == 11
+
+
+def test_the_library_s_fallbacks_are_kept_on_the_brief_for_diagnosis_without_logging():
+    result = expanded(["roof"], [item("a")], fallbacks=["writer: the writer failed (TimeoutError): one search with the prompt itself"])
+    b, _, _ = ask(expansion=FakeExpansion(result))
+    assert b.fallbacks == ["writer: the writer failed (TimeoutError): one search with the prompt itself"]
+
+
+# ---------------------------------------------------------------------------- the dead code is gone
+
+@pytest.mark.parametrize("name", [
+    "write_questions", "Written", "fallback_question", "jev_score", "JEV_TASK", "parse_questions", "valid_window",
+    "quoted_phrases", "keep_quoted", "with_phrase_queries", "is_plain_question", "default_writer_llm", "Scope", "Found",
+    "allowed", "merge_lists", "build_block", "cited_entries", "estimate_tokens", "MAX_QUESTIONS", "MAX_PHRASE_QUERIES",
+    "SEARCH_LIMIT", "FALLBACK_PAGE", "WRITER_TIMEOUT_S", "SEARCH_TIMEOUT_S", "PLAIN_QUESTION_CHARS", "SENTENCE_POOL",
+    "NEED_SOURCES", "ALL_SOURCES"])
+def test_the_plugins_own_question_writing_and_its_helpers_are_gone(name):
+    assert not hasattr(pc, name), name
+
+
+def test_settings_lost_the_writer_and_search_timeouts():
+    s = pc.Settings()
+    assert not hasattr(s, "writer_timeout_s") and not hasattr(s, "search_timeout_s")
+    assert (s.decision_timeout_s, s.deadline_s) == (1.0, 5.0)
+
+
+# ---------------------------------------------------------------------------- provider: switch, settings, never fails
 
 class FakeMemory:
-    def __init__(self, store, synth=None):
-        self.store, self.synth_calls = store, []
-        self._synth = synth
+    """The provider's Memory: ``expand_and_recall`` is the fake expansion; the old prefetch still has recall_synth."""
 
-    def search(self, q, **kw):
-        return self.store.search(q, **kw)
+    def __init__(self, expansion, synth=None):
+        self.expansion, self.synth_calls = expansion, []
+
+    def expand_and_recall(self, prompt, kind="chat", **kw):
+        return self.expansion(prompt, kind, **kw)
+
+    def search(self, *a, **k):
+        raise AssertionError("the contract prefetch never calls search: it is one expansion")
 
     def recall_synth(self, q, **kw):
         self.synth_calls.append(q)
+        from types import SimpleNamespace
         return SimpleNamespace(synthesis="An old synthesised answer.", sources=[SimpleNamespace(source="s1")])
 
     def _tracer(self, *a, **k):
         pass
 
 
+ENV = ("PROSPECTA_PREFETCH", "PROSPECTA_PREFETCH_MODE", "PROSPECTA_PREFETCH_DECISION_MODEL",
+       "PROSPECTA_PREFETCH_QUESTION_MODEL", "PROSPECTA_PREFETCH_CONTRACT", "PROSPECTA_PREFETCH_MAX_TOKENS",
+       "PROSPECTA_PREFETCH_DEADLINE", "PROSPECTA_PREFETCH_DECISION_TIMEOUT", "PROSPECTA_PREFETCH_WRITER_TIMEOUT",
+       "PROSPECTA_PREFETCH_SEARCH_TIMEOUT", "PROSPECTA_DECISION_MODEL", "PROSPECTA_QUERY_WRITER_MODEL",
+       "PROSPECTA_RERANKER_MODEL", "PROSPECTA_RECALL_STAGE3", "PROSPECTA_TIMEZONE", "PROSPECTA_JEV_MODEL")
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for k in ("PROSPECTA_PREFETCH", "PROSPECTA_PREFETCH_MODE", "PROSPECTA_PREFETCH_DECISION_MODEL",
-              "PROSPECTA_PREFETCH_QUESTION_MODEL", "PROSPECTA_PREFETCH_CONTRACT", "PROSPECTA_PREFETCH_MAX_TOKENS",
-              "PROSPECTA_PREFETCH_DEADLINE", "PROSPECTA_DECISION_MODEL", "PROSPECTA_QUERY_WRITER_MODEL",
-              "PROSPECTA_RERANKER_MODEL", "PROSPECTA_RECALL_STAGE3", "PROSPECTA_TIMEZONE"):
+    for k in ENV:
         monkeypatch.delenv(k, raising=False)
 
 
-def provider(plugin_module, *, config=None, store=None, jev=None, writer=None):
+def provider(plugin_module, *, config=None, expansion=None, jev=None):
     p = plugin_module.ProspectaProvider()
     p._config = dict(config or {})
     p._session_id = "s1"
-    p._memory = FakeMemory(store or FakeStore())
+    p.expansion = expansion if expansion is not None else FakeExpansion()
+    p._memory = FakeMemory(p.expansion)
     p._jev_transport = jev
-    p._writer_llm = writer
+    p._today = lambda: TODAY
     p._prefetch_cfg = p._resolve_prefetch_settings()
     return p
 
@@ -622,8 +688,8 @@ def test_defaults_are_off_and_flat_nested_and_env_settings_read(plugin_module, m
     p = plugin_module.ProspectaProvider()
     s = p._resolve_prefetch_settings()
     assert (s.mode, s.decision_model, s.query_writer_model, s.max_tokens, s.deadline_s) == (
-        "off", "typesafe/jev-1.14", "openrouter/google/gemini-2.5-flash-lite", 0, 5.0)
-    assert p._reranker_model() == "qwen/qwen3-reranker-8b"
+        "off", None, None, 0, 5.0)
+    assert p._reranker_model() is None and p._decision_model() is None
     p._config = {"recall.prefetch.mode": "contract", "recall.prefetch.max_tokens": "800",
                  "recall.prefetch.contract_path": "/x/c.md"}
     s = p._resolve_prefetch_settings()
@@ -634,39 +700,88 @@ def test_defaults_are_off_and_flat_nested_and_env_settings_read(plugin_module, m
     assert p._resolve_prefetch_settings().mode == "off"
 
 
-def test_the_three_models_are_configurable_profile_then_env_then_default(plugin_module, monkeypatch):
+def test_the_models_are_the_profiles_only_the_library_resolves_the_environment_and_the_defaults(plugin_module, monkeypatch):
     p = plugin_module.ProspectaProvider()
-    assert (p._decision_model(), p._reranker_model()) == ("typesafe/jev-1.14", "qwen/qwen3-reranker-8b")
     monkeypatch.setenv("PROSPECTA_DECISION_MODEL", "typesafe/jev-env")
     monkeypatch.setenv("PROSPECTA_QUERY_WRITER_MODEL", "openrouter/x/writer-env")
     monkeypatch.setenv("PROSPECTA_RERANKER_MODEL", "x/reranker-env")
     s = p._resolve_prefetch_settings()
-    assert (s.decision_model, s.query_writer_model, p._reranker_model()) == (
-        "typesafe/jev-env", "openrouter/x/writer-env", "x/reranker-env")
+    assert (s.decision_model, s.query_writer_model, p._decision_model(), p._reranker_model()) == (None,) * 4
     p._config = {"decision_model": "typesafe/jev-9", "query_writer_model": "openrouter/x/writer-cfg",
-                 "reranker_model": "x/reranker-cfg"}                        # the profile wins over the env
+                 "reranker_model": "x/reranker-cfg"}
     s = p._resolve_prefetch_settings()
     assert (s.decision_model, s.query_writer_model, p._reranker_model()) == (
         "typesafe/jev-9", "openrouter/x/writer-cfg", "x/reranker-cfg")
-    p._config = {"decision_model": "  ", "reranker_model": 5}               # blank or not a string: not set
-    assert (p._decision_model(), p._reranker_model()) == ("typesafe/jev-env", "x/reranker-env")
+    p._config = {"decision_model": "  ", "reranker_model": 5}              # blank or not a string: not set
+    assert (p._decision_model(), p._reranker_model()) == (None, None)
 
 
-def test_the_old_model_settings_are_ignored_loudly(plugin_module, monkeypatch, caplog):
+def test_the_writer_model_is_read_from_recall_prefetch_too_and_that_wins(plugin_module):
     p = plugin_module.ProspectaProvider()
-    p._config = {"recall.prefetch.decision_model": "typesafe/jev-old",
-                 "recall": {"prefetch": {"question_model": "openrouter/x/old"}}}
-    monkeypatch.setenv("PROSPECTA_PREFETCH_QUESTION_MODEL", "openrouter/x/old-env")
+    p._config = {"recall": {"prefetch": {"query_writer_model": "openrouter/x/nested"}}}
+    assert p._resolve_prefetch_settings().query_writer_model == "openrouter/x/nested"
+    p._config = {"recall.prefetch.query_writer_model": "openrouter/x/flat"}
+    assert p._resolve_prefetch_settings().query_writer_model == "openrouter/x/flat"
+    p._config = {"query_writer_model": "openrouter/x/top", "recall.prefetch.query_writer_model": "openrouter/x/flat"}
+    assert p._resolve_prefetch_settings().query_writer_model == "openrouter/x/flat"
+
+
+def test_the_old_question_model_key_is_a_deprecated_alias_with_one_warning_line(plugin_module, caplog):
+    for config in ({"recall": {"prefetch": {"question_model": "openrouter/x/old"}}},
+                   {"recall.prefetch.question_model": "openrouter/x/old"}):
+        p = plugin_module.ProspectaProvider()
+        p._config = dict(config)
+        assert p._resolve_prefetch_settings().query_writer_model == "openrouter/x/old"      # it still works
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            p._warn_renamed_settings()
+        assert len(caplog.records) == 1                                                       # ONE warning
+        msg = caplog.records[0].getMessage()
+        assert "\n" not in msg and "recall.prefetch.question_model is deprecated" in msg
+        assert "recall.prefetch.query_writer_model" in msg and "openrouter/x/old" not in msg
+
+
+def test_the_new_key_wins_over_the_deprecated_alias_and_the_warning_still_names_it(plugin_module, caplog):
+    p = plugin_module.ProspectaProvider()
+    p._config = {"recall": {"prefetch": {"question_model": "openrouter/x/old",
+                                         "query_writer_model": "openrouter/x/new"}}}
+    assert p._resolve_prefetch_settings().query_writer_model == "openrouter/x/new"
     with caplog.at_level(logging.WARNING):
         p._warn_renamed_settings()
-    assert p._resolve_prefetch_settings().decision_model == "typesafe/jev-1.14"        # not applied
-    for old, new in (("recall.prefetch.decision_model", "decision_model"),
-                     ("recall.prefetch.question_model", "query_writer_model"),
-                     ("PROSPECTA_PREFETCH_QUESTION_MODEL", "PROSPECTA_QUERY_WRITER_MODEL")):
-        assert f"{old} is ignored now; set {new}" in caplog.text
+    assert len(caplog.records) == 1 and "deprecated" in caplog.text
+
+
+def test_the_alias_is_warned_once_at_initialise_not_on_every_resolve_or_turn(plugin_module, caplog):
+    p = provider(plugin_module, config={**CONTRACT_ON, "recall": {"prefetch": {
+        "mode": "contract", "question_model": "openrouter/x/old"}}})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        p._prefetch_cfg = p._resolve_prefetch_settings()
+        for _ in range(3):
+            p.prefetch("What did we decide about the Henley branch roof?")
+    assert not caplog.records                                          # resolving and prefetching are silent
+
+
+def test_the_other_old_settings_stay_ignored_loudly_one_line_each(plugin_module, monkeypatch, caplog):
+    p = plugin_module.ProspectaProvider()
+    p._config = {"recall.prefetch.decision_model": "typesafe/jev-old",
+                 "recall": {"prefetch": {"writer_timeout_seconds": 2, "search_timeout_seconds": "3"}}}
+    monkeypatch.setenv("PROSPECTA_PREFETCH_QUESTION_MODEL", "openrouter/x/old-env")
+    monkeypatch.setenv("PROSPECTA_PREFETCH_SEARCH_TIMEOUT", "2")
+    with caplog.at_level(logging.WARNING):
+        p._warn_renamed_settings()
+    assert p._resolve_prefetch_settings().decision_model is None                          # not applied
+    for old in ("recall.prefetch.decision_model is ignored now; set decision_model",
+                "PROSPECTA_PREFETCH_QUESTION_MODEL is ignored now; set PROSPECTA_QUERY_WRITER_MODEL",
+                "recall.prefetch.writer_timeout_seconds is ignored now",
+                "recall.prefetch.search_timeout_seconds is ignored now",
+                "PROSPECTA_PREFETCH_SEARCH_TIMEOUT is ignored now"):
+        assert old in caplog.text, old
+    assert all("\n" not in r.getMessage() for r in caplog.records)
     caplog.clear()
     monkeypatch.delenv("PROSPECTA_PREFETCH_QUESTION_MODEL")
-    plugin_module.ProspectaProvider()._warn_renamed_settings()                         # nothing set: silent
+    monkeypatch.delenv("PROSPECTA_PREFETCH_SEARCH_TIMEOUT")
+    plugin_module.ProspectaProvider()._warn_renamed_settings()                           # nothing set: silent
     assert not caplog.records
 
 
@@ -683,55 +798,51 @@ def test_mode_is_read_at_initialize_so_the_next_session_picks_it_up(plugin_modul
     p._config = {"prefetch_enabled": "true"}
     assert p._resolve_prefetch_settings().mode == "off"
     p._config = {"prefetch_enabled": "true", "recall": {"prefetch": {"mode": "contract"}}}
-    assert p._resolve_prefetch_settings().mode == "contract"   # what initialize() stores per session
+    assert p._resolve_prefetch_settings().mode == "contract"
 
 
 def test_prefetch_disabled_changes_nothing_even_with_mode_contract(plugin_module):
-    jev, store = FakeJev(decision=jev_decision("new_ask", 0.9)), FakeStore(default=[item("a")])
-    p = provider(plugin_module, config={"recall": {"prefetch": {"mode": "contract"}}}, store=store, jev=jev,
-                 writer=FakeWriter())
-    assert p.prefetch("What did we decide about the Henley branch roof?") == ""
-    assert not jev.requests and not store.calls and p._memory.synth_calls == []
+    jev, expansion = FakeJev(decision=jev_decision("new_ask", 0.9)), FakeExpansion()
+    p = provider(plugin_module, config={"recall": {"prefetch": {"mode": "contract"}}}, expansion=expansion, jev=jev)
+    assert p.prefetch(ROOF_Q) == ""
+    assert not jev.requests and not expansion.calls and p._memory.synth_calls == []
     p._config = {"prefetch_enabled": "false", "recall": {"prefetch": {"mode": "contract"}}}
-    assert p.prefetch("What did we decide about the Henley branch roof?") == ""
-    assert not jev.requests
+    assert p.prefetch(ROOF_Q) == "" and not jev.requests
 
 
 def test_mode_off_keeps_the_old_synthesised_prefetch(plugin_module):
-    jev, store = FakeJev(decision=jev_decision("new_ask", 0.9)), FakeStore(default=[item("a")])
-    p = provider(plugin_module, config={"prefetch_enabled": "true"}, store=store, jev=jev, writer=FakeWriter())
+    jev, expansion = FakeJev(decision=jev_decision("new_ask", 0.9)), FakeExpansion()
+    p = provider(plugin_module, config={"prefetch_enabled": "true"}, expansion=expansion, jev=jev)
     out = p.prefetch("What did we decide?")
     assert "An old synthesised answer." in out and out.startswith("<prospecta-recall>")
-    assert p._memory.synth_calls == ["What did we decide?"] and not jev.requests and not store.calls
-    p.queue_prefetch("anything")                      # no ahead work either
+    assert p._memory.synth_calls == ["What did we decide?"] and not jev.requests and not expansion.calls
+    p.queue_prefetch("anything")
     time.sleep(0.1)
-    assert not jev.requests
+    assert not jev.requests and not expansion.calls
 
 
-def test_mode_contract_never_synthesises(plugin_module):
+def test_mode_contract_never_synthesises_and_never_searches_itself(plugin_module):
     jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    store = FakeStore(default=[item("roof", "The roof is to be replaced in June.")])
-    p = provider(plugin_module, config=CONTRACT_ON, store=store, jev=jev, writer=FakeWriter())
-    out = p.prefetch("What did we decide about the Henley branch roof?")
+    p = provider(plugin_module, config=CONTRACT_ON, jev=jev,
+                 expansion=FakeExpansion(expanded(["Henley roof"], [item("roof", "The roof is to be replaced in June.")])))
+    out = p.prefetch(ROOF_Q)
     assert "The roof is to be replaced in June." in out
-    assert p._memory.synth_calls == [] and p._last_brief.decision == "ask"
-    assert "<prospecta-recall>" not in out
+    assert p._memory.synth_calls == [] and p._last_brief.decision == "ask" and "<prospecta-recall>" not in out
 
 
 def test_a_successful_turn_writes_no_recall_log_line(plugin_module, caplog):
     jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    store = FakeStore(default=[item("roof", "The roof is to be replaced in June.")])
-    p = provider(plugin_module, config=CONTRACT_ON, store=store, jev=jev,
-                 writer=FakeWriter(questions_reply("What is the plan for the roof?")))
+    p = provider(plugin_module, config=CONTRACT_ON, jev=jev,
+                 expansion=FakeExpansion(expanded(["roof plan"], [item("roof", "The roof is to be replaced in June.")])))
     with caplog.at_level(logging.DEBUG):
         assert "The roof is to be replaced" in p.prefetch("and the roof?")
     assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
     assert not [r for r in caplog.records if "[recall]" in r.getMessage() or "brief" in r.getMessage()]
+    assert p.expansion.kwargs[0]["record"] is False
 
 
 def test_prefetch_never_raises_whatever_fails(plugin_module, monkeypatch, caplog):
-    p = provider(plugin_module, config=CONTRACT_ON, jev=FakeJev(decision=jev_decision("new_ask", 0.9)),
-                 writer=FakeWriter())
+    p = provider(plugin_module, config=CONTRACT_ON, jev=FakeJev(decision=jev_decision("new_ask", 0.9)))
 
     class Weird(Exception):
         pass
@@ -742,7 +853,7 @@ def test_prefetch_never_raises_whatever_fails(plugin_module, monkeypatch, caplog
         monkeypatch.setattr(plugin_module._pc, "run_contract", boom)   # the plugin's own copy of the module
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            assert p.prefetch("What did we decide about the Henley branch roof?") == ""
+            assert p.prefetch(ROOF_Q) == ""
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
         assert "Panama" not in caplog.text and "Henley" not in caplog.text    # no text in the log
@@ -752,37 +863,91 @@ def test_prefetch_never_raises_whatever_fails(plugin_module, monkeypatch, caplog
     p2 = provider(plugin_module, config={**CONTRACT_ON, "recall": {"prefetch": {"mode": "contract",
                                                                               "contract_path": "/no/such.md"}}})
     p2._prefetch_cfg = p2._resolve_prefetch_settings()
-    assert p2.prefetch("What did we decide about the Henley branch roof?") == ""
+    assert p2.prefetch(ROOF_Q) == ""
+
+
+def test_a_library_without_the_entry_point_goes_without_memory_with_one_warning_line(plugin_module, caplog):
+    from types import SimpleNamespace
+    p = provider(plugin_module, config=CONTRACT_ON, jev=FakeJev(decision=jev_decision("new_ask", 0.9)))
+    p._memory = SimpleNamespace(search=lambda *a, **k: [])          # the pinned library before PR 85: no entry point
+    with caplog.at_level(logging.INFO):
+        assert p.prefetch(ROOF_Q) == ""
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and "AttributeError" in warnings[0].getMessage() and "Henley" not in caplog.text
 
 
 def test_every_stage_failing_still_returns_a_string(plugin_module):
-    p = provider(plugin_module, config=CONTRACT_ON, store=FakeStore(fail=RuntimeError("db")),
-                 jev=FakeJev(fail_decision=RuntimeError("down")), writer=FakeWriter(fail=RuntimeError("down")))
-    out = p.prefetch("What did we decide about the Henley branch roof?")
+    p = provider(plugin_module, config=CONTRACT_ON, expansion=FakeExpansion(fail=RuntimeError("db")),
+                 jev=FakeJev(fail_decision=RuntimeError("down")))
+    out = p.prefetch(ROOF_Q)
     assert isinstance(out, str) and out == "(memory was not consulted: the search failed)"
 
 
 def test_the_deadline_is_honoured_and_a_late_answer_is_dropped(plugin_module, caplog):
-    store = FakeStore(default=[item("roof", "late note")], delay=1.5)
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    p = provider(plugin_module, config=CONTRACT_ON, store=store, jev=jev, writer=FakeWriter())
-    p._prefetch_cfg = pc.Settings(mode="contract", deadline_s=0.4, search_timeout_s=5.0)
+    expansion = FakeExpansion(delay=1.5)
+    p = provider(plugin_module, config=CONTRACT_ON, expansion=expansion,
+                 jev=FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95)))
+    p._prefetch_cfg = pc.Settings(mode="contract", deadline_s=0.4)
     t0 = time.monotonic()
     with caplog.at_level(logging.INFO):
-        out = p.prefetch("What did we decide about the Henley branch roof?")
+        out = p.prefetch(ROOF_Q)
     assert out == "(memory was not consulted: the search did not answer in time)"
     assert time.monotonic() - t0 < 1.0
-    assert "Henley" not in caplog.text and "late note" not in out
-    time.sleep(1.4)                                  # the late worker finishes: nothing is injected afterwards
-    assert p._last_brief.text == out and "late note" not in p._last_brief.text
+    assert "Henley" not in caplog.text
+    time.sleep(1.4)                                  # the late call finishes: nothing is injected afterwards
+    assert p._last_brief.text == out
 
 
-def test_the_default_deadline_is_below_cores_wait(plugin_module):
+def test_a_hung_run_is_ended_by_the_provider_and_goes_without_memory(plugin_module, monkeypatch, caplog):
+    p = provider(plugin_module, config=CONTRACT_ON)
+    p._prefetch_cfg = pc.Settings(mode="contract", deadline_s=0.3)
+    monkeypatch.setattr(plugin_module._pc, "run_contract", lambda *a, **k: time.sleep(2))
+    t0 = time.monotonic()
+    with caplog.at_level(logging.INFO):
+        assert p.prefetch(ROOF_Q) == ""
+    assert time.monotonic() - t0 < 1.0
+    assert [r.levelno for r in caplog.records] == [logging.WARNING] and "Henley" not in caplog.text
+
+
+def test_the_deadline_is_five_seconds_by_default_and_never_above_seven(plugin_module):
     s = plugin_module.ProspectaProvider()._resolve_prefetch_settings()
-    assert s.deadline_s == 5.0 < 8.0                 # agent/memory_manager.py _EXTERNAL_PREFETCH_TIMEOUT_S
+    assert s.deadline_s == 5.0
     p = plugin_module.ProspectaProvider()
     p._config = {"recall.prefetch.deadline_seconds": "30"}
-    assert p._resolve_prefetch_settings().deadline_s < 8.0
+    assert p._resolve_prefetch_settings().deadline_s == 7.0
+    p._config = {"recall.prefetch.deadline_seconds": "6.5"}
+    assert p._resolve_prefetch_settings().deadline_s == 6.5
+    assert pc.MAX_DEADLINE_S == 7.0
+
+
+def test_the_library_never_gets_more_than_the_cap(plugin_module):
+    p = provider(plugin_module, config={**CONTRACT_ON, "recall.prefetch.deadline_seconds": "30"},
+                 jev=FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95)))
+    p.prefetch(ROOF_Q)
+    assert 0 < p.expansion.kwargs[0]["deadline"] <= 7.0
+
+
+# ---------------------------------------------------------------------------- the stage limit the plugin still owns
+
+def test_the_decision_limit_default_and_overrides(plugin_module, monkeypatch):
+    assert plugin_module.ProspectaProvider()._resolve_prefetch_settings().decision_timeout_s == 1.0
+    p = plugin_module.ProspectaProvider()
+    p._config = {"recall": {"prefetch": {"decision_timeout_seconds": "3.25"}}}
+    assert p._resolve_prefetch_settings().decision_timeout_s == 3.25
+    p._config = {"recall.prefetch.decision_timeout_seconds": 2}
+    assert p._resolve_prefetch_settings().decision_timeout_s == 2.0
+    monkeypatch.setenv("PROSPECTA_PREFETCH_DECISION_TIMEOUT", "0.75")
+    assert p._resolve_prefetch_settings().decision_timeout_s == 0.75
+
+
+@pytest.mark.parametrize("bad", ["soon", "-1", "0", "nan", "inf"])
+def test_a_bad_decision_limit_falls_back_with_one_warning(plugin_module, caplog, bad):
+    p = plugin_module.ProspectaProvider()
+    p._config = {"recall": {"prefetch": {"decision_timeout_seconds": bad}}}
+    with caplog.at_level(logging.WARNING):
+        s = p._resolve_prefetch_settings()
+    assert s.decision_timeout_s == 1.0
+    assert [r.levelno for r in caplog.records] == [logging.WARNING] and "decision_timeout_seconds" in caplog.text
 
 
 # ---------------------------------------------------------------------------- the agent's last answer and ahead
@@ -795,18 +960,6 @@ def _sync(p, user, assistant, monkeypatch, sid="s1"):
     time.sleep(0.003)             # a turn's source ends in the millisecond: keep two turns apart
 
 
-def test_sync_turn_keeps_the_agents_last_answer_per_session(plugin_module, monkeypatch):
-    jev = FakeJev(decision=jev_decision("go_ahead", 0.1))
-    p = provider(plugin_module, config=CONTRACT_ON, jev=jev, writer=FakeWriter())
-    _sync(p, "hello there", OPENER_AGENT_LAST, monkeypatch)
-    _sync(p, "other", "A different answer for another session.", monkeypatch, sid="s2")
-    p.prefetch("ok do it please")
-    assert jev.decisions()[0]["state"]["agent_last"] == OPENER_AGENT_LAST
-    assert "4 earlier" not in jev.decisions()[0]["state"]["in_view"] and "1 earlier" in jev.decisions()[0]["state"]["in_view"]
-    p.prefetch("and then", session_id="s2")
-    assert jev.decisions()[1]["state"]["agent_last"] == "A different answer for another session."
-
-
 def _wait(cond, secs=3.0):
     end = time.monotonic() + secs
     while time.monotonic() < end:
@@ -816,189 +969,83 @@ def _wait(cond, secs=3.0):
     return False
 
 
+def test_sync_turn_keeps_the_agents_last_answer_per_session_and_the_library_gets_it(plugin_module, monkeypatch):
+    jev = FakeJev(decision=jev_decision("go_ahead", 0.9, stands=0.1))
+    p = provider(plugin_module, config=CONTRACT_ON, jev=jev)
+    _sync(p, "hello there", OPENER_AGENT_LAST, monkeypatch)
+    _sync(p, "other", "A different answer for another session.", monkeypatch, sid="s2")
+    p.prefetch("ok do it please")
+    assert jev.decisions()[0]["state"]["agent_last"] == OPENER_AGENT_LAST
+    assert p.expansion.kwargs[0]["agent_last"] == OPENER_AGENT_LAST
+    assert "1 earlier" in jev.decisions()[0]["state"]["in_view"]
+    p.prefetch("and then", session_id="s2")
+    assert jev.decisions()[1]["state"]["agent_last"] == "A different answer for another session."
+    assert p.expansion.kwargs[1]["agent_last"] == "A different answer for another session."
+
+
 def test_ahead_is_keyed_on_the_agents_answer_and_spares_the_next_turn(plugin_module, monkeypatch):
     jev = FakeJev(decision=jev_decision("go_ahead", 0.9, stands=0.1, need_library=1))
-    writer = FakeWriter(questions_reply("What happened to the village library?"))
-    store = FakeStore(default=[item("closure", "The library closed on 4 June after the roof failed.")])
-    p = provider(plugin_module, config=CONTRACT_ON, store=store, jev=jev, writer=writer)
+    expansion = FakeExpansion(expanded(["village library closure"],
+                                       [item("closure", "The library closed on 4 June after the roof failed.")]))
+    p = provider(plugin_module, config=CONTRACT_ON, expansion=expansion, jev=jev)
     _sync(p, "can you help with an explainer?", OPENER_AGENT_LAST, monkeypatch)
     p.queue_prefetch("can you help with an explainer?", session_id="s1")           # the person's words
     assert _wait(lambda: "s1" in p._ahead)
-    assert OPENER_AGENT_LAST in writer.prompts[0]                                  # keyed on the agent's answer
-    assert "can you help with an explainer?" not in writer.prompts[0]
-    assert not jev.decisions()                                                     # nobody replied: no decision
+    (prompt, kind, kw) = expansion.calls[0]
+    assert kw["agent_last"] == OPENER_AGENT_LAST and prompt == pc.AHEAD_PROMPT      # keyed on the agent's answer
+    assert "can you help with an explainer?" not in prompt and kw["gate"] is False and kw["record"] is False
+    assert not jev.decisions()                                                      # nobody replied: no decision
     assert p._ahead["s1"].key == pc.ahead_key(OPENER_AGENT_LAST)
-    n_writer, n_search = len(writer.prompts), len(store.calls)
-    out = p.prefetch("ok do it")                                                   # the go-ahead
+    n = len(expansion.calls)
+    out = p.prefetch("ok do it")                                                    # the go-ahead
     assert "The library closed on 4 June" in out
-    assert len(writer.prompts) == n_writer and len(store.calls) == n_search        # used, not recomputed
-    assert p._last_brief.ahead_used and "s1" not in p._ahead                       # one use
+    assert len(expansion.calls) == n                                                # used, not recomputed
+    assert p._last_brief.ahead_used and "s1" not in p._ahead                        # one use
 
 
 def test_ahead_is_not_used_when_the_agent_said_something_else(plugin_module, monkeypatch):
     jev = FakeJev(decision=jev_decision("go_ahead", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("What happened to the village library?"))
-    store = FakeStore(default=[item("closure", "closure text")])
-    p = provider(plugin_module, config=CONTRACT_ON, store=store, jev=jev, writer=writer)
+    p = provider(plugin_module, config=CONTRACT_ON, jev=jev,
+                 expansion=FakeExpansion(expanded(["closure"], [item("closure", "closure text")])))
     _sync(p, "x", OPENER_AGENT_LAST, monkeypatch)
     p.queue_prefetch("x", session_id="s1")
     assert _wait(lambda: "s1" in p._ahead)
     _sync(p, "ok do it", "Done. The draft is in the chat.", monkeypatch)           # a new answer: the old key is stale
-    n = len(writer.prompts)
+    n = len(p.expansion.calls)
     p.prefetch("ok do it")
-    assert not p._last_brief.ahead_used and len(writer.prompts) == n + 1
+    assert not p._last_brief.ahead_used and len(p.expansion.calls) == n + 1
+
+
+def test_a_proposal_that_finds_nothing_keeps_no_ahead_entry(plugin_module, monkeypatch):
+    p = provider(plugin_module, config=CONTRACT_ON, expansion=FakeExpansion(expanded(["closure"], [])))
+    _sync(p, "x", OPENER_AGENT_LAST, monkeypatch)
+    p.queue_prefetch("x", session_id="s1")
+    assert _wait(lambda: p.expansion.calls)
+    time.sleep(0.2)
+    assert "s1" not in p._ahead
 
 
 def test_no_ahead_unless_the_agent_ended_on_a_proposal(plugin_module, monkeypatch):
-    jev, writer = FakeJev(decision=jev_decision("go_ahead", 0.9)), FakeWriter(questions_reply("A question?"))
-    p = provider(plugin_module, config=CONTRACT_ON, store=FakeStore(default=[item("a")]), jev=jev, writer=writer)
+    p = provider(plugin_module, config=CONTRACT_ON, jev=FakeJev(decision=jev_decision("go_ahead", 0.9)))
     _sync(p, "x", "The draft is finished and saved in the chat.", monkeypatch)
     p.queue_prefetch("x", session_id="s1")
     time.sleep(0.2)
-    assert not writer.prompts and "s1" not in p._ahead
+    assert not p.expansion.calls and "s1" not in p._ahead
 
 
 def test_no_ahead_with_the_switch_off(plugin_module, monkeypatch):
     for config in ({"prefetch_enabled": "true"}, {"recall": {"prefetch": {"mode": "contract"}}}):
-        writer = FakeWriter(questions_reply("A question?"))
-        p = provider(plugin_module, config=config, store=FakeStore(default=[item("a")]),
-                     jev=FakeJev(decision=jev_decision("go_ahead", 0.9)), writer=writer)
+        p = provider(plugin_module, config=config, jev=FakeJev(decision=jev_decision("go_ahead", 0.9)))
         _sync(p, "x", OPENER_AGENT_LAST, monkeypatch)
         p.queue_prefetch("x", session_id="s1")
         time.sleep(0.2)
-        assert not writer.prompts and not p._ahead
+        assert not p.expansion.calls and not p._ahead
 
 
 def test_queue_prefetch_never_raises(plugin_module, monkeypatch):
     p = provider(plugin_module, config=CONTRACT_ON)
     monkeypatch.setattr(p, "_last_exchange", lambda sid: (_ for _ in ()).throw(RuntimeError("x")))
     p.queue_prefetch("anything", session_id="s1")
-
-
-# ---------------------------------------------------------------------------- the stage limits
-
-STAGE_KEYS = {"decision_timeout_seconds": "decision_timeout_s", "writer_timeout_seconds": "writer_timeout_s",
-              "search_timeout_seconds": "search_timeout_s"}
-STAGE_ENV = {"decision_timeout_seconds": "PROSPECTA_PREFETCH_DECISION_TIMEOUT",
-             "writer_timeout_seconds": "PROSPECTA_PREFETCH_WRITER_TIMEOUT",
-             "search_timeout_seconds": "PROSPECTA_PREFETCH_SEARCH_TIMEOUT"}
-
-
-def test_stage_limit_defaults(plugin_module):
-    s = plugin_module.ProspectaProvider()._resolve_prefetch_settings()
-    assert (s.decision_timeout_s, s.writer_timeout_s, s.search_timeout_s) == (1.0, 1.5, 4.5)
-    assert not hasattr(s, "rank_timeout_s")          # the second rank call is gone: Stage 2 is the library's
-
-
-@pytest.mark.parametrize("key", list(STAGE_KEYS))
-def test_each_stage_limit_is_overridden_nested_flat_and_env(plugin_module, monkeypatch, key):
-    attr = STAGE_KEYS[key]
-    p = plugin_module.ProspectaProvider()
-    p._config = {"recall": {"prefetch": {key: "3.25"}}}
-    s = p._resolve_prefetch_settings()
-    assert getattr(s, attr) == 3.25
-    assert [getattr(s, a) for a in STAGE_KEYS.values() if a != attr] == [
-        getattr(pc.Settings(), a) for a in STAGE_KEYS.values() if a != attr]
-    p._config = {f"recall.prefetch.{key}": 2}
-    assert getattr(p._resolve_prefetch_settings(), attr) == 2.0
-    monkeypatch.setenv(STAGE_ENV[key], "0.75")
-    assert getattr(p._resolve_prefetch_settings(), attr) == 0.75
-
-
-@pytest.mark.parametrize("key", list(STAGE_KEYS))
-@pytest.mark.parametrize("bad", ["soon", "-1", "0", "nan", "inf"])
-def test_bad_stage_limit_falls_back_with_one_warning(plugin_module, caplog, key, bad):
-    p = plugin_module.ProspectaProvider()
-    p._config = {"recall": {"prefetch": {key: bad}}}
-    with caplog.at_level(logging.WARNING):
-        s = p._resolve_prefetch_settings()
-    assert getattr(s, STAGE_KEYS[key]) == getattr(pc.Settings(), STAGE_KEYS[key])
-    assert [r.levelno for r in caplog.records] == [logging.WARNING] and key in caplog.text
-
-
-def _timed_search(plugin_module, search_s, **cfg):
-    store = FakeStore(default=[item("roof", "the roof note")], delay=search_s)
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    p = provider(plugin_module, config=CONTRACT_ON, store=store, jev=jev, writer=FakeWriter())
-    p._prefetch_cfg = pc.Settings(mode="contract", **cfg)
-    return p.prefetch("What did we decide about the Henley branch roof?")
-
-
-def test_a_search_of_4s_is_under_the_default_limit_and_returns_a_block(plugin_module):
-    # the defaults of the stages add up to more than the deadline; the search is still given its 4.5 s
-    out = _timed_search(plugin_module, 0.4, search_timeout_s=0.5, deadline_s=1.0)  # scaled: 0.4 < 0.5 limit
-    assert "the roof note" in out and "not consulted" not in out
-    s = pc.Settings()
-    assert s.search_timeout_s == 4.5 and s.deadline_s >= 4.5 + 0.3
-
-
-def test_a_slow_search_still_gets_a_block_through_the_real_defaults(plugin_module):
-    out = _timed_search(plugin_module, 4.0, deadline_s=7.0)
-    assert "the roof note" in out
-
-
-def test_a_search_of_6s_gets_the_not_consulted_line(plugin_module):
-    out = _timed_search(plugin_module, 6.0, deadline_s=7.0)
-    assert out == "(memory was not consulted: the search did not answer in time)"
-
-
-def test_the_deadline_wins_over_the_stage_limits(plugin_module):
-    t0 = time.monotonic()
-    out = _timed_search(plugin_module, 6.0, deadline_s=1.0, search_timeout_s=4.5)
-    assert out == "(memory was not consulted: the search did not answer in time)"
-    assert time.monotonic() - t0 < 1.5
-
-
-def test_the_stage_budget_is_capped_by_what_is_left_of_the_deadline():
-    now = [0.0]
-    deps = pc.Deps(search=lambda q, scope: pc.Found([]), clock=lambda: now[0])
-    run = pc._Run(deps, pc.Settings(deadline_s=7.0), pc.load_contract(), started=0.0)
-    assert run.budget(4.5) == 4.5
-    now[0] = 3.0
-    assert run.budget(4.5) == 4.0
-    now[0] = 8.0
-    assert run.budget(4.5) == 0.0
-
-
-# ---------------------------------------------------------------------------- what the writer is given
-
-def _writer_input(prompt):
-    return prompt[prompt.index("## Input"):]
-
-
-def test_writer_kinds_are_any_when_no_need_reached_half():
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("Who was the person with at the cafe?"))
-    b = run("do you remember who i saw it with?", make_deps(FakeStore(default=[item("a")]), jev, writer))
-    assert b.sources == list(pc.ALL_SOURCES)          # the search still uses all of them
-    text = _writer_input(writer.prompts[0])
-    assert "The kinds of knowledge needed: any" in text
-    assert not any(src in text.split("kinds of knowledge needed:")[1] for src in pc.ALL_SOURCES)
-    assert OPENER_AGENT_LAST in text                  # the last answer, and only it, is the context
-
-
-def test_writer_kinds_are_only_the_chosen_ones():
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1, need_decisions=0.8))
-    writer = FakeWriter(questions_reply("What was decided?"))
-    run("and that?", make_deps(FakeStore(default=[item("a")]), jev, writer))
-    kinds = _writer_input(writer.prompts[0]).split("The kinds of knowledge needed: ")[1].split("\n\n")[0].strip()
-    assert kinds == pc.NEED_SOURCES["need_decisions"]
-
-
-def test_writer_context_is_exactly_the_last_answer():
-    seen = {}
-    import prospecta._formulate as f
-    real = f.formulate_queries
-
-    def spy(line, **kw):
-        seen["context"] = kw["context"]
-        return real(line, **kw)
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    import unittest.mock as um
-    with um.patch.object(f, "formulate_queries", spy):
-        run("and that?", make_deps(FakeStore(default=[item("a")]), jev, FakeWriter(questions_reply("Q one?"))),
-            agent_last="LAST ANSWER ONLY")
-    assert seen["context"] == "LAST ANSWER ONLY"
 
 
 # ---------------------------------------------------------------------------- the last answer after a restart
@@ -1059,11 +1106,10 @@ def test_recovery_is_read_only(plugin_module, tmp_path):
     assert sorted(x.name for x in tmp_path.iterdir()) == ["state.db"]
 
 
-def test_recovery_reaches_decision_and_writer_once_per_session(plugin_module, tmp_path, monkeypatch):
+def test_the_recovered_last_answer_reaches_the_decision_and_the_library_once_per_session(plugin_module, tmp_path,
+                                                                                         monkeypatch):
     jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("Who was the person with?"))
-    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "We met Ana at the cafe.", 1)],
-                   store=FakeStore(default=[item("a")]), jev=jev, writer=writer)
+    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "We met Ana at the cafe.", 1)], jev=jev)
     calls = []
     real = p._read_last_assistant
     monkeypatch.setattr(p, "_read_last_assistant", lambda sid: calls.append(sid) or real(sid))
@@ -1071,18 +1117,16 @@ def test_recovery_reaches_decision_and_writer_once_per_session(plugin_module, tm
     p.prefetch("and then?")
     assert calls == ["s1"]
     assert jev.decisions()[0]["state"]["agent_last"] == "We met Ana at the cafe."
-    assert "We met Ana at the cafe." in writer.prompts[0]
-    assert "The kinds of knowledge needed: any" in writer.prompts[0]
+    assert [kw["agent_last"] for kw in p.expansion.kwargs] == ["We met Ana at the cafe."] * 2
 
 
 def test_recovery_does_not_run_when_an_answer_is_held(plugin_module, tmp_path, monkeypatch):
     jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "from the db", 1)], jev=jev,
-                   writer=FakeWriter(questions_reply("Q?")), store=FakeStore(default=[item("a")]))
+    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "from the db", 1)], jev=jev)
     _sync(p, "hello", "kept answer", monkeypatch)
     monkeypatch.setattr(p, "_read_last_assistant", lambda sid: pytest.fail("must not read"))
     p.prefetch("and that?")
-    assert jev.decisions()[0]["state"]["agent_last"] == "kept answer"
+    assert jev.decisions()[0]["state"]["agent_last"] == "kept answer" and p.expansion.kwargs[0]["agent_last"] == "kept answer"
 
 
 def test_recovery_never_fails_the_turn(plugin_module, tmp_path, monkeypatch):
@@ -1094,55 +1138,53 @@ def test_recovery_never_fails_the_turn(plugin_module, tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------- no echoes: the thread's last turns, in SQL
 
-def _turns_provider(plugin_module, monkeypatch, n=3, config=None, store=None):
-    store = store or FakeStore(default=[item("roof", "The roof is to be replaced in June.")])
-    p = provider(plugin_module, config=config if config is not None else CONTRACT_ON, store=store,
-                 jev=FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1)),
-                 writer=FakeWriter(questions_reply("What about the roof?")))
+def _turns_provider(plugin_module, monkeypatch, n=3, config=None):
+    p = provider(plugin_module, config=config if config is not None else CONTRACT_ON,
+                 expansion=FakeExpansion(expanded(["roof"], [item("roof", "The roof is to be replaced in June.")])),
+                 jev=FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1)))
     for i in range(1, n + 1):
         _sync(p, f"user line {i}", f"assistant reply {i}", monkeypatch)
-    return p, store
+    return p
 
 
-def test_the_last_two_turns_are_excluded_in_sql_and_older_turns_stay_eligible(plugin_module, monkeypatch):
-    p, store = _turns_provider(plugin_module, monkeypatch, n=3)
+def test_the_last_two_turns_are_excluded_for_every_search_and_older_turns_stay_eligible(plugin_module, monkeypatch):
+    p = _turns_provider(plugin_module, monkeypatch, n=3)
     first, second, third = [k["source"] for k in p._retained]
     assert all(src.startswith("turn:s1:") for src in (first, second, third)) and len({first, second, third}) == 3
     assert p._echo_sources("s1") == [second, third]
     assert "The roof is to be replaced in June." in p.prefetch("and the roof?")
-    (kw,) = store.kwargs
+    (kw,) = p.expansion.kwargs
     assert kw["excluded_sources"] == [second, third] and first not in kw["excluded_sources"]
-    assert kw["mode"] == "hybrid"
 
 
 def test_a_session_with_one_turn_excludes_that_one(plugin_module, monkeypatch):
-    p, store = _turns_provider(plugin_module, monkeypatch, n=1)
+    p = _turns_provider(plugin_module, monkeypatch, n=1)
     p.prefetch("and the roof?")
-    assert store.kwargs[0]["excluded_sources"] == [p._retained[0]["source"]]
+    assert p.expansion.kwargs[0]["excluded_sources"] == [p._retained[0]["source"]]
 
 
 def test_the_first_message_of_a_session_excludes_nothing(plugin_module, monkeypatch):
-    p, store = _turns_provider(plugin_module, monkeypatch, n=0)
+    p = _turns_provider(plugin_module, monkeypatch, n=0)
     p.prefetch("and the roof?")
-    assert "excluded_sources" not in store.kwargs[0] and "date_from" not in store.kwargs[0]
+    assert p.expansion.kwargs[0]["excluded_sources"] is None and p.expansion.kwargs[0]["date_from"] is None
 
 
 def test_each_session_excludes_only_its_own_turns(plugin_module, monkeypatch):
-    p, store = _turns_provider(plugin_module, monkeypatch, n=2)
+    p = _turns_provider(plugin_module, monkeypatch, n=2)
     _sync(p, "other user", "other reply", monkeypatch, sid="s2")
     p.prefetch("and the roof?")
     p.prefetch("and the roof?", session_id="s2")
     s1 = [k["source"] for k in p._retained if k["source"].startswith("turn:s1:")]
-    assert store.kwargs[0]["excluded_sources"] == s1
-    assert store.kwargs[1]["excluded_sources"] == [p._retained[-1]["source"]]
-    assert store.kwargs[1]["excluded_sources"][0].startswith("turn:s2:")
+    assert p.expansion.kwargs[0]["excluded_sources"] == s1
+    assert p.expansion.kwargs[1]["excluded_sources"] == [p._retained[-1]["source"]]
+    assert p.expansion.kwargs[1]["excluded_sources"][0].startswith("turn:s2:")
 
 
 def test_drop_echoes_off_sends_no_exclusion(plugin_module, monkeypatch):
     cfg = {"prefetch_enabled": "true", "recall": {"prefetch": {"mode": "contract", "drop_echoes": False}}}
-    p, store = _turns_provider(plugin_module, monkeypatch, n=3, config=cfg)
+    p = _turns_provider(plugin_module, monkeypatch, n=3, config=cfg)
     p.prefetch("and the roof?")
-    assert "excluded_sources" not in store.kwargs[0]
+    assert p.expansion.kwargs[0]["excluded_sources"] is None
 
 
 def test_drop_echoes_env_off_and_default_on(plugin_module, monkeypatch):
@@ -1153,28 +1195,15 @@ def test_drop_echoes_env_off_and_default_on(plugin_module, monkeypatch):
     assert provider(plugin_module)._prefetch_cfg.drop_echoes is True
 
 
-def test_no_text_comparison_is_left_a_record_with_the_same_words_is_not_dropped(plugin_module, monkeypatch):
-    """The old after-the-fact filter compared text; the library now excludes by source, so a note that
-    merely holds the agent's words stays (and the 60-character rule for the last answer is gone)."""
-    long_answer = "This is a long last answer of the agent that is over sixty characters."
-    twin = item("twin", f"<user>: q\n\n<assistant>: {long_answer}", source="note:twin")
-    p, store = _turns_provider(plugin_module, monkeypatch, n=0, store=FakeStore(default=[twin]))
-    _sync(p, "q", long_answer, monkeypatch)
-    out = p.prefetch("and the roof?")
-    assert long_answer in out and not hasattr(pc, "ECHO_MIN_ANSWER_CHARS")
-
-
 def test_after_a_restart_the_last_two_turns_come_from_the_bank_once(plugin_module, tmp_path, monkeypatch):
-    store = FakeStore(default=[item("roof", "The roof is to be replaced in June.")])
-    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "We spoke of the roof.", 1)], store=store,
-                   jev=FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1)),
-                   writer=FakeWriter(questions_reply("What about the roof?")))
+    p = _restarted(plugin_module, tmp_path, [("s1", "assistant", "We spoke of the roof.", 1)],
+                   jev=FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1)))
     asked = []
     monkeypatch.setattr(p, "_read_turn_sources", lambda sid: asked.append(sid) or ["turn:s1:11", "turn:s1:12"])
     p.prefetch("and the roof?")
     p.prefetch("and the roof again?")
     assert asked == ["s1"]
-    assert [k["excluded_sources"] for k in store.kwargs] == [["turn:s1:11", "turn:s1:12"]] * 2
+    assert [k["excluded_sources"] for k in p.expansion.kwargs] == [["turn:s1:11", "turn:s1:12"]] * 2
 
 
 def test_turn_recovery_is_silent_on_errors_and_never_holds_the_turn(plugin_module, tmp_path, monkeypatch):
@@ -1193,258 +1222,13 @@ def test_turn_recovery_is_silent_on_errors_and_never_holds_the_turn(plugin_modul
     assert time.monotonic() - t0 < 1.5 and p._last_exchange("s1") == ("x", 0) and p._echo_sources("s1") == []
 
 
-# ---------------------------------------------------------------------------- Stage 0: the time scope
-
-def _scoped(scope, *, writer=None, line="What did we decide about the Henley branch roof?", stands=0.95, store=None,
-            decision=None):
-    jev = FakeJev(decision=decision or jev_decision("new_ask", 0.9, stands=stands, scope=scope))
-    store = store or FakeStore(default=[item("roof", "The roof is to be replaced in June.")])
-    b = run(line, make_deps(store, jev, writer or FakeWriter(questions_reply("What was decided about the roof?"))))
-    return b, store, jev
-
-
-@pytest.mark.parametrize("scope,window", [
-    ("recent", ("2026-10-16", "2026-10-17")),
-    ("past_week", ("2026-10-10", "2026-10-17")),
-    ("past_month", ("2026-09-16", "2026-10-17")),
-    ("past_year", ("2025-10-16", "2026-10-17")),
-])
-def test_a_relative_time_scope_is_a_window_counted_back_from_today(scope, window):
-    b, store, _ = _scoped(scope)
-    (sc,) = store.scopes
-    assert (sc.date_from, sc.date_to) == window and (b.date_from, b.date_to) == window and b.time_scope == scope
-    assert f"Only notes dated {window[0]} to {window[1]} were searched." in b.text
-
-
-def test_no_time_scope_is_no_window():
-    b, store, _ = _scoped("none")
-    (sc,) = store.scopes
-    assert sc.date_from is None and sc.date_to is None and sc.window is None
-    assert "were searched" not in b.text
-
-
-def test_the_decision_request_carries_today_and_the_time_scope_question():
-    _, _, jev = _scoped("none")
-    (req,) = jev.decisions()
-    assert req["state"]["today"] == "2026-10-17"
-    assert req["questions"]["time_scope"]["type"] == "choice"
-    assert list(req["questions"]["time_scope"]["criteria"]) == list(pc.TIME_SCOPES)
-
-
-def test_a_named_period_is_the_question_writers_window_and_the_writer_always_runs():
-    writer = FakeWriter(json.dumps({"questions": ["What did we decide in July about the roof?"],
-                                    "date_from": "2026-07-01", "date_to": "2026-07-31"}))
-    b, store, _ = _scoped("named", writer=writer, line="What did we decide in July about the Henley branch roof?")
-    assert writer.prompts                               # a plain standalone question is not asked as written here
-    assert (store.scopes[0].date_from, store.scopes[0].date_to) == ("2026-07-01", "2026-07-31")
-    assert "Today: 2026-10-17" in writer.prompts[0]
-    assert "The time scope the decision model found in the new lines: named" in writer.prompts[0]
-    assert "date_from" in writer.prompts[0]             # the rule that asks for the dates
-
-
-@pytest.mark.parametrize("reply", [
-    {"questions": ["Q about the roof?"]},                                                  # no dates given
-    {"questions": ["Q about the roof?"], "date_from": "2026-08-01", "date_to": "2026-07-01"},   # backwards
-    {"questions": ["Q about the roof?"], "date_from": "July", "date_to": "August"},        # not dates
-    {"questions": ["Q about the roof?"], "date_from": "1850-01-01", "date_to": "1850-02-01"},   # absurd
-    {"questions": ["Q about the roof?"], "date_from": "2026-07-01", "date_to": "2031-01-01"},   # far future
-    {"questions": ["Q about the roof?"], "date_from": "2026-07-01"},                       # half a window
-])
-def test_a_named_period_without_a_valid_window_searches_all_dates(reply):
-    b, store, _ = _scoped("named", writer=FakeWriter(json.dumps(reply)))
-    assert store.scopes[0].window is None and b.date_from is None and b.injected == 1
-
-
-def test_a_named_period_with_a_failed_writer_searches_all_dates_and_still_asks():
-    b, store, _ = _scoped("named", writer=FakeWriter(fail=RuntimeError("down")),
-                          line="What did we decide in July about the Henley branch roof?")
-    assert store.scopes[0].window is None and b.injected == 1
-
-
-def test_the_writer_cannot_give_a_window_the_decision_model_did_not_find():
-    writer = FakeWriter(json.dumps({"questions": ["What happened to the roof?"],
-                                    "date_from": "2026-07-01", "date_to": "2026-07-31"}))
-    b, store, _ = _scoped("none", writer=writer, stands=0.1)
-    assert writer.prompts and store.scopes[0].window is None
-
-
-def test_an_unknown_or_missing_time_scope_answer_is_no_window_never_no_decision():
-    for mutate in (lambda a: a.pop("time_scope"), lambda a: a["time_scope"].update(choice="next_century"),
-                   lambda a: a.update(time_scope="garbage")):
-        decision = jev_decision("new_ask", 0.9, stands=0.95, scope="past_week")
-        mutate(decision["answers"])
-        b, store, _ = _scoped("none", decision=decision)
-        assert b.decision == "ask" and store.scopes[0].window is None    # the decision stands, with no window
-
-
-def test_a_contract_without_the_time_scope_question_still_works(tmp_path):
-    import re
-    text = pc.DEFAULT_CONTRACT_PATH.read_text()
-    body = re.search(r"## jev-questions.*?```json\n(.*?)\n```", text, re.S).group(1)
-    questions = json.loads(body)
-    del questions["time_scope"]
-    path = tmp_path / "old.md"
-    path.write_text(text.replace(body, json.dumps(questions)))
-    contract = pc.load_contract(path)
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95, scope="past_week"))
-    store = FakeStore(default=[item("roof")])
-    b = pc.run_contract("What did we decide about the Henley branch roof?", agent_last="", turns=1,
-                        deps=make_deps(store, jev, FakeWriter()), settings=SETTINGS, contract=contract)
-    assert "time_scope" not in jev.decisions()[0]["questions"] and store.scopes[0].window is None and b.injected == 1
-
-
-def test_a_closed_gate_searches_nothing_whatever_the_time_scope():
-    jev = FakeJev(decision=jev_decision("new_ask", 0.2, stands=0.95, scope="past_week"))
-    store = FakeStore(default=[item("a")])
-    b = run("What did we decide about the Henley branch roof?", make_deps(store, jev, FakeWriter()))
-    assert b.text == "" and not store.calls and b.time_scope == "past_week" and b.date_from is None
-
-
-def test_nothing_answers_inside_a_window_says_which_window():
-    b, _, _ = _scoped("past_week", store=FakeStore())
-    assert b.text == ("Memory was asked: What did we decide about the Henley branch roof?. Nothing in it answers "
-                      "this. Only notes dated 2026-10-10 to 2026-10-17 were searched.")
-
-
-@pytest.mark.parametrize("scope", ["recent", "past_week", "past_month", "past_year", "named", "none"])
-def test_the_window_math_is_pure(scope):
-    w = pc.relative_window(scope, date(2026, 3, 1))
-    assert (w is None) == (scope in ("none", "named"))
-    if w:
-        assert w[1] == "2026-03-01" and w[0] < w[1]
-
-
-# ---------------------------------------------------------------------------- Stage 0: the query writer keeps "quoted phrases"
-
-def test_quoted_phrases_are_found_in_straight_and_curly_quotes_once_each():
-    assert pc.quoted_phrases('what about "electric dreams" and \u201cthe Panama deal\u201d, "electric dreams" again') == [
-        "electric dreams", "the Panama deal"]
-    assert pc.quoted_phrases('a 5" pipe') == []                       # an inch mark is not a quote
-    assert pc.quoted_phrases('say "" or "x"? or " "') == []           # nothing worth matching
-    assert pc.quoted_phrases('the "error 0x80070005" thing') == ["error 0x80070005"]
-    assert pc.quoted_phrases("") == [] and pc.quoted_phrases(None) == []
-
-
-def test_a_phrase_the_model_kept_is_left_alone():
-    qs = ['What did we say about "electric dreams" at the party?']
-    assert pc.keep_quoted('remind me about "electric dreams"', qs) == qs
-
-
-def test_a_phrase_whose_words_stayed_but_lost_its_quotes_is_quoted_again_in_place():
-    out = pc.keep_quoted('remind me about "electric dreams"', ["What did we say about electric dreams at the party?"])
-    assert out == ['What did we say about "electric dreams" at the party?']
-
-
-def test_a_phrase_the_model_dropped_is_put_back_on_the_first_question():
-    out = pc.keep_quoted('remind me about "electric dreams"', ["What did we say at the party?", "Who came?"])
-    assert out == ['What did we say at the party? "electric dreams"', "Who came?"]
-
-
-def test_a_curly_quoted_phrase_is_written_with_straight_quotes_because_only_those_are_a_phrase_search():
-    assert pc.keep_quoted("about \u201celectric dreams\u201d", ["What is \u201celectric dreams\u201d?"]) == [
-        'What is "electric dreams"?']
-    assert pc.keep_quoted("about \u201celectric dreams\u201d", ["What was said?"]) == ['What was said? "electric dreams"']
-
-
-def test_several_phrases_all_survive_and_a_changed_case_is_not_the_phrase():
-    out = pc.keep_quoted('"Electric Dreams" and "v1.14"', ["What about electric dreams and v1.14?"])
-    assert '"Electric Dreams"' in out[0] and '"v1.14"' in out[0]      # the model changed the case: put back verbatim
-
-
-def test_each_phrase_is_also_asked_on_its_own_so_the_exact_retriever_can_find_it():
-    qs = ["What was said at the party?"]
-    assert pc.with_phrase_queries('and "electric dreams"?', qs) == [qs[0], '"electric dreams"']
-    assert pc.with_phrase_queries('and "electric dreams"?', [qs[0], '"electric dreams"']) == [qs[0], '"electric dreams"']
-    many = pc.with_phrase_queries('"one two" "three four" "five six"', qs)
-    assert many == [qs[0], '"one two"', '"three four"']                 # at most MAX_PHRASE_QUERIES
-    assert pc.with_phrase_queries("no quotes", qs) == qs and pc.with_phrase_queries('"a b"', []) == []
-
-
-def test_no_phrase_or_no_questions_changes_nothing():
-    assert pc.keep_quoted("no quotes here", ["Q one?", "Q two?"]) == ["Q one?", "Q two?"]
-    assert pc.keep_quoted('"x y"', []) == []
-
-
-def test_a_quoted_phrase_survives_the_writers_output_into_the_search():
-    line = 'and the "electric dreams" thing, who was there?'
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply('What did we say about "electric dreams" and who was there?'))
-    store = FakeStore(default=[item("a")])
-    b = run(line, make_deps(store, jev, writer))
-    assert b.questions == ['What did we say about "electric dreams" and who was there?', '"electric dreams"']
-    assert sorted(store.calls) == sorted(b.questions)
-
-
-def test_a_quoted_phrase_the_writer_dropped_is_reinserted_before_the_search():
-    line = 'and the "electric dreams" thing, who was there?'
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("What was said at the party and who was there?"))
-    store = FakeStore(default=[item("a")])
-    b = run(line, make_deps(store, jev, writer))
-    assert b.questions == ['What was said at the party and who was there? "electric dreams"', '"electric dreams"']
-    assert 'Asked: What was said at the party and who was there? "electric dreams"' in b.text
-
-
-def test_the_writer_is_told_to_keep_quoted_phrases_whatever_the_contract_file_says():
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("Q about the roof?"))
-    run("and that?", make_deps(FakeStore(default=[item("a")]), jev, writer))
-    assert 'Keep every "quoted phrase" of the person\'s new lines exactly as written' in writer.prompts[0]
-    assert "{%" not in writer.prompts[0]                              # the template text is rendered away
-
-
-def test_a_standalone_question_with_a_quoted_phrase_is_asked_as_written():
-    line = 'What did we decide about "electric dreams" last spring?'
-    jev = FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95))
-    writer, store = FakeWriter(), FakeStore(default=[item("a")])
-    run(line, make_deps(store, jev, writer))
-    assert sorted(store.calls) == sorted([line, '"electric dreams"']) and not writer.prompts
-
-
-def test_when_the_writer_fails_the_phrase_stays_in_the_sentence_that_is_asked():
-    def pick(request):
-        return [3.0 if "house style" in r["instructions"]["text"] else 0.0 for r in request["questions"].values()]
-    jev = FakeJev(decision=jev_decision("go_ahead", 0.9, stands=0.1), score=pick)
-    store = FakeStore(default=[item("a")])
-    run('ok, do it with "electric dreams"', make_deps(store, jev, FakeWriter(fail=RuntimeError("down"))))
-    assert sorted(store.calls) == sorted(['Shall I write it in our explainer house style? "electric dreams"',
-                                          '"electric dreams"'])
-
-
-def test_a_follow_up_is_resolved_against_the_agents_last_line_only():
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1))
-    writer = FakeWriter(questions_reply("Who did I see the cafe visit with?"))
-    run("do you remember who i saw it with?", make_deps(FakeStore(default=[item("a")]), jev, writer),
-        agent_last="We met Ana at the cafe on Tuesday.")
-    text = writer.prompts[0]
-    assert "The agent's last line: We met Ana at the cafe on Tuesday." in text
-    assert "do you remember who i saw it with?" in text
-
-
-# ---------------------------------------------------------------------------- what reaches the library's search
-
-def test_the_exclusion_and_the_date_window_reach_the_librarys_search_call(plugin_module, monkeypatch):
-    jev = FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1, scope="past_week"))
-    store = FakeStore(default=[item("roof", "The roof is to be replaced in June.")])
-    p = provider(plugin_module, config=CONTRACT_ON, store=store, jev=jev,
-                 writer=FakeWriter(questions_reply("What about the roof?")))
-    p._today = lambda: TODAY
+def test_every_search_carries_the_same_exclusion_and_window_because_they_are_arguments_of_one_call(plugin_module, monkeypatch):
+    p = provider(plugin_module, config=CONTRACT_ON, jev=FakeJev(decision=jev_decision("follow_up", 0.9, stands=0.1,
+                                                                                    scope="past_week")))
     _sync(p, "user line 1", "assistant reply 1", monkeypatch)
     _sync(p, "user line 2", "assistant reply 2", monkeypatch)
     out = p.prefetch("and the roof?")
-    (kw,) = store.kwargs
+    (kw,) = p.expansion.kwargs                                 # ONE call: the library gives every search these filters
     assert kw["excluded_sources"] == [r["source"] for r in p._retained]
     assert (kw["date_from"], kw["date_to"]) == ("2026-10-10", "2026-10-17")
-    assert kw["mode"] == "hybrid" and kw["limit"] == pc.SEARCH_LIMIT and isinstance(kw["_trace"], list)
-    assert "depth" not in kw                                 # an ordinary turn: the library's standard depth
     assert "Only notes dated 2026-10-10 to 2026-10-17 were searched." in out
-
-
-def test_a_library_that_raises_gives_the_not_consulted_line_and_logs_no_text(plugin_module, caplog):
-    store = FakeStore(fail=ValueError("date_from, date_to and excluded_sources need the hybrid_chunk channel"))
-    p = provider(plugin_module, config=CONTRACT_ON, store=store,
-                 jev=FakeJev(decision=jev_decision("new_ask", 0.9, stands=0.95, scope="past_week")), writer=FakeWriter())
-    with caplog.at_level(logging.INFO):
-        out = p.prefetch("What did we decide about the Henley branch roof?")
-    assert out == "(memory was not consulted: the search failed)"
-    assert [r for r in caplog.records if r.levelno >= logging.INFO] == []

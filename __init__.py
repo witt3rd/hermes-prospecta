@@ -44,9 +44,10 @@ is the zone of that day (handed to the library as PROSPECTA_TIMEZONE).
 Prefetch (OFF by default; see README, "Prefetch"): with ``prefetch_enabled`` on,
 ``recall.prefetch.mode`` picks the old synthesised answer ('off', the default) or the
 written recall contract ('contract', ``prefetch_contract.py``: one typed decision per
-message (needs memory? which period of time?), questions only when needed, the
-library's Stage 1 + Stage 2 with the thread's last turns excluded in SQL, a cited
-block, no synthesis, never fails a turn).
+message (needs memory? which period of time?), then the library's query expansion
+(``Memory.expand_and_recall``: the message becomes structured searches, run in parallel
+through Stage 1 + Stage 2 with the thread's last turns excluded in SQL, one cited block),
+no synthesis, never fails a turn).
 
 Lifecycle hooks: sync_turn (non-blocking daemon thread), on_session_end,
                   shutdown. Prefetch OPT-IN via config (default OFF —
@@ -238,6 +239,12 @@ class _BoundedPool:
     @property
     def database_url(self) -> str:
         return self._database_url
+
+    @property
+    def max_size(self) -> int:
+        """How many connections the pool holds at most (the library's query expansion bounds the
+        searches it runs in the database at once by it)."""
+        return self._max
 
     @property
     def _conn(self):
@@ -871,7 +878,7 @@ class ProspectaProvider(MemoryProvider):
         self._conn_watch: Optional[_ConnectionWatch] = None
         self._date_gate_held = False
         # recall.prefetch (the written recall contract): settings read per session at initialize;
-        # per-session state kept from sync_turn; the injectable Jev transport and question model
+        # per-session state kept from sync_turn; the injectable Jev transport (the library's writer is Memory's llm)
         self._prefetch_cfg: Optional[Any] = None  # _pc.Settings
         self._state_lock = threading.Lock()
         self._turn_sources: "OrderedDict[str, list]" = OrderedDict()  # session -> sources of its last two retained turns
@@ -879,7 +886,6 @@ class ProspectaProvider(MemoryProvider):
         self._ahead: Dict[str, Any] = {}  # session -> _pc.AheadEntry
         self._ahead_running: set = set()  # (session, key) pairs being prepared
         self._jev_transport: Optional[Any] = None   # tests / hosts: a (request, timeout) -> response callable
-        self._writer_llm: Optional[Any] = None      # tests / hosts: the question model
         self._last_brief: Optional[Any] = None      # the last contract run's record (no text is logged)
 
     # ---- identity ----
@@ -1080,19 +1086,23 @@ class ProspectaProvider(MemoryProvider):
 
     # ---- recall.prefetch (the written recall contract) ----
 
-    def _prefetch_setting(self, env_name: str, key: str) -> Any:
-        """A ``recall.prefetch.*`` option: env (when non-empty) wins; then
-        ``{"recall": {"prefetch": {key: ...}}}``; then the flat ``"recall.prefetch.key"``
-        that ``hermes memory setup`` writes. None when unset."""
-        raw = os.environ.get(env_name)
-        if raw is not None and raw.strip():
-            return raw.strip()
+    def _prefetch_config(self, key: str) -> Any:
+        """A ``recall.prefetch.*`` option from the profile only: ``{"recall": {"prefetch": {key: ...}}}``,
+        else the flat ``"recall.prefetch.key"`` that ``hermes memory setup`` writes. None when unset."""
         nested = self._config.get("recall")
         nested = nested.get("prefetch") if isinstance(nested, dict) else None
         if isinstance(nested, dict) and nested.get(key) not in (None, ""):
             return nested[key]
         flat = self._config.get(f"recall.prefetch.{key}")
         return None if flat in (None, "") else flat
+
+    def _prefetch_setting(self, env_name: str, key: str) -> Any:
+        """A ``recall.prefetch.*`` option: env (when non-empty) wins; then the profile
+        (``_prefetch_config``). None when unset."""
+        raw = os.environ.get(env_name)
+        if raw is not None and raw.strip():
+            return raw.strip()
+        return self._prefetch_config(key)
 
     def _prefetch_number(self, key: str, env_name: str, default: float, *, whole: bool = False,
                          positive: bool = False) -> float:
@@ -1109,23 +1119,31 @@ class ProspectaProvider(MemoryProvider):
                            key, raw, "whole number" if whole else "number", ">" if positive else ">=", default)
             return default
 
-    def _model_setting(self, key: str, env_name: str, default: str) -> str:
-        """A model id: the profile's ``key`` (prospecta.json), else the environment's ``env_name``,
-        else ``default`` (the plan's order, docs/hybrid-implementation-plan.md section 2; the same
-        order as ``llm_model`` and PROSPECTA_LLM_MODEL)."""
-        value = self._config.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        raw = os.environ.get(env_name)
-        return raw.strip() if raw and raw.strip() else default
+    def _profile_model(self, *values: Any) -> Optional[str]:
+        """The first of ``values`` (a profile setting) that is a non-blank string, stripped; else None.
+        The plugin holds the profile's model ids only: when it has none, the library resolves the model
+        (the bank's recall_config, then the PROSPECTA_*_MODEL environment variable, then its own default),
+        so the order and the defaults live in one place."""
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
 
-    def _decision_model(self) -> str:
-        """The Stage 0 decision model (also the library's Stage 3 gate model)."""
-        return self._model_setting("decision_model", "PROSPECTA_DECISION_MODEL", _pc.DEFAULT_DECISION_MODEL)
+    def _decision_model(self) -> Optional[str]:
+        """The profile's decision model (Stage 0 of the contract prefetch, and the library's Stage 3
+        gate), or None: the gate then uses the library's (``prospecta.stages.JEV_MODEL``)."""
+        return self._profile_model(self._config.get("decision_model"))
 
-    def _reranker_model(self) -> str:
-        """The Stage 2 cross-encoder, given to the library on every search."""
-        return self._model_setting("reranker_model", "PROSPECTA_RERANKER_MODEL", _pc.DEFAULT_RERANKER_MODEL)
+    def _reranker_model(self) -> Optional[str]:
+        """The profile's Stage 2 cross-encoder, given to the library, or None (the library resolves it)."""
+        return self._profile_model(self._config.get("reranker_model"))
+
+    def _query_writer_model(self) -> Optional[str]:
+        """The profile's query-writer model for the contract prefetch, or None (the library resolves it):
+        ``recall.prefetch.query_writer_model``, else the profile-wide ``query_writer_model``, else the
+        deprecated ``recall.prefetch.question_model`` (warned about at initialise)."""
+        return self._profile_model(self._prefetch_config("query_writer_model"), self._config.get("query_writer_model"),
+                                   self._prefetch_config("question_model"))
 
     def _recall_stage3(self) -> bool:
         """Answer ``prospecta_recall`` through the library's ``ask()`` with the Stage 3 sufficiency
@@ -1134,21 +1152,26 @@ class ProspectaProvider(MemoryProvider):
         return ("" if raw is None else str(raw).strip().lower()) in ("1", "true", "yes", "on")
 
     def _warn_renamed_settings(self) -> None:
-        """The contract prefetch's old model settings no longer apply (the three models are now
-        ``decision_model``, ``query_writer_model`` and ``reranker_model``): say so, once a session."""
+        """Old contract-prefetch settings, one warning line each, once a session (at initialise).
+        ``recall.prefetch.question_model`` is a deprecated alias of ``recall.prefetch.query_writer_model``
+        and still works. The others no longer apply: the decision-model keys moved to ``decision_model``,
+        and the writer and search time limits went with the stages the library owns now."""
+        if self._prefetch_config("question_model") is not None:
+            logger.warning("prospecta: recall.prefetch.question_model is deprecated; set "
+                           "recall.prefetch.query_writer_model (the value is used for now)")
         old = {"recall.prefetch.decision_model": "decision_model",
-               "recall.prefetch.question_model": "query_writer_model"}
+               "recall.prefetch.writer_timeout_seconds": None, "recall.prefetch.search_timeout_seconds": None}
         old_env = {"PROSPECTA_PREFETCH_DECISION_MODEL": "PROSPECTA_DECISION_MODEL",
-                   "PROSPECTA_PREFETCH_QUESTION_MODEL": "PROSPECTA_QUERY_WRITER_MODEL"}
-        nested = self._config.get("recall")
-        nested = nested.get("prefetch") if isinstance(nested, dict) else None
+                   "PROSPECTA_PREFETCH_QUESTION_MODEL": "PROSPECTA_QUERY_WRITER_MODEL",
+                   "PROSPECTA_PREFETCH_WRITER_TIMEOUT": None, "PROSPECTA_PREFETCH_SEARCH_TIMEOUT": None}
         for key, new in old.items():
-            short = key.rsplit(".", 1)[1]
-            if self._config.get(key) not in (None, "") or (isinstance(nested, dict) and nested.get(short) not in (None, "")):
-                logger.warning("prospecta: %s is ignored now; set %s", key, new)
+            if self._prefetch_config(key.rsplit(".", 1)[1]) is not None:
+                logger.warning("prospecta: %s is ignored now; %s", key, f"set {new}" if new else
+                               "the library owns that stage and runs it inside recall.prefetch.deadline_seconds")
         for name, new in old_env.items():
             if os.environ.get(name, "").strip():
-                logger.warning("prospecta: %s is ignored now; set %s", name, new)
+                logger.warning("prospecta: %s is ignored now; %s", name, f"set {new}" if new else
+                               "the library owns that stage and runs it inside PROSPECTA_PREFETCH_DEADLINE")
 
     def _resolve_prefetch_settings(self) -> Any:
         """The ``recall.prefetch.*`` options. Read at initialize (each session), so flipping the
@@ -1160,23 +1183,19 @@ class ProspectaProvider(MemoryProvider):
                            raw_mode, list(_pc.MODES), _pc.DEFAULT_MODE)
             mode = _pc.DEFAULT_MODE
         contract = self._prefetch_setting("PROSPECTA_PREFETCH_CONTRACT", "contract_path")
-        # below core's own wait (8 s) so a slow turn is ours to end, not core's to time out
+        # below core's own wait (8 s) so a slow turn is ours to end, not core's to time out; the library
+        # is given what is left of it for the whole expansion (the writer, every search, every rerank)
         deadline = self._prefetch_number("deadline_seconds", "PROSPECTA_PREFETCH_DEADLINE", _pc.DEADLINE_S)
         return _pc.Settings(
             mode=mode,
             decision_model=self._decision_model(),
-            query_writer_model=self._model_setting(
-                "query_writer_model", "PROSPECTA_QUERY_WRITER_MODEL", _pc.DEFAULT_QUERY_WRITER_MODEL),
+            query_writer_model=self._query_writer_model(),
             contract_path=str(contract) if contract else "",
             max_tokens=int(self._prefetch_number("max_tokens", "PROSPECTA_PREFETCH_MAX_TOKENS", 0, whole=True)),
-            deadline_s=min(deadline, 7.0) if deadline > 0 else _pc.DEADLINE_S,
-            # each stage is also capped by what is left of the deadline (_Run.budget)
+            deadline_s=min(deadline, _pc.MAX_DEADLINE_S) if deadline > 0 else _pc.DEADLINE_S,
+            # the one stage limit the plugin still owns (also capped by what is left of the deadline)
             decision_timeout_s=self._prefetch_number("decision_timeout_seconds", "PROSPECTA_PREFETCH_DECISION_TIMEOUT",
                                                      _pc.DECISION_TIMEOUT_S, positive=True),
-            writer_timeout_s=self._prefetch_number("writer_timeout_seconds", "PROSPECTA_PREFETCH_WRITER_TIMEOUT",
-                                                   _pc.WRITER_TIMEOUT_S, positive=True),
-            search_timeout_s=self._prefetch_number("search_timeout_seconds", "PROSPECTA_PREFETCH_SEARCH_TIMEOUT",
-                                                   _pc.SEARCH_TIMEOUT_S, positive=True),
             paste_chars=int(self._prefetch_number("paste_chars", "PROSPECTA_PREFETCH_PASTE_CHARS",
                                                   _pc.PASTE_CHARS, whole=True)) or _pc.PASTE_CHARS,
             drop_echoes=str(self._prefetch_setting("PROSPECTA_PREFETCH_DROP_ECHOES", "drop_echoes")
@@ -1339,18 +1358,18 @@ class ProspectaProvider(MemoryProvider):
             },
             {
                 "key": "decision_model",
-                "description": "The Stage 0 decision model: a typed System One model called through OpenRouter with the profile's key. It decides whether memory is needed and for what period of time (contract prefetch), and is the library's Stage 3 gate model. Default typesafe/jev-1.14. The profile value wins over PROSPECTA_DECISION_MODEL.",
-                "default": _pc.DEFAULT_DECISION_MODEL,
+                "description": "The Stage 0 decision model: a typed System One model called through OpenRouter with the profile's key. It decides whether memory is needed and for what period of time (contract prefetch), and is the library's Stage 3 gate model. Unset (default): the library's choice, PROSPECTA_DECISION_MODEL else typesafe/jev-1.14. The profile value wins over the environment.",
+                "default": "",
             },
             {
                 "key": "query_writer_model",
-                "description": "The small text model that writes the contract prefetch's questions (LiteLLM id, called with the profile's key). Default openrouter/google/gemini-2.5-flash-lite. The profile value wins over PROSPECTA_QUERY_WRITER_MODEL.",
-                "default": _pc.DEFAULT_QUERY_WRITER_MODEL,
+                "description": "The small text model that expands the contract prefetch's message into searches (LiteLLM id, called with the profile's key; also read as recall.prefetch.query_writer_model, which wins). Unset (default): the library's choice, the bank's recall_config.models.query_writer_model, else PROSPECTA_QUERY_WRITER_MODEL, else openrouter/google/gemini-2.5-flash-lite. The profile value wins over the environment.",
+                "default": "",
             },
             {
                 "key": "reranker_model",
-                "description": "The Stage 2 cross-encoder the library reranks each search with (OpenRouter's rerank endpoint, the profile's key); used where the bank's recall_config sets rerank.stage to cross_encoder. Default qwen/qwen3-reranker-8b. The profile value wins over PROSPECTA_RERANKER_MODEL.",
-                "default": _pc.DEFAULT_RERANKER_MODEL,
+                "description": "The Stage 2 cross-encoder the library reranks each search with (OpenRouter's rerank endpoint, the profile's key); used where the bank's recall_config sets rerank.stage to cross_encoder. Unset (default): the library's choice, the bank's recall_config.rerank.model, else PROSPECTA_RERANKER_MODEL, else qwen/qwen3-reranker-8b. The profile value wins over the environment.",
+                "default": "",
             },
             {
                 "key": "recall.stage3",
@@ -1359,18 +1378,18 @@ class ProspectaProvider(MemoryProvider):
             },
             {
                 "key": "recall.prefetch.mode",
-                "description": "The pre-turn recall (only when prefetch_enabled is true): 'off' (default: the old prefetch, one model-written answer) or 'contract' (the written recall contract: one decision per message, questions only when needed, the library's Stage 1 + Stage 2, a cited block, no synthesis). Read when a session starts. PROSPECTA_PREFETCH_MODE env overrides.",
+                "description": "The pre-turn recall (only when prefetch_enabled is true): 'off' (default: the old prefetch, one model-written answer) or 'contract' (the written recall contract: one decision per message, then the library's query expansion into parallel searches through Stage 1 + Stage 2, one cited block, no synthesis). Read when a session starts. PROSPECTA_PREFETCH_MODE env overrides.",
                 "default": _pc.DEFAULT_MODE,
                 "choices": list(_pc.MODES),
             },
             {
                 "key": "recall.prefetch.contract_path",
-                "description": "The recall contract file (the Jev questions, the question-writer prompt, the block's words). Default: the bundled contract/recall-contract-v1.md. PROSPECTA_PREFETCH_CONTRACT env overrides.",
+                "description": "The recall contract file (the Jev questions and the block's words). Default: the bundled contract/recall-contract-v1.md. PROSPECTA_PREFETCH_CONTRACT env overrides.",
                 "default": "",
             },
             {
                 "key": "recall.prefetch.max_tokens",
-                "description": "Safety valve on the contract prefetch block: leave out (whole, never cut) the entries that would take it past this many estimated tokens. 0 (default) = off: the block is sized by relevance alone. PROSPECTA_PREFETCH_MAX_TOKENS env overrides.",
+                "description": "Safety valve on the contract prefetch block (the library's): leave out (whole, never cut) the entries that would take it past this many estimated tokens. 0 (default) = not set: the block is sized by relevance alone, unless the bank's recall_config.expansion.max_tokens sets a valve. PROSPECTA_PREFETCH_MAX_TOKENS env overrides.",
                 "default": "0",
             },
             {
@@ -1527,13 +1546,15 @@ class ProspectaProvider(MemoryProvider):
         endpoint with the profile's ``OPENROUTER_API_KEY``, read per call and never stored) and, only
         with ``recall.stage3`` on, the Stage 3 gate's Jev. They take effect where the bank's
         ``recall_config`` asks for them; a failure to build them leaves the library's own order."""
+        # the profile's model ids only (None: the library resolves the bank's config, the environment, the default)
         kw: Dict[str, Any] = {"reranker_model": self._reranker_model(), "decision_model": self._decision_model()}
         try:
             from prospecta.stages import openrouter_rerank_transport
             kw["rerank_transport"] = openrouter_rerank_transport()
             if self._recall_stage3():
                 from prospecta.stages import JevScore, openrouter_jev_transport
-                kw["jev"] = JevScore(openrouter_jev_transport(), model=self._decision_model())
+                model = self._decision_model()
+                kw["jev"] = JevScore(openrouter_jev_transport(), **({"model": model} if model else {}))
         except Exception:
             logger.exception("prospecta could not build the Stage 2 / Stage 3 transports; the library's own order is used")
         return kw
@@ -1798,12 +1819,17 @@ class ProspectaProvider(MemoryProvider):
         )
 
     def _check_recall_stages(self, bank_id: str) -> None:
-        """With the contract prefetch on, say once a session (read-only, never raises) if the bank
-        cannot run the library's Stage 1 + Stage 2: no ``hybrid_chunk`` channel (the thread's last turns
-        and the date window are Stage 1 filters, so every turn after the first would go without memory)
-        or no ``cross_encoder`` rerank (Stage 1's own order is used)."""
+        """With the contract prefetch on, say once a session (read-only, never raises) what stops the
+        library's query expansion from working: a library without ``Memory.expand_and_recall``, a bank
+        with no ``hybrid_chunk`` channel (Stage 1: without it every turn goes without memory) or with no
+        ``cross_encoder`` rerank (each search keeps Stage 1's own order)."""
         try:
             if not (self._prefetch_enabled() and self._prefetch_cfg is not None and self._prefetch_cfg.active):
+                return
+            if not hasattr(self._memory, "expand_and_recall"):
+                logger.warning(
+                    "prospecta: the installed library has no Memory.expand_and_recall: the contract prefetch "
+                    "needs prospecta from main@736bd28 (PR 85) or later, so every turn goes without memory")
                 return
             from prospecta.channels.recall import read_channel_config
             from prospecta.stages import read_recall_config
@@ -1814,13 +1840,13 @@ class ProspectaProvider(MemoryProvider):
             if not any(c.get("name") == "hybrid_chunk" and c.get("enabled", True) for c in channels):
                 logger.warning(
                     "prospecta: bank %r has no hybrid_chunk channel in its channel_config: the contract "
-                    "prefetch cannot filter the thread's last turns or dates, so turns after the first go "
-                    "without memory (README, 'Recall: Stage 1 + Stage 2, cited')", bank_id)
+                    "prefetch (query expansion) runs on Stage 1, so every turn goes without memory "
+                    "(README, 'Recall: Stage 1 + Stage 2, cited')", bank_id)
             if not (rerank.get("enabled") and rerank.get("stage") == "cross_encoder"):
                 logger.warning(
                     "prospecta: bank %r does not rerank with the cross_encoder stage (recall_config.rerank): "
-                    "the contract prefetch uses Stage 1's own order, the first %d hits of each question "
-                    "(README, 'Recall: Stage 1 + Stage 2, cited')", bank_id, _pc.FALLBACK_PAGE)
+                    "the contract prefetch keeps Stage 1's own order for each search, the candidates within "
+                    "half of its best score (README, 'Recall: Stage 1 + Stage 2, cited')", bank_id)
         except Exception:
             logger.debug("prospecta: could not check the bank's recall stages", exc_info=True)
 
@@ -2269,32 +2295,15 @@ class ProspectaProvider(MemoryProvider):
 
     # ---- recall.prefetch.mode: contract ----
 
-    def _contract_deps(self, cfg: Any) -> Any:
+    def _contract_deps(self) -> Any:
+        """The run's outside world: the library's one entry point for automatic recall (its query-writer
+        model is the Memory's ``llm``, called with the writer model per call; its searches, reranks and merge
+        run inside it) and the Jev transport of the gate. A library without the entry point raises here, which
+        ``prefetch`` turns into its one warning line."""
         transport = self._jev_transport
         if transport is None:
             transport = _pc.default_transport()
-        writer = self._writer_llm
-        if writer is None:
-            try:
-                writer = _pc.default_writer_llm(cfg.query_writer_model)
-            except Exception:  # no LiteLLM: the contract's fallback sentence stands in
-                writer = None
-        return _pc.Deps(search=self._contract_search, transport=transport, writer_llm=writer,
-                        today=self._today)
-
-    def _contract_search(self, question: str, scope: Any) -> Any:
-        """One question through the library's Stage 1 (hybrid candidates: the thread's last turns and
-        the date window are filtered in SQL, before the candidates are cut) and Stage 2 (cross-encoder
-        rerank; the library falls back to Stage 1's order if it fails). A library failure raises: the
-        run turns it into the contract's "not consulted" line."""
-        kw: Dict[str, Any] = {}
-        if scope.excluded_sources:
-            kw["excluded_sources"] = list(scope.excluded_sources)
-        if scope.date_from and scope.date_to:
-            kw.update(date_from=scope.date_from, date_to=scope.date_to)
-        trace: List[Dict[str, Any]] = []
-        items = list(self._memory.search(question, mode="hybrid", limit=_pc.SEARCH_LIMIT, _trace=trace, **kw))
-        return _pc.Found(items=items, ranked=_stage2_graded(trace))
+        return _pc.Deps(expand=self._memory.expand_and_recall, transport=transport, today=self._today)
 
     def _prefetch_contract(self, query: str, sid: str, cfg: Any) -> str:
         contract = _pc.load_contract(cfg.contract_path or None)
@@ -2305,7 +2314,7 @@ class ProspectaProvider(MemoryProvider):
             ahead = self._ahead.get(sid)
         if ahead is not None and started - ahead.at > _pc.AHEAD_TTL_S:
             ahead = None
-        deps = self._contract_deps(cfg)
+        deps = self._contract_deps()
         try:
             brief = _pc.run_bounded(lambda: _pc.run_contract(
                 query, agent_last=agent_last, turns=turns, deps=deps, settings=cfg, contract=contract,
@@ -2350,7 +2359,7 @@ class ProspectaProvider(MemoryProvider):
     def _prepare_ahead(self, sid: str, key: str, agent_last: str, cfg: Any) -> None:
         try:
             contract = _pc.load_contract(cfg.contract_path or None)
-            deps = self._contract_deps(cfg)
+            deps = self._contract_deps()
             started = time.monotonic()
             entry = _pc.run_bounded(lambda: _pc.run_ahead(
                 agent_last, deps=deps, settings=cfg, contract=contract, started=started,

@@ -211,11 +211,13 @@ class FakeRerank:
     (``{model, query, documents, top_n}`` -> ``{results: [{index, relevance_score}], usage}``). A
     document's score is the share of the query's words it holds (0..1)."""
 
-    def __init__(self, fail=None):
-        self.requests, self.fail = [], fail
+    def __init__(self, fail=None, delay=0.0):
+        self.requests, self.fail, self.delay = [], fail, delay
 
     def __call__(self, request, timeout):
         self.requests.append(request)
+        if self.delay:
+            time.sleep(self.delay)
         if self.fail:
             raise self.fail
         query = set(re.findall(r"\w+", request["query"].split("Query:", 1)[-1].lower()))

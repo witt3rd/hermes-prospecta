@@ -12,12 +12,13 @@ filtered in SQL by date and by the records to leave out) and **Stage 2** (a
 cross-encoder rerank), and every hit is **cited** (source, date, kind, how it
 matched, the matched words in context, the whole chunk). The plugin wires the
 library's search into the Hermes memory hooks and the agent's tools. The LLM
-half of the spine (recall synthesis, question expansion) reads
+half of the spine (recall synthesis, the query writer of the contract prefetch) reads
 `PROSPECTA_LLM_MODEL` (env) or `llm_model` (config) and calls
 `prospecta.defaults.make_default_llm` — same pattern as Hindsight. No `ctx.llm`
 dependency.
 
-The library is pinned in `pyproject.toml` (`prospecta` at `c52a126`). Stage 1 and
+The library is pinned in `pyproject.toml` (`prospecta` at `736bd28`, which has the
+query-expansion entry point `Memory.expand_and_recall`). Stage 1 and
 Stage 2 run where the bank says so; see [Recall](#recall-stage-1--stage-2-cited).
 
 ## Install
@@ -112,8 +113,7 @@ matched words marked `<<like this>>`).
 `qwen/qwen3-reranker-8b` through OpenRouter's rerank endpoint, the profile's
 `OPENROUTER_API_KEY`) scores each candidate against the question; notes under a floor
 are cut, near copies collapse, the best few stay. If it fails the library keeps Stage 1's
-order, and the plugin says so (`"reranked": false`; in the contract block a note and the
-first five hits of each question).
+order, and the plugin says so (`"reranked": false`; in the contract block a note).
 
 **Where it is switched on: the bank.** Stage 1 and Stage 2 run when the bank's
 `channel_config` lists `hybrid_chunk` and its `recall_config.rerank` is
@@ -129,8 +129,9 @@ mem.set_recall_config({"rerank": {"enabled": True, "stage": "cross_encoder",
 A bank without it keeps working for `prospecta_search` and `prospecta_recall` (the
 library's older three-channel recall: the same cited fields, with `match_kind` and
 `exact_snippet` empty and no rerank), but it cannot filter by date or by the records to
-leave out, so the contract prefetch needs it: with the contract prefetch on, `initialize`
-logs one warning for each of the two things the bank lacks. Banks that were written
+leave out, and the library's query expansion runs on Stage 1, so the contract prefetch needs
+it: with the contract prefetch on, `initialize` logs one warning for each of the two things
+the bank lacks (and one if the installed library has no `Memory.expand_and_recall`). Banks that were written
 with questions only (no `chunk` notes) have nothing for Stage 1 to read; every note this
 plugin writes is chunked.
 
@@ -159,16 +160,21 @@ the evidence suffices, and under 0.70 one broadened search runs (a wider pool, t
 window dropped). A gate that cannot run never blocks the answer (`sufficient` is `null`
 and `gate` says why).
 
-**The three models** are each configurable, in this order: the profile's
-`prospecta.json`, then the environment, then the default (the plan's order, and the one
-`llm_model` / `PROSPECTA_LLM_MODEL` already use; it differs from the `recall.*` options
-below, where the environment wins):
+**The three models** are each configurable. The plugin holds only the **profile's** value
+(`prospecta.json`); when the profile sets none, the library resolves the model, in its own
+order (the bank's `recall_config`, then the environment variable, then its default), so the
+order and the defaults live in one place:
 
-| `prospecta.json` key | Env | Default | Used for |
+| `prospecta.json` key | Env (read by the library) | Library default | Used for |
 |---|---|---|---|
 | `decision_model` | `PROSPECTA_DECISION_MODEL` | `typesafe/jev-1.14` | Stage 0 of the contract prefetch (needs memory? which period?); the Stage 3 gate |
-| `query_writer_model` | `PROSPECTA_QUERY_WRITER_MODEL` | `openrouter/google/gemini-2.5-flash-lite` (a LiteLLM id) | the contract prefetch's question writer |
+| `query_writer_model` (also `recall.prefetch.query_writer_model`, which wins) | `PROSPECTA_QUERY_WRITER_MODEL` | `openrouter/google/gemini-2.5-flash-lite` (a LiteLLM id) | the library's query writer: the contract prefetch's searches |
 | `reranker_model` | `PROSPECTA_RERANKER_MODEL` | `qwen/qwen3-reranker-8b` | Stage 2, on every search |
+
+A profile value wins over the environment. The one difference to the library's order: the
+Stage 0 gate (the plugin's own Jev call) takes the profile's `decision_model`, else the
+library's environment-and-default choice, and does not read the bank's
+`recall_config.models.decision_model` (the Stage 3 gate and the search tools do).
 
 **What was removed.** The plugin's own lanes are gone, because the library owns them now:
 the in-memory keyword leg (an Okapi BM25 index of the bank's notes, built in a background
@@ -195,13 +201,17 @@ picks the path:
 
 ### Prefetch, mode `contract`
 
-Mode 1A of the hybrid architecture: one typed decision per chat message (is memory
-needed, and for what period of time), questions written only when needed, each question
-asked of the library's Stage 1 + Stage 2 with the thread's last turns left out in SQL, a
-labelled block of cited evidence. No answer is synthesised. The design is the recall flow
-design's Hermes column; the words it fixes (the Jev question list, the question-writer
-prompt, the block's sentences) are in a file, not in code (see below). The bank needs the
-`hybrid_chunk` channel and the `cross_encoder` rerank ([Recall](#recall-stage-1--stage-2-cited)).
+Mode 1 of the hybrid architecture: **automatic recall is query expansion**, and the library
+does it. Per chat message the plugin gates and decides (one typed decision: is memory needed,
+and for what period of time), then makes **one call** to the library's
+`Memory.expand_and_recall`: its query-writer model expands the message into structured
+searches (a `query`, verbatim `terms`, a period), every search runs the library's Stage 1 +
+Stage 2 in parallel with the same filters, and the records merge into one cited block. No
+answer is synthesised. The design is the recall flow design's Hermes column; the words it
+fixes (the Jev question list, the block's sentences) are in a file, not in code (see below).
+The bank needs the `hybrid_chunk` channel and the `cross_encoder` rerank
+([Recall](#recall-stage-1--stage-2-cited)). The library is pinned at `main@736bd28` (PR 85
+merged); bump the pin only with a test run against the new commit.
 
 Per message, before the turn:
 
@@ -209,90 +219,83 @@ Per message, before the turn:
    the like. The plugin also skips an empty message, a slash command and a
    message too large for anything to read (over 1,000,000 characters). A long
    paste (over `paste_chars`, default 50,000) is not cut and not asked: it is
-   marked as material by its size and goes whole to the question writer.
-2. **Decide (Stage 0).** One call to the decision model (`decision_model`, default
-   `typesafe/jev-1.14` through OpenRouter's System One door, typed answers, about $0.0001)
-   with the state (the agent's last answer, kept per session from `sync_turn`; the new
-   line; how many turns the session has had; today's date in the profile's `timezone`) and
-   the contract's nine questions: `line_kind`, `stands_alone`, `needs_memory`,
-   `need_decisions`, `need_library`, `need_conversations`, `need_work`, `need_person` and
-   `time_scope`. `social` is always zero questions; `needs_memory` below 0.5 is the **gate**:
-   zero questions (nothing is searched, nothing is written, nothing is injected, and the
-   turn pays one decision call). The `need_*` at 0.5 or above are the sources to ask; none
-   at 0.5 means all. Prospecta banks tell conversations (the turns the plugin retained)
-   from everything else, so `need_conversations` alone keeps only the turns and any other
-   `need_*` alone leaves the turns out. A go-ahead or an answer that still needs something
-   outside the thread (`needs_memory` at 0.5 or above) is asked, from the agent's last
-   answer.
+   marked as material by its size and goes whole to the library's writer.
+2. **Decide (Stage 0, the plugin's own gate).** One call to the decision model (the profile's
+   `decision_model`, else the library's: `typesafe/jev-1.14` through OpenRouter's System One
+   door, typed answers, about $0.0001) with the state (the agent's last answer, kept per
+   session from `sync_turn`; the new line; how many turns the session has had; today's date
+   in the profile's `timezone`) and the contract's nine questions. The plugin reads three of
+   them: `line_kind`, `needs_memory` and `time_scope`. `social` is always zero searches;
+   `needs_memory` below 0.5 is the **gate**: **no expansion call is made** (nothing is
+   searched, nothing is written, nothing is injected, and the turn pays one decision call).
+   The gate is the plugin's, run before the call because the window below comes from the same
+   answer, so the library's own gate is switched off (`gate=False`) and never asks twice. The
+   other six questions (`stands_alone` and the five `need_*`) are still asked, because they
+   are the contract's words, but nothing reads them any more: the library's writer takes no
+   kinds of knowledge (the contract file may drop them).
 
-   **`time_scope`** gives the search a window of dates (the notes' dates, inclusive,
+   **`time_scope`** gives every search a window of dates (the notes' dates, inclusive,
    counted back from today): `recent` (today and yesterday), `past_week` (7 days),
-   `past_month` (31), `past_year` (366), `none` (no window), or `named`: the line names a
-   period ("in July", "March 2025", an ISO date), which the decision model cannot turn
-   into dates, so the question writer does (below). The window is a Stage 1 filter and the
-   block says when one applied ("Only notes dated 2026-10-10 to 2026-10-17 were
-   searched."). A missing, unknown or invalid answer is no window: a search with no date
-   filter loses nothing, a wrong window could.
-3. **Questions.** A single standalone question is asked as written (not when the time
-   scope is `named`, which needs the writer). Otherwise Prospecta's own `formulate_queries`
-   runs with the contract's question-writer prompt and the agent's last answer as context,
-   on the small text model (`query_writer_model`), and returns 0 to 3 questions: a
-   follow-up is resolved against the agent's last answer only, never the whole thread. The
-   writer is told the kinds of knowledge only when some `need_*` reached 0.5 (it gets
-   those); otherwise it gets "any" (the search still uses all sources). It is also told
-   today's date and the time scope. Two rules are appended to its prompt whatever contract
-   file is loaded: keep every `"quoted phrase"` of the person's lines verbatim, and, for a
-   `named` period, return `date_from` / `date_to` (checked: two real dates, in order, not
-   before 1990 nor more than a year ahead, else no window). **A quoted phrase is also
-   guaranteed in code:** one the model dropped is put back (quoted where its words stayed,
-   else appended to the first question), and each phrase (at most two) is also asked **on
-   its own**, in quotes: the library reads a question through `websearch_to_tsquery`, where
-   every word must be in the chunk, so a phrase inside a full question reaches the exact
-   retriever only for a chunk that also holds all the other words. The agent's last
-   answer is the only earlier turn the writer sees; at a session's first turn with none
-   kept (after a restart or with a new session id) it is read once, whole, from the latest
-   assistant message in `state.db` of `HERMES_HOME` through a separate read-only
-   connection (silently none on any error).
-4. **Ask (Stage 1 + Stage 2).** Each question goes, in parallel, to the library's
-   search for up to 50 candidates, with `excluded_sources` (the thread's last two turns,
-   below) and `date_from` / `date_to` filtered **in SQL** before the candidates are cut,
-   then reranked by the cross-encoder (`reranker_model`). A note that two questions both
-   found appears once, with its matched words if either found them. If the library's
-   Stage 2 fails, its own fallback is Stage 1's order: the first five hits of each question
-   stand and the block says "The reranker could not rank these; they are in the search's
-   own order." If the library call itself fails, the block is the one "not consulted" line.
-   There is no second rank call: Jev no longer scores the results.
-5. **Block.** A markdown block: the contract's header paragraph, `Asked:` lines, then the
-   library's own cited entries, each `[n] source=... | date=... | kind=... | match=...`,
-   an `Exact match snippet: "..."` line when a lexical retriever matched, and the whole
-   chunk (`kind` is left out for a note with none). It is sized by Stage 2's relevance
-   floor: no count cap, no entry is ever cut. `recall.prefetch.max_tokens` (default 0 =
-   off) is a safety valve that leaves out whole entries that would take the block past it.
-   When memory could not be searched the block is one line, `(memory was not consulted:
-   <reason>)`; when the search found nothing that answers, one line says so.
+   `past_month` (31), `past_year` (366) or `none`. It is passed as `date_from` / `date_to`, so
+   every search that names no period of its own carries it. A period the line **names** ("in
+   July", "March 2025") is `named`: the decision model cannot turn it into dates, so no window
+   is passed and the library's writer dates the search that names it (its own `date_from` /
+   `date_to`; the other searches stay open). The block says when a window applied ("Only notes
+   dated 2026-10-10 to 2026-10-17 were searched."). A missing, unknown or invalid answer is no
+   window: a search with no date filter loses nothing, a wrong window could.
+3. **Expand and search (the library).** `expand_and_recall(line, "chat", agent_last=...,
+   date_from=..., date_to=..., excluded_sources=..., deadline=..., max_tokens=...,
+   query_writer_model=..., gate=False, record=False)`. The query-writer model writes about 3
+   searches for a short message and up to 10 to 20 for an elaborate one (at most 20), each
+   standing alone: a **follow-up** is resolved against `agent_last`, the agent's last answer
+   (kept from `sync_turn`; at a session's first turn with none kept, after a restart or with a
+   new session id, it is read once, whole, from the latest assistant message in `state.db` of
+   `HERMES_HOME` through a separate read-only connection, silently none on any error). Quoted
+   phrases, identifiers and names are guaranteed in a search's `terms`. Every search runs Stage
+   1 (up to 50 candidates; `excluded_sources` and the dates are filtered **in SQL** before the
+   candidates are cut) and Stage 2 (the cross-encoder, against its own query) at the same time,
+   inside one deadline. A record found by several searches appears once. If a search's Stage 2
+   fails, its own fallback is Stage 1's order and the block says "The reranker could not rank
+   these; they are in the search's own order." If the writer fails the library searches the
+   message itself (one search); a search still running at the deadline is dropped.
+4. **Block.** The contract's opening paragraph (it replaces the library's heading), then the
+   library's block: **the searches that ran** ("Searches run": each query with its terms and
+   period), the line telling the agent to **cite `[n]`** when it uses an item, then the cited
+   entries, each `[n] source=... | date=... | kind=... | match=... | found_by=...` (the searches
+   that found it), an `Exact match snippet: "..."` line when a lexical retriever matched, and
+   the whole chunk (`kind` is left out for a note with none). It is sized by Stage 2's relevance
+   floor: no count cap, no entry is ever cut. `recall.prefetch.max_tokens` (default 0 = not set)
+   is the library's safety valve: it leaves out whole entries that would take the block past it
+   and says how many (not set: the library's own, the bank's `recall_config.expansion.max_tokens`,
+   which is off unless an operator set it). When memory could not be searched the block is one line, `(memory was not
+   consulted: <reason>)`; when the searches found nothing that answers, one line lists them:
+   `Memory was asked: <the searches' queries>. Nothing in it answers this.`
 
-**Never fails a turn.** The whole function is wrapped, and it has a deadline of
-5 s from the call (core waits 8 s; `deadline_seconds`, at most 7). Each stage
-has a fallback: no decision in 1 s (or a refusal, or no key) means a rule
-(three words or fewer: nothing; anything else is asked as written, with no
-window, and the block says "Questions formed without the decision model."); no
-questions in 1.5 s (or bad JSON, or no model) means the sentence Jev rates most
-relevant from the agent's last answer, or the line itself, whole (never a paste,
-never a bare reply); a search that fails (or a bank that cannot run it) gives the one
-"not consulted" line. Past the
-deadline the turn runs without memory and a late answer is dropped.
+**Never fails a turn.** The whole function is wrapped, and the whole turn has a deadline of
+5 s from the call (core waits 8 s; `deadline_seconds`, at most 7). The decision has its own
+limit (`decision_timeout_seconds`, 1 s); the library is given **what is left of the deadline** and
+shares it between its writer and its searches (the writer at most half, and a quarter always
+left for the searches), so nothing runs past it: a late search is dropped by the library, and
+a library call that has still not returned a moment after the deadline is ended by the plugin.
+Each step has a fallback: no decision in 1 s (or a refusal, or no key) means a rule (three
+words or fewer: nothing; anything else is expanded, with no window, and the block says
+"Searches were made without the decision model."); a writer that fails gives one search with the
+message itself (the library's); a library that fails, cannot run (a bank with no `hybrid_chunk`
+channel), has no search that answered, or is late gives the one "not consulted" line.
 
-**Logging.** Nothing is logged per turn. The only line is one warning (no text)
-when a turn goes without memory because of an error or the deadline.
+**Logging.** Nothing is logged per turn, and the library is called with `record=False`, so it
+writes no recall event and no model-call event for a chat message. The only line is one warning
+(no text) when a turn goes without memory because the plugin itself failed or the deadline passed.
 
 **Ahead.** Core calls `queue_prefetch` after each turn with the person's text.
 In contract mode the plugin ignores that text and, when the agent's own last
-answer ended on a proposal ("Shall I draft it?"), prepares the block its
-go-ahead will need on its own thread, keyed on that answer. The next turn uses
+answer ended on a proposal ("Shall I draft it?"), expands it on its own thread
+(the message is "the person has not replied yet; prepare for the reply", the agent's
+answer is `agent_last`), keyed on that answer. The next turn uses
 it, once, if the decision is `answer` or `go_ahead` for the same answer. (A bare
 "yes" never reaches the plugin: core's filter skips it; "ok do it" does.)
 
-**No echoes.** The brief never hands the agent back what it already has in view: the current session's last two retained turns (`turn:<session>:<ms>`) are passed to the library as `excluded_sources` and left out **in SQL**, so Stage 1 never returns them and the freed slots go to the next candidates (older turns of the same session, other sessions and notes stay). `sync_turn` names each turn's record when the turn ends; after a restart the last two are read once from the bank. `recall.prefetch.drop_echoes` (default `true`) turns it off. This replaces the old after-the-fact text comparison, including its rule that the agent's last answer counts only from 60 characters: a record is now excluded because it *is* one of the last two turns (every chunk of it, however long the turn), not because its text holds the agent's words, so a short last answer ("Done.") can no longer match an older turn by accident and a note that merely quotes the agent is never dropped.
+**No echoes.** The brief never hands the agent back what it already has in view: the current session's last two retained turns (`turn:<session>:<ms>`) are passed to the library as `excluded_sources` and left out **in SQL** for every search, so Stage 1 never returns them and the freed slots go to the next candidates (older turns of the same session, other sessions and notes stay). `sync_turn` names each turn's record when the turn ends; after a restart the last two are read once from the bank. `recall.prefetch.drop_echoes` (default `true`) turns it off. A record is excluded because it *is* one of the last two turns (every chunk of it, however long the turn), not because its text holds the agent's words, so a short last answer ("Done.") can never match an older turn by accident and a note that merely quotes the agent is never dropped.
 
 **Switches and files** (all read when a session starts, so the next session
 picks up a change with no gateway restart; env wins over config):
@@ -302,49 +305,49 @@ picks up a change with no gateway restart; env wins over config):
 | `mode` | `off` (`off` or `contract`) | `PROSPECTA_PREFETCH_MODE` |
 | `contract_path` | bundled `contract/recall-contract-v1.md` | `PROSPECTA_PREFETCH_CONTRACT` |
 | `max_tokens` | `0` (off) | `PROSPECTA_PREFETCH_MAX_TOKENS` |
-| `deadline_seconds` | `5` | `PROSPECTA_PREFETCH_DEADLINE` |
+| `deadline_seconds` | `5` (at most `7`) | `PROSPECTA_PREFETCH_DEADLINE` |
 | `paste_chars` | `50000` | `PROSPECTA_PREFETCH_PASTE_CHARS` |
 | `drop_echoes` | `true` | `PROSPECTA_PREFETCH_DROP_ECHOES` |
 | `decision_timeout_seconds` | `1.0` | `PROSPECTA_PREFETCH_DECISION_TIMEOUT` |
-| `writer_timeout_seconds` | `1.5` | `PROSPECTA_PREFETCH_WRITER_TIMEOUT` |
-| `search_timeout_seconds` | `4.5` | `PROSPECTA_PREFETCH_SEARCH_TIMEOUT` |
+| `query_writer_model` | unset: the library resolves it | `PROSPECTA_QUERY_WRITER_MODEL` (the library's, below the profile) |
 
 The models are `decision_model`, `query_writer_model` and `reranker_model`, set in
-`prospecta.json` (top level) or the environment, see [Recall](#recall-stage-1--stage-2-cited).
-The old `recall.prefetch.decision_model` / `question_model` keys and their
-`PROSPECTA_PREFETCH_DECISION_MODEL` / `PROSPECTA_PREFETCH_QUESTION_MODEL` env vars no
-longer apply (renamed, with a new default for the writer); a session that still has one
-logs a warning naming the new key. `PROSPECTA_PREFETCH_RANK_TIMEOUT` and
-`rank_timeout_seconds` are gone with the rank call.
+`prospecta.json` (top level; the writer's also under `recall.prefetch`) or the environment, see
+[Recall](#recall-stage-1--stage-2-cited).
 
-The three `*_timeout_seconds` limits are per stage and must be above 0 (a bad
-value logs one warning and the default is used). They are not added up: each
-stage is also capped by what is left of `deadline_seconds`, so the deadline
-always wins. The search default is 4.5 s: it covers the question's embedding, the one SQL
-query and the reranker's own 2.5 s limit; a search that has not answered by its limit
-gives the "not consulted" line.
+**Renamed and removed settings.** `recall.prefetch.question_model` is renamed
+`recall.prefetch.query_writer_model` (the profile-wide `query_writer_model` also works). The old
+key is read as a **deprecated alias** for this release: it still sets the writer model, and
+`initialize` logs one warning line naming the new key. The other old settings no longer apply, and
+a session that still has one logs one warning line: `recall.prefetch.decision_model` and the
+`PROSPECTA_PREFETCH_DECISION_MODEL` / `PROSPECTA_PREFETCH_QUESTION_MODEL` env vars (use
+`decision_model` / `query_writer_model` and their environment variables), and
+`recall.prefetch.writer_timeout_seconds` / `search_timeout_seconds` with
+`PROSPECTA_PREFETCH_WRITER_TIMEOUT` / `PROSPECTA_PREFETCH_SEARCH_TIMEOUT`: the library owns the
+writer and the searches now and runs them inside the deadline, so the plugin keeps only the limit
+of the one stage it owns, the decision (it must be above 0; a bad value logs one warning and the
+default is used; it is also capped by what is left of `deadline_seconds`).
 
 The models are called with the profile's own keys (`OPENROUTER_API_KEY`), and
 see only what the agent sees: the person's line and the agent's last answer.
 
 **The contract file.** `contract/recall-contract-v1.md` holds, word for word
-from the design: the Jev question list (`jev-questions`, JSON), the
-question-writer prompt (`question-writer-prompt`), the block's first paragraph
-(`block-intro`) and the fixed sentences (`lines`: the `Asked:` line, "Nothing in
-it answers this", "N more matched less well", the search-order line, the window
-line, "Questions formed without the decision model" and the "not consulted"
-line). Swapping the file (`contract_path`) is enough to change any of them; the
-file must keep the section names and the eight original question ids (`time_scope`
-is optional: without it no window is ever asked for). What changed since the design,
-and why: the ninth question `time_scope` (Stage 0 now also finds the period); the
-entries are the library's cited evidence instead of `[source | date | rated]` labels,
-and Jev no longer rates them (Stage 2 does), so the two `rated-*` lines are gone;
-"N more matched less well" now counts only entries left out by `max_tokens` (Stage 2's
-own cuts are final); the search-order line names the reranker, not Jev; the window line
-is new. The opening paragraph and the "Memory was asked: ... Nothing in it answers this."
-line are unchanged. Everything else is code: the gate, the 0.5 threshold, the source
-mapping, the parallel asking, the deadline and every fallback, the quoted-phrase and
-named-period rules of the writer, and the timings.
+from the design: the Jev question list (`jev-questions`, JSON), the block's first paragraph
+(`block-intro`) and the fixed sentences (`lines`: "Nothing in it answers this", the
+search-order line, the window line, "Searches were made without the decision model" and the
+"not consulted" line). Swapping the file (`contract_path`) is enough to change any of them; the
+file must keep the section names and the question ids `line_kind` and `needs_memory`
+(`time_scope` is optional: without it no window is ever asked for). What changed since the
+design, and why: the ninth question `time_scope` (Stage 0 also finds the period); the entries are
+the library's cited evidence instead of `[source | date | rated]` labels, and Jev no longer rates
+them (Stage 2 does), so the two `rated-*` lines are gone; the search-order line names the
+reranker, not Jev; the window line is new; and the recall is now query expansion by the library,
+so the **question-writer prompt is no longer in the file** (the writer's prompt is the library's),
+the block lists the **searches** that ran (and the library's cite-`[n]` line) instead of
+`Asked:` questions, `Memory was asked:` now lists the searches, and the `asked` and `more` lines
+are gone (the library says how many records its token valve left out). Everything else is code:
+the gate, the 0.5 threshold, the parallel searches (the library's), the deadline and every
+fallback.
 
 ## Shadow reads
 
@@ -512,15 +515,15 @@ something else since is left alone.
 | `timezone` | `America/Los_Angeles` | IANA zone whose calendar day the library saves as each new note's date (handed to it as `PROSPECTA_TIMEZONE`), see [Note dates](#note-dates) |
 | `hash_precheck` | empty (on) | before saving, look for the same text already in the bank and skip the write (no embedding calls); `PROSPECTA_HASH_PRECHECK` env overrides. Same text under another source is logged and skipped |
 | `tool_guide` | empty (on) | add a short guide to the memory tools (search vs recall, depth, dates, retain) to the system prompt block; `false` or `PROSPECTA_TOOL_GUIDE=off` turns it off |
-| `decision_model` | `typesafe/jev-1.14` | the Stage 0 decision model (contract prefetch) and the Stage 3 gate model; the profile value wins over `PROSPECTA_DECISION_MODEL`. See [Recall](#recall-stage-1--stage-2-cited) |
-| `query_writer_model` | `openrouter/google/gemini-2.5-flash-lite` | the small text model that writes the contract prefetch's questions (a LiteLLM id); the profile value wins over `PROSPECTA_QUERY_WRITER_MODEL` |
-| `reranker_model` | `qwen/qwen3-reranker-8b` | the Stage 2 cross-encoder (OpenRouter rerank); the profile value wins over `PROSPECTA_RERANKER_MODEL` |
+| `decision_model` | unset (the library: `typesafe/jev-1.14`) | the Stage 0 decision model (contract prefetch) and the Stage 3 gate model; the profile value wins over `PROSPECTA_DECISION_MODEL`. See [Recall](#recall-stage-1--stage-2-cited) |
+| `query_writer_model` | unset (the library: `openrouter/google/gemini-2.5-flash-lite`) | the small text model that expands the contract prefetch's message into searches (a LiteLLM id); also read as `recall.prefetch.query_writer_model` (which wins); the profile value wins over `PROSPECTA_QUERY_WRITER_MODEL` |
+| `reranker_model` | unset (the library: `qwen/qwen3-reranker-8b`) | the Stage 2 cross-encoder (OpenRouter rerank); the profile value wins over `PROSPECTA_RERANKER_MODEL` |
 | `recall.stage3` | `false` | `prospecta_recall` answers through the library's `ask()` with the Stage 3 sufficiency gate; `PROSPECTA_RECALL_STAGE3` env overrides |
 | `recall.date_cue_gate` | `true` | call the filter-extraction model only when the question has a date cue (month, weekday, `ago`, `last week`, a year, an ISO date, ...); otherwise search with no date filter and no model call (people matching still runs). `false` restores the library behaviour; `PROSPECTA_DATE_CUE_GATE` env overrides |
 | `recall.date_timeout_seconds` | `6` | hard wall-clock cap on the date-extraction model call; on timeout or error the search continues with the library's regex date filter and one warning is logged. Stalled calls are abandoned (at most 8 at once; beyond that the model is skipped). `0` disables; `PROSPECTA_DATE_TIMEOUT` env overrides |
-| `recall.prefetch.mode` | `off` | `off` (the old prefetch) or `contract` (the written recall contract), see [Prefetch](#prefetch); `PROSPECTA_PREFETCH_MODE` env overrides |
+| `recall.prefetch.mode` | `off` | `off` (the old prefetch) or `contract` (the written recall contract: one decision, then the library's query expansion), see [Prefetch](#prefetch); `PROSPECTA_PREFETCH_MODE` env overrides |
 | `recall.prefetch.contract_path` | empty (the bundled file) | the recall contract file; `PROSPECTA_PREFETCH_CONTRACT` env overrides |
-| `recall.prefetch.max_tokens` | `0` (off) | safety valve on the contract block; `PROSPECTA_PREFETCH_MAX_TOKENS` env overrides |
+| `recall.prefetch.max_tokens` | `0` (off) | safety valve on the contract block (the library's); `PROSPECTA_PREFETCH_MAX_TOKENS` env overrides |
 | `dual_write_retry_path` | `prospecta-dual-write-retry.jsonl` beside `prospecta.json` | notes whose second write failed |
 
 Persisted to `$HERMES_HOME/prospecta.json`.

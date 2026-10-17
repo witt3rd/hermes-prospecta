@@ -207,6 +207,15 @@ def test_the_stage_2_and_3_arguments_the_provider_gives_memory(plugin_module, mo
     assert kw["jev"].model == "typesafe/jev-9" and callable(kw["jev"].transport)
 
 
+def test_with_no_profile_models_the_provider_hands_the_library_none_so_it_resolves_them(plugin_module):
+    from prospecta.stages import JEV_MODEL
+    p = plugin_module.ProspectaProvider()
+    p._config = {"recall": {"stage3": "true"}}
+    kw = p._recall_stage_kwargs()
+    assert kw["reranker_model"] is None and kw["decision_model"] is None   # bank config, env, default: the library's
+    assert kw["jev"].model == JEV_MODEL
+
+
 # ---- the shadow log: false-abstain rate beside every abstention figure ----
 
 OLD, NEW = "old_bank", "new_bank"
@@ -369,7 +378,7 @@ def test_real_recall_through_ask_with_the_stage_3_gate_on(hybrid_bank):
             return "The roof will be replaced in June [1]."
 
     p = hybrid_bank(config={"recall": {"stage3": "true"}}, llm=Writer())
-    p._memory._jev = JevScore(gate, model=p._decision_model())
+    p._memory._jev = JevScore(gate)                                # the library's own model, no profile value
     p._retain("The Henley branch roof will be replaced in June.", source="note:new", metadata={"created_on": "2026-10-12"})
     out = _call(p, "prospecta_recall", query="Henley branch roof")
     assert out["answer"] == "The roof will be replaced in June [1]."
