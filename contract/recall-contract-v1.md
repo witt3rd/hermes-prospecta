@@ -7,7 +7,9 @@ loads this file at run time (`recall.prefetch.contract_path`, env `PROSPECTA_PRE
 to adopt a newer shared text, replace this file. Nothing here is code: the code only reads it.
 
 Changes since the design (hybrid architecture, Mode 1 of Prospecta's `docs/postgres-hybrid.md`):
-`jev-questions` has a ninth question, `time_scope`, which gives the search a window of dates;
+`jev-questions` has a ninth question, `time_scope`, which gives the search a window of dates
+(only when the line limits the memory it asks about to a past period; a period that only says when the
+request happens, "this week's theme", is no window, and doubt is no window);
 the block's entries are the library's cited evidence (`[n] source=... | date=... | kind=... |
 match=... | found_by=...`, an `Exact match snippet:` line, the whole chunk) and are no longer
 rated by a second Jev call, so the two `rated-*` lines are gone; `search-order` names the
@@ -109,14 +111,14 @@ design abbreviates them with "...").
   },
   "time_scope": {
     "type": "choice",
-    "instructions": "Does `new_lines` limit what it asks about to a period of time, counted back from `today`?",
+    "instructions": "Does `new_lines` ask about what happened, was said or was done within a period of time, counted back from `today`, so that notes from before that period would be worthless to the answer? Answer a period ONLY then. A relative period that only modifies the request (it says when the request is made, or when the thing asked for happens or is due: this week's theme, today's plan, tonight, next week, a deadline) is not a limit on the memory being asked about: answer none. When older notes could also answer, answer none. When in doubt: none (a search with no window loses nothing; a wrong window can lose everything).",
     "criteria": {
-      "none": "No period is named or meant.",
-      "recent": "Today or yesterday.",
-      "past_week": "The last few days or the last week.",
-      "past_month": "The last few weeks or the last month.",
-      "past_year": "The last few months or the last year.",
-      "named": "A particular period that `new_lines` names: a month, a season, a year, a date or a range."
+      "none": "No period limits the memory asked about: no period is named or meant; or a relative period only modifies the request (this week's theme, today's plan, tonight, next week, a deadline); or older notes could also answer. When in doubt: none.",
+      "recent": "It asks about what happened, was said or was done today or yesterday, and older notes would be worthless to the answer.",
+      "past_week": "It asks about what happened, was said or was done in the last few days or the last week, and older notes would be worthless to the answer.",
+      "past_month": "It asks about what happened, was said or was done in the last few weeks or the last month, and older notes would be worthless to the answer.",
+      "past_year": "It asks about what happened, was said or was done in the last few months or the last year, and older notes would be worthless to the answer.",
+      "named": "It asks about what happened, was said or was done in a particular past period that `new_lines` names: a month, a season, a year, a date or a range."
     }
   }
 }

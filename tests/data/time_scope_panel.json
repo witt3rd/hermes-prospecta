@@ -1,0 +1,173 @@
+{
+ "description": "Invented lines for the time_scope question. Class modifies_request: a relative period only says when the request happens or is due (expected none). Class limits_memory: the line asks about what happened within a past period (expected: that scope). No real names or private text.",
+ "lines": [
+  {
+   "id": "evidence_shape",
+   "line": "Dear Orrin, since you have been so artistic THIS WEEK with your lanterns, how do you feel about picking the Marigold theme for THIS WEEK's QRTZ?",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "evidence_shape_b",
+   "line": "Hey Orrin, you were so inventive THIS WEEK with the garden sketches, what do you think about choosing the Pelican theme for THIS WEEK's VLTX?",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "evidence_shape_c",
+   "line": "Since you have been on a roll this week with the kite drawings, could you pick the Juniper theme for this week's BRKN meetup?",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "modifies_request_theme",
+   "line": "What should be the theme for this week's newsletter, given what Tamsin likes?",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "modifies_request_plan",
+   "line": "Help me plan today around the Alder Street delivery and the dentist.",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "modifies_request_tonight",
+   "line": "What did Mirela say about the Cobalt recipe? I want to cook it tonight.",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "modifies_request_next_week",
+   "line": "Draft the agenda for next week's Fennick committee meeting like we did before.",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "deadline",
+   "line": "The Hollis grant report is due this Friday; what format did the funder ask for?",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "recurring",
+   "line": "Remember the rules of the Thursday chess club? I need them for this week's session.",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "upcoming",
+   "line": "I am travelling tomorrow to Brindle Cove; what did we note about the ferry times?",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "old_notes_also_answer",
+   "line": "What have we decided about the Kestrel logo so far? Need it by end of this week.",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "no_period",
+   "line": "What is Ludo's favourite tea?",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "both_ways",
+   "line": "Which poem did we use for the Wren Society opener? We are doing it again this week.",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "this_month_request",
+   "line": "Write this month's Saffron report in the usual style, with the figures we always use.",
+   "expected": "none",
+   "class": "modifies_request"
+  },
+  {
+   "id": "yesterday_work",
+   "line": "What was I working on yesterday?",
+   "expected": "recent",
+   "class": "limits_memory"
+  },
+  {
+   "id": "today_said",
+   "line": "What did Priya say earlier today about the Quill invoices?",
+   "expected": "recent",
+   "class": "limits_memory"
+  },
+  {
+   "id": "last_night",
+   "line": "What did we talk about last night and yesterday evening?",
+   "expected": "recent",
+   "class": "limits_memory"
+  },
+  {
+   "id": "last_week_decide",
+   "line": "What did we decide last week?",
+   "expected": "past_week",
+   "class": "limits_memory"
+  },
+  {
+   "id": "past_days_done",
+   "line": "What have I done over the last few days on the Tern project?",
+   "expected": "past_week",
+   "class": "limits_memory"
+  },
+  {
+   "id": "this_past_week",
+   "line": "Summarize what was said in the Marlow standups in the past week.",
+   "expected": "past_week",
+   "class": "limits_memory"
+  },
+  {
+   "id": "lately_week",
+   "line": "What did Dalia send me in the last seven days?",
+   "expected": "past_week",
+   "class": "limits_memory"
+  },
+  {
+   "id": "issues_last_month",
+   "line": "List the issues raised last month on the Bramble tracker.",
+   "expected": "past_month",
+   "class": "limits_memory"
+  },
+  {
+   "id": "last_few_weeks",
+   "line": "What did we agree with the Osprey supplier over the last few weeks?",
+   "expected": "past_month",
+   "class": "limits_memory"
+  },
+  {
+   "id": "past_month_notes",
+   "line": "What notes did I take in the past month about the Elm Court renovation?",
+   "expected": "past_month",
+   "class": "limits_memory"
+  },
+  {
+   "id": "past_year_trips",
+   "line": "What trips did I take over the last year?",
+   "expected": "past_year",
+   "class": "limits_memory"
+  },
+  {
+   "id": "last_few_months",
+   "line": "How did the Cinder budget change in the last few months?",
+   "expected": "past_year",
+   "class": "limits_memory"
+  },
+  {
+   "id": "named_march",
+   "line": "What did we decide about the Plover pricing in March 2025?",
+   "expected": "named",
+   "class": "limits_memory"
+  },
+  {
+   "id": "named_summer",
+   "line": "What did Joss and I discuss in the summer of 2024?",
+   "expected": "named",
+   "class": "limits_memory"
+  }
+ ]
+}
