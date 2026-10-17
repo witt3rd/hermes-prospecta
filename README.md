@@ -565,8 +565,12 @@ See the docstring of `importer.py` for the exact mapping. Prospecta has no
 entity/link tables, so entities become documents and links, provenance, event
 timestamps, and unrecognised fields ride in `documents.document_metadata.hindsight`
 (links on both endpoints). `created_at` of each document/item is the original
-timestamp. No LLM is needed: the fact text is its own `index_text`; only the
-embedder is called.
+timestamp. No LLM is needed: the fact text is its own `index_text` (a question item),
+and the library also writes its `chunk` items (`child_chunks=True`), which are what hybrid
+recall (Stage 1) reads, so an imported note can be found by the contract prefetch and
+`prospecta_search`; only the embedder is called. A bank imported before this was written
+holds question items only: re-import it after deleting those documents (a re-run leaves an
+unchanged document alone, so it does not add the chunks).
 
 - **Idempotent**: re-running leaves unchanged documents alone (no re-embed);
   changed ones are replaced under the same source (`hindsight://<bank>/<kind>/<id>`).

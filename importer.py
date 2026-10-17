@@ -24,6 +24,8 @@ carried in ``documents.document_metadata['hindsight']``):
   ``entity:<name>`` + original tags, created_at = original timestamp.
 * each entity -> one document, source ``hindsight://<bank>/entity/<id>``.
 * each link -> recorded on BOTH endpoint documents (out/in).
+* every document is indexed as a question item (its own text) AND as ``chunk`` items, which
+  are what the library's hybrid recall (Stage 1) reads.
 * any unrecognised field -> ``hindsight.extra``.
 * identical text under a different id -> merged into the first document as
   ``hindsight.import_aliases`` (prospecta dedups on content hash).
@@ -206,8 +208,10 @@ def import_dump(memory, dump: dict, *, bank_id: str | None = None,
                 res["imported"] += 1
                 continue
             hh = dict(h, import_aliases=aliases) if aliases else h
-            doc_id = memory.retain(text, source=source, index_text=[text], tags=it["tags"],
-                                   metadata={"hindsight": hh})
+            # index_text=[text] keeps the question item (the unit's own text); child_chunks=True adds the
+            # kind='chunk' items, which are all that the library's hybrid recall (Stage 1) reads.
+            doc_id = memory.retain(text, source=source, index_text=[text], child_chunks=True,
+                                   tags=it["tags"], metadata={"hindsight": hh})
             created = _ts(it["created"])
             if created:
                 with memory._pool.connection() as conn, conn.cursor() as cur:

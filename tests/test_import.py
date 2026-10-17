@@ -86,6 +86,38 @@ def test_import_no_loss_and_fields(memory):
     assert ent["aliases"] == ["dt"] and len(ent["links"]) == 1
 
 
+def _items(memory):
+    """(source, kind, content, created_at) of every memory item the import wrote."""
+    with memory._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT d.source, m.kind, m.content, m.created_at FROM memory_items m "
+                    "JOIN documents d ON d.id = m.document_id WHERE d.bank_id='b' ORDER BY d.source, m.kind")
+        return cur.fetchall()
+
+
+def test_import_writes_chunk_items_next_to_the_question_item(memory):
+    """Stage 1 reads kind='chunk' items only: an imported note with no chunk item cannot be found by
+    hybrid recall. The question item (the unit's own text, as before) stays; the chunk is added."""
+    importer.import_dump(memory, copy.deepcopy(DUMP))
+    by_source: dict = {}
+    for source, kind, content, created in _items(memory):
+        by_source.setdefault(source, []).append((kind, content, created))
+    assert sorted(by_source) == ["hindsight://janus/entity/e1", "hindsight://janus/unit/u1",
+                                 "hindsight://janus/unit/u2", "hindsight://janus/unit/u3"]
+    for source, rows in by_source.items():
+        assert sorted(k for k, _, _ in rows) == ["chunk", "question"], source
+    u1 = {k: (c, t) for k, c, t in by_source["hindsight://janus/unit/u1"]}
+    assert u1["chunk"][0] == u1["question"][0] == "Dave prefers uv over pip."
+    # the original timestamp is on the chunk item too (not only on the question item and the document)
+    assert u1["chunk"][1].isoformat().startswith("2025-03-01T10:00")
+
+
+def test_imported_notes_are_found_by_the_librarys_stage_1(memory):
+    importer.import_dump(memory, copy.deepcopy(DUMP))
+    memory.set_channel_config([{"name": "hybrid_chunk", "weight": 1}])
+    hits = memory.search("Dave moving Seattle", mode="hybrid", limit=5)
+    assert "hindsight://janus/unit/u2" in [h.source for h in hits]
+
+
 def test_import_idempotent(memory):
     importer.import_dump(memory, copy.deepcopy(DUMP))
     before = _docs(memory)
