@@ -17,10 +17,6 @@ class FakeMemory:
         self.calls.append(("search", q, kw))
         return []
 
-    def recall_mapreduce(self, q, **kw):
-        self.calls.append(("recall_mapreduce", q, kw))
-        return SimpleNamespace(synthesis="all of them", citations=["[a]", "[b]"])
-
 
 def _provider(plugin_module):
     p = plugin_module.ProspectaProvider()
@@ -43,16 +39,7 @@ def test_depth_deep_reaches_recall_and_search(plugin_module):
     assert [kw["depth"] for _, _, kw in p._memory.calls] == ["deep", "deep"]
 
 
-def test_recall_set_runs_mapreduce_with_entity_and_aliases(plugin_module):
-    p = _provider(plugin_module)
-    out = json.loads(p.handle_tool_call(
-        "prospecta_recall_set", {"query": "nicknames?", "entity": "Kelly", "aliases": ["K"]}))
-    assert out == {"synthesis": "all of them", "citations": ["[a]", "[b]"]}
-    assert p._memory.calls[0] == ("recall_mapreduce", "nicknames?", {"entity": "Kelly", "aliases": ["K"]})
-
-
-def test_schemas_offer_depth_and_the_set_tool(plugin_module):
+def test_schemas_offer_depth(plugin_module):
     names = {s["name"]: s for s in plugin_module.ProspectaProvider().get_tool_schemas()}
     assert names["prospecta_recall"]["parameters"]["properties"]["depth"]["enum"] == ["standard", "deep"]
     assert names["prospecta_search"]["parameters"]["properties"]["depth"]["enum"] == ["standard", "deep"]
-    assert "prospecta_recall_set" in names

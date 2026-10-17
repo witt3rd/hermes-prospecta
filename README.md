@@ -93,7 +93,6 @@ Both paths run migrations and create the default bank idempotently.
 | `prospecta_retain` | Store a note: chunked and searchable at once, no model call; optional `index_text` (anticipated questions) kept as extra keys next to the chunks |
 | `prospecta_recall` | Synthesized answer + cited sources (with `recall.stage3`: the library's `ask()` with the Stage 3 gate), see [Recall](#recall-stage-1--stage-2-cited) |
 | `prospecta_search` | Cited hits, no synthesis: source, date, kind, match, relevance, `exact_snippet`, the whole chunk; optional `date_from` / `date_to`, see [Recall](#recall-stage-1--stage-2-cited) |
-| `prospecta_recall_set` | The complete cited list for a set question about one entity (map-reduce) |
 
 ## Recall: Stage 1 + Stage 2, cited
 
@@ -396,17 +395,17 @@ the same shape as the library's own shadow of `Memory.recall()`.
 extra thread). They prepare a switch to a newer bank.
 
 - `linked_writes` builds the main `Memory` with the stages the library CLI
-  builds (`prospecta.cli._common._stage_kwargs()`: linker, Jev, rerank and
-  synth LLMs, built when `OPENROUTER_API_KEY` is set; `PROSPECTA_LINKER=off` /
-  `PROSPECTA_JEV=off` opt out), and retains notes with `child_chunks=True`. New
-  notes get entities and links like the migrated bank. Note that the same
-  stages also apply to recall on that `Memory`. The library links on its own
-  worker thread; a linking (or stage build) failure is logged with the full
-  exception and never fails the turn.
+  builds (`prospecta.cli._common._stage_kwargs()`: synth and rerank LLMs and
+  Jev, built when `OPENROUTER_API_KEY` is set; `PROSPECTA_JEV=off` opts out),
+  and retains notes with `child_chunks=True`. The library no longer has a
+  linker, so no entities or links are written and `PROSPECTA_LINKER` is
+  ignored (an old `PROSPECTA_LINKER=off` is harmless). Note that the same
+  stages also apply to recall on that `Memory`. A stage build failure is logged
+  with the full exception and never fails the turn.
 - `dual_write_bank_id` queues every note the main bank accepted (`sync_turn`
   and `prospecta_retain`) for one background daemon thread (bounded queue, 16
   pending, same worker as the shadow reads) that retains it into that bank with
-  its own embedder, the linker on and chunk children. The agent's turn never
+  its own embedder and chunk children. The agent's turn never
   waits for it and it can never fail it.
 - The second write is idempotent: a note whose content hash is already in the
   second bank is skipped, so a catch-up copy and the dual write cannot
@@ -510,7 +509,7 @@ something else since is left alone.
 | `shadow_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the shadow bank |
 | `shadow_embedding_dim` | `1536` | dimensionality of the shadow bank |
 | `shadow_mode` | `search` | `search` = retrieval only; `full` = also shadow `recall_synth` (LLM cost) |
-| `linked_writes` | `false` | linked notes, see [Linked and dual writes](#linked-and-dual-writes); `PROSPECTA_LINKED_WRITES` env overrides |
+| `linked_writes` | `false` | chunk children and library stages, see [Linked and dual writes](#linked-and-dual-writes); `PROSPECTA_LINKED_WRITES` env overrides |
 | `dual_write_bank_id` | empty (OFF) | second bank every note is also written to; `PROSPECTA_DUAL_WRITE_BANK` env overrides (set it empty to force OFF) |
 | `dual_write_embed_model` | `openrouter/openai/text-embedding-3-large` | embedder for the dual-write bank |
 | `dual_write_embedding_dim` | `1536` | dimensionality of the dual-write bank |
