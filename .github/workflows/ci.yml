@@ -2,9 +2,23 @@ name: ci
 on:
   push:
     branches: [main]
-  pull_request:
+  pull_request:   # only for the conversion PR itself; direct landing opens none after it
+  schedule:
+    - cron: "17 */6 * * *"   # Tier 2 every 6 h
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  test:
+  tier1:   # the job scripts/land-direct's red-check reads: do not rename
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: scripts/tier1.sh
+  tier2:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

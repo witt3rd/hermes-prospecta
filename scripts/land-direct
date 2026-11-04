@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Land the worker's LOCAL commits DIRECT TO MAIN (docs/decisions/0001-land-direct.md): no branch pushed, no pull request, one coordinator. Adapted from lung's scripts/land-direct.
+#   scripts/land-direct [--dry-run] [<rev>]     lands the commits origin/main..<rev> (default HEAD) of the worktree it is run in, each as itself (linear history)
+#   scripts/land-direct --hold "<reason>" | --release      the hold marker <git common dir>/hermes-prospecta-land-hold: stops every landing (checked at the start, after the lock, right before the push)
+# Under ONE flock (<git common dir>/land.lock): red-check (main's latest push run of ci.yml: its tier1 job failed => only a fix(ci):/fix(tests):/revert commit lands) -> fetch -> rebase the
+# commits onto origin/main in a scratch worktree (<git-dir>/hermes-prospecta-land-direct/wt) -> a rebase conflict ONLY in scripts/generated-paths.txt takes main's file and regenerates it with the
+# gates' own --write (scripts/regen-baselines.sh: improvements only) -> Tier 1 LOCALLY on that exact combination -> fetch again: main moved during Tier 1 = rebase and check again (3 tries)
+# -> `git push origin <sha>:refs/heads/main`, a plain fast-forward push: there is no force anywhere in this script (a refused push runs the loop again).
+# Land-time checks on every commit, before any lock: a Conventional subject `type(scope): summary`; the production diff (lines of non-test .py files, not generated files) over 150 needs a
+# `Diff-Budget: <note>` trailer on a commit. Files Tier 1 re-renders (docs/proof-ledger.md) land as one extra `chore:` commit of the lander.
+# Exit codes: 0 landed | 1 stopped with a plain message | 2 bad input | 10 main is red (or unknowable) | 11 rebase conflict (aborted, files named: resolve in your worktree, run again) |
+#   12 a regenerated baseline is worse than main's | 13 Tier 1 fails (nothing lands) | 14 held | 15 busy: no lock within LAND_LOCK_WAIT_SECONDS (default 90): run it again.
+# The LAST line of stdout is JSON: {"sha","commits","tier1_seconds","specified_share","result","exit"} (null where not known; result: landed, would-land, blocked-red, conflict, gate-diff, tier1,
+# held, busy, error). Overridable for the self-test: REMOTE, BASE, GH, TIER1_CMD, REGEN_CMD.
+export LC_ALL=C
+set -euo pipefail
+remote=${REMOTE:-origin}; base=${BASE:-main}; gh=${GH:-gh}
+tier1=${TIER1_CMD:-scripts/tier1.sh}; regen=${REGEN_CMD:-true}   # Tier 1 ~40 s (pytest -n 8, no network); there are no generated files, so regen is a no-op
+here=$(cd "$(dirname "$0")" && pwd)
+top=$(git rev-parse --show-toplevel) || exit 2
+common=$(git -C "$top" rev-parse --path-format=absolute --git-common-dir)
+case ${1:-} in
+  --hold) [ $# -eq 2 ] || { echo "usage: land-direct --hold \"<reason>\"" >&2; exit 2; }
+    printf '%s\n' "$2" > "$common/hermes-prospecta-land-hold.tmp.$$" && mv -f "$common/hermes-prospecta-land-hold.tmp.$$" "$common/hermes-prospecta-land-hold"; echo "land-direct: hold set: $2"; exit 0;;
+  --release) rm -f "$common/hermes-prospecta-land-hold"; echo "land-direct: hold released"; exit 0;;
+esac
+dry=0; args=(); for a in "$@"; do case $a in --dry-run) dry=1;; -*) echo "usage: land-direct [--dry-run] [<rev>]" >&2; exit 2;; *) args+=("$a");; esac; done
+[ ${#args[@]} -le 1 ] || { echo "usage: land-direct [--dry-run] [<rev>]" >&2; exit 2; }
+rev=${args[0]:-HEAD}
+sha=; ncommits=; t1=; share=; result=error
+json_num() { [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$1" || printf null; }
+json_str() { [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]] && printf '"%s"' "$1" || printf null; }
+onexit() { local c=$?; printf '{"sha":%s,"commits":%s,"tier1_seconds":%s,"specified_share":%s,"result":"%s","exit":%s}\n' "$(json_str "$sha")" "$(json_num "$ncommits")" "$(json_num "$t1")" "$(json_num "$share")" "$result" "$c"; }
+trap onexit EXIT
+stop() { local code=$1; result=$2; shift 2; echo "land-direct: $*" >&2; exit "$code"; }
+die() { stop 1 error "$*"; }
+holdcheck() { local f=$common/hermes-prospecta-land-hold; [ ! -e "$f" ] || stop 14 held "HOLD in force ($f): $(sed -n 1p "$f" 2>/dev/null); not landing. scripts/land-direct --release lifts it."; }
+holdcheck
+git -C "$top" fetch -q "$remote" "$base" || die "cannot fetch $remote $base"
+tip0=$(git -C "$top" rev-parse --verify -q "$rev^{commit}") || { echo "land-direct: no such revision: $rev" >&2; exit 2; }
+commits=$(git -C "$top" rev-list --reverse --topo-order "$remote/$base..$tip0")
+[ -n "$commits" ] || { echo "land-direct: nothing to land: $rev is already in $remote/$base" >&2; exit 2; }
+[ -z "$(git -C "$top" rev-list --merges "$remote/$base..$tip0")" ] || { echo "land-direct: $rev has merge commits: history lands linear; rebase onto $remote/$base first" >&2; exit 2; }
+ncommits=$(wc -l <<<"$commits")
+budget=; title=$(git -C "$top" log -1 --format=%s "$tip0"); allfix=1
+for c in $commits; do
+  subj=$(git -C "$top" log -1 --format=%s "$c"); body=$(git -C "$top" log -1 --format=%B "$c" | tr -d '\r')
+  grep -qE '^(feat|fix|docs|chore|refactor|test|perf|build|ci|style|revert)(\([a-z0-9_,./-]+\))?!?: ..*' <<<"$subj" || die "commit ${c:0:12}: the subject is not a Conventional Commit 'type(scope): summary': '$subj'"
+  grep -qE '^Diff-Budget: ..*' <<<"$body" && budget=$(sed -n 's/^Diff-Budget: *//p' <<<"$body" | sed -n 1p) || true
+  grep -qE '^(fix\((ci|tests)\):|[Rr]evert)' <<<"$subj" || { allfix=0; title=$subj; }
+done
+[ "$allfix" = 0 ] || title=$(git -C "$top" log -1 --format=%s "$tip0")
+gen0=$(git -C "$top" show "$remote/$base:scripts/generated-paths.txt" 2>/dev/null | sed 's/#.*//; s/[[:space:]]//g; /^$/d' || true)
+prod=$(git -C "$top" diff --numstat "$remote/$base...$tip0" -- '*.py' ':!tests/*' | awk -v g="$gen0" 'BEGIN{n=split(g,a,"\n"); for(i=1;i<=n;i++) x[a[i]]=1} !($3 in x) && $1!="-" {t+=$1+$2} END{print t+0}')
+if [ "$prod" -gt 150 ] && [ -z "$budget" ]; then die "$prod production lines (non-test .py files, not generated) exceed the 150-line budget and no commit carries a 'Diff-Budget: <decomposition note>' trailer; not landing."; fi
+echo "land-direct: $ncommits commit(s); diff budget: $prod production lines (budget 150$([ "$prod" -le 150 ] || echo ", waived: $budget"))"
+# red-check: main's latest push run of ci.yml; its tier1 job failed => only a fix/revert lands. A run still going (or none yet) is not red: the local Tier 1 below is the gate. gh failing: fail closed.
+red_check() {
+  local r jobs n c l1=
+  r=$("$gh" run list --workflow ci.yml --branch "$base" --limit 20 --json databaseId,headSha,displayTitle,event --jq '[.[]|select(.event=="push")]|.[0]|select(.!=null)|[.databaseId,.headSha,.displayTitle]|@tsv') \
+    || stop 10 blocked-red "cannot tell whether $base is red (gh run list failed): not landing"
+  [ -n "$r" ] || return 0
+  local id sh rt; IFS=$'\t' read -r id sh rt <<<"$r"
+  jobs=$("$gh" run view "$id" --json jobs --jq '.jobs[]|[.name,.conclusion]|@tsv') || stop 10 blocked-red "cannot tell whether $base is red (gh run view $id failed): not landing"
+  while IFS=$'\t' read -r n c; do [ "$n" != tier1 ] || l1=$c; done <<<"$jobs"
+  case $l1 in failure|timed_out)
+    if [ "${LAND_FIX_FOR_RED:-}" = 1 ] || [[ "$title" =~ ^(fix\((ci|tests)\):|[Rr]evert) ]]; then echo "land-direct: $base is red (${sh:0:12}: $rt); this is the fix: landing"; return 0; fi
+    stop 10 blocked-red "$base is red: Tier 1 of its latest push failed (${sh:0:12}: $rt). Land the fix first (a fix(ci): / fix(tests): / revert subject, or LAND_FIX_FOR_RED=1).";; esac
+}
+exec 9>"$common/land.lock"
+tw=$(date +%s); echo "land-direct: waiting for the lock (at most ${LAND_LOCK_WAIT_SECONDS:-90}s)"
+flock -w "${LAND_LOCK_WAIT_SECONDS:-90}" 9 || stop 15 busy "another lander held the lock for $(( $(date +%s) - tw ))s; run land-direct again"
+holdcheck; red_check
+wt=$common/hermes-prospecta-land-direct/wt; mkdir -p "$common/hermes-prospecta-land-direct"
+if [ ! -e "$wt/.git" ]; then git -C "$top" worktree prune; git -C "$top" worktree add -q --detach "$wt" "$remote/$base"; fi
+g() { git -C "$wt" "$@"; }
+g rebase --abort >/dev/null 2>&1 || true; g reset -q --hard; g clean -fdq
+gen=$(git -C "$top" show "$remote/$base:scripts/generated-paths.txt" 2>/dev/null | sed 's/#.*//; s/[[:space:]]//g; /^$/d' || true)
+for attempt in 1 2 3; do
+  g fetch -q "$remote" "$base"; g reset -q --hard; g clean -fdq; g checkout -q --detach "$tip0"; regenned=0
+  if ! g rebase -q "$remote/$base" >/dev/null 2>&1; then
+    while [ -d "$(g rev-parse --path-format=absolute --git-path rebase-merge)" ] || [ -d "$(g rev-parse --path-format=absolute --git-path rebase-apply)" ]; do
+      conflicted=$(g diff --name-only --diff-filter=U); other=$(grep -vxFf <(printf '%s\n' "$gen") <<<"$conflicted" || true)
+      if [ -n "$other" ] || [ -z "$conflicted" ]; then g rebase --abort; stop 11 conflict "your commit(s) conflict with $base in files that are not generated: $(echo $other $conflicted | tr ' ' '\n' | sort -u | paste -sd' '). Resolve it in your worktree: git fetch $remote && git rebase $remote/$base, then run land-direct again."; fi
+      for f in $conflicted; do { g checkout --ours -- "$f" && g add -- "$f"; } 2>/dev/null || g rm -q -- "$f"; done   # during a rebase "ours" is main
+      regenned=1; GIT_EDITOR=true g rebase --continue >/dev/null 2>&1 || true
+    done
+  fi
+  if [ "$regenned" = 1 ]; then
+    echo "land-direct: generated files conflicted: took $base's and regenerating (improvements only)"
+    rc=0; (cd "$wt" && bash -c "$regen") >"$common/land-direct.regen.log" 2>&1 || rc=$?
+    [ "$rc" = 0 ] || { tail -3 "$common/land-direct.regen.log" >&2; stop 12 gate-diff "the regenerated baselines are not improvements on $base's (exit $rc): a gate worsens. A deliberate worsening is a re-base with a recorded target; not landing."; }
+  fi
+  ts=$(date +%s); (cd "$wt" && bash -c "$tier1") >"$common/land-direct.tier1.log" 2>&1 || { tail -15 "$common/land-direct.tier1.log" >&2; stop 13 tier1 "Tier 1 fails on the rebased commits (log: $common/land-direct.tier1.log); nothing lands."; }
+  t1=$(( $(date +%s) - ts ))
+  dirty=$(g status --porcelain | sed 's/^...//'); strays=$(grep -vxFf <(printf '%s\n' "$gen") <<<"$dirty" || true)
+  [ -z "$strays" ] || stop 13 tier1 "Tier 1 left changes outside the generated paths: $(echo $strays); not landing."
+  if [ -n "$dirty" ]; then g add -A; g commit -qm "chore: regenerate generated files after rebase onto $base" -m "Generated by scripts/land-direct."; fi
+  sha=$(g rev-parse HEAD); g fetch -q "$remote" "$base"
+  if ! g merge-base --is-ancestor "$remote/$base" HEAD; then   # main moved during Tier 1: rebase and check again
+    [ "$attempt" -lt 3 ] || die "$base moved three times during Tier 1; run land-direct again."
+    echo "land-direct: $base moved during Tier 1: rebasing and checking again ($attempt of 3)"; continue
+  fi
+  holdcheck; red_check
+  [ "$dry" = 0 ] || break
+  if g push -q "$remote" "$sha:refs/heads/$base" 2>"$common/land-direct.push.log"; then break; fi   # plain: the remote refuses what is not a fast-forward
+  echo "land-direct: the push of ${sha:0:12} to $base was refused (main moved?): rebasing and checking again ($attempt of 3)" >&2; sed 's/^/land-direct: push: /' "$common/land-direct.push.log" >&2
+  [ "$attempt" -lt 3 ] || die "the push to $base was refused three times; run land-direct again."
+done
+ss=
+if [ "$dry" = 1 ]; then result=would-land; echo "land-direct: dry run: would land ${sha:0:12} (tier1 ${t1}s); nothing pushed"; exit 0; fi
+result=landed
+echo "land-direct: ${sha:0:12} is $base: $ncommits commit(s), tier1 ${t1}s "
+echo "land-direct: your branch still holds the pre-rebase commits ($base has them rebased): start the next task from a fresh worktree off $remote/$base"
